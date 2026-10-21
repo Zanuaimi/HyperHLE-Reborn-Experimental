@@ -50,3 +50,6 @@ xcuserdata/
 
 # Graphify index artifacts
 /graphify-out/
+
+# Testing folder
+/testing
