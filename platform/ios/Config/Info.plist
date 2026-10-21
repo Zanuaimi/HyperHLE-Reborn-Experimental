@@ -24,6 +24,8 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Lets games record sound with the microphone.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>
