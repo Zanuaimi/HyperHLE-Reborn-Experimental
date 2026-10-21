@@ -319,6 +319,8 @@ pub enum ThreadBlock {
     Suspended(usize, Box<ThreadBlock>),
     // Thread is waiting on a FILE object lock.
     FileObjectLock(MutPtr<FILE>),
+    // Thread is waiting for a KeyMgr process-wide pointer lock.
+    KeymgrLock(i32),
 }
 
 struct BinaryDependencyNode {
@@ -4103,6 +4105,12 @@ impl Environment {
                             thread_id,
                         );
                         if acquired {
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        }
+                    }
+                    ThreadBlock::KeymgrLock(key) => {
+                        if self.libc_state.keymgr_processwide_ptr_is_unlocked(key) {
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
                         }

@@ -191,3 +191,10 @@ pub struct State {
     mach_error: mach::error::State,
     mmap: mmap::State,
 }
+
+impl State {
+    /// Whether a guest thread waiting on KeyMgr can retry its acquisition.
+    pub(crate) fn keymgr_processwide_ptr_is_unlocked(&self, key: i32) -> bool {
+        self.keymgr.processwide_ptr_is_unlocked(key)
+    }
+}
