@@ -23,14 +23,6 @@ if [[ $# == 3 ]]; then
         ICON_NAME="icon_$(echo "$BRANDING" | tr 'A-Z' 'a-z')"
         VERSION="$VERSION $BRANDING"
     fi
-    rm -rf "$ICON_NAME.icns" "$ICON_NAME.iconset"
-    mkdir "$ICON_NAME.iconset"
-    cp ../res/"$ICON_NAME.png" "$ICON_NAME.iconset"/icon_512x512.png
-    # iconutil requires the image to match the size implied by its filename
-    # (512x512), so resize in case the source PNG has different dimensions.
-    sips -z 512 512 "$ICON_NAME.iconset"/icon_512x512.png > /dev/null
-    iconutil -c icns -o "$ICON_NAME.icns" "$ICON_NAME.iconset"
-
     rm -rf "$APP_NAME.app"
     mkdir -p "$APP_NAME.app"/Contents/MacOS "$APP_NAME.app"/Contents/Resources
     cp $PATH_TO_BINARY "$APP_NAME.app"/Contents/MacOS/touchHLE
@@ -38,7 +30,7 @@ if [[ $# == 3 ]]; then
     cp -r ../touchHLE_fonts "$APP_NAME.app"/Contents/Resources/
     cp -r ../touchHLE_default_options.txt "$APP_NAME.app"/Contents/Resources/
     cp ../touchHLE_wallpaper.png "$APP_NAME.app"/Contents/Resources/
-    cp "$ICON_NAME.icns" "$APP_NAME.app"/Contents/Resources/
+    cp ../res/"$ICON_NAME.icns" "$APP_NAME.app"/Contents/Resources/
 
     plutil -create xml1 "$APP_NAME.app"/Contents/Info.plist
     plutil -insert CFBundleName -string "$APP_NAME" "$APP_NAME.app"/Contents/Info.plist

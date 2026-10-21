@@ -1131,6 +1131,16 @@ impl Environment {
         let launch_image = None;
 
         assert!(!options.headless);
+        // On macOS, leave NSApp's icon alone so Launch Services keeps the
+        // bundled HyperHLE.icns icon. SDL_SetWindowIcon would replace the Dock
+        // icon with the app picker's fallback artwork.
+        #[cfg(target_os = "macos")]
+        let window_icon = {
+            let _ = icon;
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let window_icon = Some(icon);
         let window = Some(Box::new(window::Window::new(
             &format!(
                 "touchHLE {}{}{}",
@@ -1142,7 +1152,7 @@ impl Environment {
                 },
                 super::VERSION
             ),
-            Some(icon),
+            window_icon,
             launch_image,
             &options,
         )?));

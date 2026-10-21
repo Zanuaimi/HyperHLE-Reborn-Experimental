@@ -305,6 +305,7 @@ struct AppPickerDelegateHostObject {
     show_fps: Option<bool>,
     cheat_engine: Option<bool>,
     trace_gl_errors: Option<bool>,
+    preserve_aspect_ratio: Option<bool>,
     force_composition: Option<bool>,
     gles_native: Option<bool>,
     fullscreen: Option<bool>,
@@ -327,6 +328,149 @@ struct AppPickerDelegateHostObject {
     swipe_right: bool,
 }
 impl HostObject for AppPickerDelegateHostObject {}
+
+#[derive(Clone, PartialEq)]
+struct PickerSettings {
+    scale_hack: Option<NonZeroU32>,
+    orientation: Option<DeviceOrientation>,
+    fullscreen: bool,
+    preserve_aspect_ratio: bool,
+    gles_native: bool,
+    force_composition: bool,
+    show_fps: bool,
+    trace_gl_errors: bool,
+    cheat_engine: bool,
+    network: bool,
+    analog_stick_tilt_controls: bool,
+    device_model_tag: Option<i32>,
+    language_tag: Option<i32>,
+}
+
+impl PickerSettings {
+    fn load(options: &Options, angle_backend_available: bool) -> Self {
+        let (gles_native, _) = quick_options_gles_native_state(options, angle_backend_available);
+        let mut settings = Self {
+            scale_hack: None,
+            orientation: None,
+            fullscreen: options.fullscreen,
+            preserve_aspect_ratio: options.preserve_aspect_ratio,
+            gles_native,
+            force_composition: options.force_composition,
+            show_fps: options.print_fps,
+            trace_gl_errors: options.trace_gl_errors,
+            cheat_engine: quick_options_trainer_enabled(options),
+            network: options.network_access,
+            analog_stick_tilt_controls: options.analog_stick_tilt_controls,
+            device_model_tag: None,
+            language_tag: None,
+        };
+        let path = paths::user_data_base_path().join(paths::PICKER_SETTINGS_FILE);
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return settings;
+        };
+        for line in contents.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "scale_hack" => {
+                    settings.scale_hack = match value {
+                        "default" => None,
+                        _ => value.parse().ok().and_then(NonZeroU32::new),
+                    }
+                }
+                "orientation" => {
+                    settings.orientation = match value {
+                        "default" => None,
+                        "landscape-left" => Some(DeviceOrientation::LandscapeLeft),
+                        "landscape-right" => Some(DeviceOrientation::LandscapeRight),
+                        "upside-down" => Some(DeviceOrientation::PortraitUpsideDown),
+                        _ => settings.orientation,
+                    }
+                }
+                "fullscreen" => set_bool(value, &mut settings.fullscreen),
+                "preserve_aspect_ratio" => set_bool(value, &mut settings.preserve_aspect_ratio),
+                "gles_native" => set_bool(value, &mut settings.gles_native),
+                "force_composition" => set_bool(value, &mut settings.force_composition),
+                "show_fps" => set_bool(value, &mut settings.show_fps),
+                "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
+                "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
+                "network" => set_bool(value, &mut settings.network),
+                "analog_stick_tilt_controls" => {
+                    set_bool(value, &mut settings.analog_stick_tilt_controls)
+                }
+                "device_model_tag" => settings.device_model_tag = parse_optional_tag(value),
+                "language_tag" => settings.language_tag = parse_optional_tag(value),
+                _ => (),
+            }
+        }
+        settings
+    }
+
+    fn save(&self) {
+        let path = paths::user_data_base_path().join(paths::PICKER_SETTINGS_FILE);
+        let orientation = match self.orientation {
+            None => "default",
+            Some(DeviceOrientation::LandscapeLeft) => "landscape-left",
+            Some(DeviceOrientation::LandscapeRight) => "landscape-right",
+            Some(DeviceOrientation::PortraitUpsideDown) => "upside-down",
+            Some(DeviceOrientation::Portrait) => "default",
+        };
+        let contents = format!(
+            "# Saved by the graphical settings screen.\n\
+             scale_hack={}\n\
+             orientation={orientation}\n\
+             fullscreen={}\n\
+             preserve_aspect_ratio={}\n\
+             gles_native={}\n\
+             force_composition={}\n\
+             show_fps={}\n\
+             trace_gl_errors={}\n\
+             cheat_engine={}\n\
+             network={}\n\
+             analog_stick_tilt_controls={}\n\
+             device_model_tag={}\n\
+             language_tag={}\n",
+            self.scale_hack
+                .map_or_else(|| "default".to_string(), |n| n.to_string()),
+            self.fullscreen,
+            self.preserve_aspect_ratio,
+            self.gles_native,
+            self.force_composition,
+            self.show_fps,
+            self.trace_gl_errors,
+            self.cheat_engine,
+            self.network,
+            self.analog_stick_tilt_controls,
+            optional_tag(self.device_model_tag),
+            optional_tag(self.language_tag),
+        );
+        if let Err(error) = std::fs::write(path, contents) {
+            log!("Warning: couldn't save app picker settings: {error}");
+        }
+    }
+}
+
+fn set_bool(value: &str, setting: &mut bool) {
+    match value {
+        "true" => *setting = true,
+        "false" => *setting = false,
+        _ => (),
+    }
+}
+
+fn parse_optional_tag(value: &str) -> Option<i32> {
+    if value == "default" {
+        None
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn optional_tag(tag: Option<i32>) -> String {
+    tag.map_or_else(|| "default".to_string(), |tag| tag.to_string())
+}
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     // Not a real iOS dylib obviously. This shouldn't really be in the list of
@@ -403,6 +547,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())traceGLErrors:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).trace_gl_errors = Some(switch_state);
+}
+- (())preserveAspectRatio:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).preserve_aspect_ratio = Some(switch_state);
 }
 - (())forceComposition:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -734,32 +882,42 @@ fn app_picker_inner(
         label
     };
 
-    let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
     let angle_backend_available = crate::window::angle_backend_available();
-    let (mut quick_options_gles_native, quick_options_gles_native_switch_enabled) =
-        quick_options_gles_native_state(&env.options, angle_backend_available);
-    let quick_options_force_composition_enabled = env.options.force_composition;
+    let mut picker_settings = PickerSettings::load(&env.options, angle_backend_available);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    env.window_mut()
+        .set_preserve_aspect_ratio(picker_settings.preserve_aspect_ratio);
+    let quick_options_gles_native_switch_enabled = angle_backend_available;
+    let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
     let settings = setup_settings(
         env,
         delegate,
         main_view,
         app_frame,
-        quick_options_cheat_engine,
-        quick_options_gles_native,
+        &picker_settings,
         quick_options_gles_native_switch_enabled,
-        quick_options_force_composition_enabled,
-        !crate::window::Window::rotatable_fullscreen(),
+        show_fullscreen_row,
     );
-    let mut quick_options_scale_hack: Option<NonZeroU32> = None;
-    let mut quick_options_fullscreen: Option<()> = None;
-    let mut quick_options_orientation: Option<DeviceOrientation> = None;
-    let mut quick_options_analog_stick_tilt_controls = true;
-    let mut quick_options_network = false;
-    let mut quick_options_show_fps = false;
-    let mut quick_options_trace_gl_errors = false;
-    let mut quick_options_force_composition_override: Option<bool> = None;
-    let mut device_state = DropdownState::default();
-    let mut language_state = DropdownState::default();
+    let mut quick_options_scale_hack = picker_settings.scale_hack;
+    let mut quick_options_fullscreen = picker_settings.fullscreen;
+    let mut quick_options_orientation = picker_settings.orientation;
+    let mut quick_options_analog_stick_tilt_controls = picker_settings.analog_stick_tilt_controls;
+    let mut quick_options_network = picker_settings.network;
+    let mut quick_options_show_fps = picker_settings.show_fps;
+    let mut quick_options_trace_gl_errors = picker_settings.trace_gl_errors;
+    let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
+    let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
+    let mut quick_options_cheat_engine = picker_settings.cheat_engine;
+    let mut quick_options_gles_native = picker_settings.gles_native;
+    let mut device_state = DropdownState {
+        selected: picker_settings.device_model_tag,
+        ..Default::default()
+    };
+    let mut language_state = DropdownState {
+        selected: picker_settings.language_tag,
+        ..Default::default()
+    };
+    let mut last_saved_picker_settings = picker_settings.clone();
 
     update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
     update_orientation_buttons(env, &settings.orientation_buttons, quick_options_orientation);
@@ -1196,15 +1354,38 @@ fn app_picker_inner(
             quick_options_show_fps = enabled;
         } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
             quick_options_trace_gl_errors = trace_gl_errors;
+        } else if let Some(preserve_aspect_ratio) =
+            std::mem::take(&mut host_obj.preserve_aspect_ratio)
+        {
+            quick_options_preserve_aspect_ratio = preserve_aspect_ratio;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            env.window_mut()
+                .set_preserve_aspect_ratio(preserve_aspect_ratio);
         } else if let Some(force_composition) = std::mem::take(&mut host_obj.force_composition) {
             quick_options_force_composition_override = Some(force_composition);
         } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
             quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
-            quick_options_fullscreen = match fullscreen {
-                false => None,
-                true => Some(()),
-            };
+            quick_options_fullscreen = fullscreen;
+        }
+
+        picker_settings.scale_hack = quick_options_scale_hack;
+        picker_settings.orientation = quick_options_orientation;
+        picker_settings.fullscreen = quick_options_fullscreen;
+        picker_settings.preserve_aspect_ratio = quick_options_preserve_aspect_ratio;
+        picker_settings.gles_native = quick_options_gles_native;
+        picker_settings.force_composition =
+            quick_options_force_composition_override.unwrap_or(env.options.force_composition);
+        picker_settings.show_fps = quick_options_show_fps;
+        picker_settings.trace_gl_errors = quick_options_trace_gl_errors;
+        picker_settings.cheat_engine = quick_options_cheat_engine;
+        picker_settings.network = quick_options_network;
+        picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
+        picker_settings.device_model_tag = device_state.selected;
+        picker_settings.language_tag = language_state.selected;
+        if picker_settings != last_saved_picker_settings {
+            picker_settings.save();
+            last_saved_picker_settings = picker_settings.clone();
         }
 
         // Detect .ipa files copied in by the "+" tile flow and refresh the
@@ -1253,14 +1434,30 @@ fn app_picker_inner(
             .to_string(),
         );
     }
-    if let Some(()) = quick_options_fullscreen {
+    if quick_options_fullscreen {
         option_args.push("--fullscreen".to_string());
+    } else {
+        option_args.push("--no-fullscreen".to_string());
+    }
+    if show_fullscreen_row {
+        option_args.push(
+            if quick_options_preserve_aspect_ratio {
+                "--preserve-aspect-ratio"
+            } else {
+                "--no-preserve-aspect-ratio"
+            }
+            .to_string(),
+        );
     }
     if !quick_options_analog_stick_tilt_controls {
         option_args.push("--disable-analog-stick-tilt-controls".to_string());
+    } else {
+        option_args.push("--enable-analog-stick-tilt-controls".to_string());
     }
     if quick_options_network {
         option_args.push("--allow-network-access".to_string());
+    } else {
+        option_args.push("--no-network-access".to_string());
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
 
@@ -1271,6 +1468,8 @@ fn app_picker_inner(
         // flag so users don't need to set env vars manually.
         std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
         crate::gles::present::set_onscreen_fps_enabled(true);
+    } else {
+        option_args.push("--no-print-fps".to_string());
     }
 
     if let Some(enabled) = quick_options_force_composition_override {
@@ -1279,6 +1478,8 @@ fn app_picker_inner(
 
     if quick_options_trace_gl_errors {
         option_args.push("--trace-gl-errors".to_string());
+    } else {
+        option_args.push("--no-trace-gl-errors".to_string());
     }
     // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
     // default is now OFF, so the switch has to be able to turn the native
@@ -2734,10 +2935,8 @@ fn setup_settings(
     delegate: id,
     super_view: id,
     app_frame: CGRect,
-    cheat_engine_enabled: bool,
-    gles_native_enabled: bool,
+    picker_settings: &PickerSettings,
     gles_native_switch_enabled: bool,
-    force_composition_enabled: bool,
     show_fullscreen_row: bool,
 ) -> SettingsStuff {
     let width = app_frame.size.width;
@@ -2851,30 +3050,41 @@ fn setup_settings(
         display_rows.push(SettingsRow::Toggle(
             "Fullscreen (override)",
             "fullscreen:",
-            false,
+            picker_settings.fullscreen,
             true,
         ));
     }
     sections.push(("DISPLAY", display_rows));
-    sections.push((
-        "GRAPHICS",
-        vec![
+    let mut graphics_rows = vec![
             SettingsRow::Toggle(
                 "GLES Native",
                 "glesNative:",
-                gles_native_enabled,
+            picker_settings.gles_native,
                 gles_native_switch_enabled,
             ),
             SettingsRow::Toggle(
                 "May fix graphics issues.",
                 "forceComposition:",
-                force_composition_enabled,
+            picker_settings.force_composition,
                 true,
             ),
-            SettingsRow::Toggle("Show FPS", "showFPS:", false, true),
-            SettingsRow::Toggle("Trace GL errors", "traceGLErrors:", false, true),
-        ],
+        SettingsRow::Toggle("Show FPS", "showFPS:", picker_settings.show_fps, true),
+        SettingsRow::Toggle(
+            "Trace GL errors",
+            "traceGLErrors:",
+            picker_settings.trace_gl_errors,
+            true,
+        ),
+    ];
+    if show_fullscreen_row {
+        graphics_rows.push(SettingsRow::Toggle(
+            "Keep aspect ratio on resize",
+            "preserveAspectRatio:",
+            picker_settings.preserve_aspect_ratio,
+            true,
     ));
+    }
+    sections.push(("GRAPHICS", graphics_rows));
     sections.push((
         "DEVICE",
         vec![
@@ -2885,12 +3095,12 @@ fn setup_settings(
     sections.push((
         "EMULATION",
         vec![
-            SettingsRow::Toggle("Cheat Engine", "cheatEngine:", cheat_engine_enabled, true),
-            SettingsRow::Toggle("Network access", "network:", false, true),
+            SettingsRow::Toggle("Cheat Engine", "cheatEngine:", picker_settings.cheat_engine, true),
+            SettingsRow::Toggle("Network access", "network:", picker_settings.network, true),
             SettingsRow::Toggle(
                 "Use analog sticks for tilt controls",
                 "analogStickTiltControls:",
-                true,
+                picker_settings.analog_stick_tilt_controls,
                 true,
             ),
         ],

@@ -13,6 +13,7 @@
 //! will be needed for the runtime of the app.
 
 mod geometry;
+mod native_aspect_ratio;
 
 use crate::gles::present::present_frame;
 use crate::gles::{
@@ -679,6 +680,27 @@ fn surface_from_image(image: &Image) -> Surface<'_> {
     surface
 }
 
+/// Leave a transparent margin so guest icons fit the macOS Dock tile similarly
+/// to the host application's bundled icon.
+#[cfg(target_os = "macos")]
+fn pad_icon_for_dock(image: &Image) -> Image {
+    let (width, height) = image.dimensions();
+    let (canvas_width, canvas_height) = (width * 5 / 4, height * 5 / 4);
+    let mut pixels = vec![0; (canvas_width * canvas_height * 4) as usize];
+    let x_offset = ((canvas_width - width) / 2) as usize;
+    let y_offset = ((canvas_height - height) / 2) as usize;
+    let source = image.pixels();
+    let source_stride = width as usize * 4;
+    let canvas_stride = canvas_width as usize * 4;
+    for y in 0..height as usize {
+        let source_start = y * source_stride;
+        let target_start = (y + y_offset) * canvas_stride + x_offset * 4;
+        pixels[target_start..target_start + source_stride]
+            .copy_from_slice(&source[source_start..source_start + source_stride]);
+    }
+    Image::from_pixels(canvas_width, canvas_height, pixels)
+}
+
 /// Query the host's primary display size in physical pixels, if possible.
 ///
 /// Used by `--device-family=auto` to pick the closest emulated device before
@@ -774,6 +796,8 @@ fn configure_android_angle_driver(use_angle: bool) -> bool {
 pub struct Window {
     _sdl_ctx: sdl2::Sdl,
     video_ctx: sdl2::VideoSubsystem,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    aspect_ratio_constraint: native_aspect_ratio::Constraint,
     window: sdl2::video::Window,
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
@@ -792,6 +816,8 @@ pub struct Window {
     /// Copy of `fullscreen` on [Options]. Note that this is meaningless when
     /// [Self::rotatable_fullscreen] returns [true].
     fullscreen: bool,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    preserve_aspect_ratio: bool,
     scale_hack: NonZeroU32,
     host_screen_size: Option<(u32, u32)>,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
@@ -852,6 +878,15 @@ impl Window {
         match self.window.set_fullscreen(mode) {
             Ok(()) => {
                 self.fullscreen = new_fullscreen;
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                self.aspect_ratio_constraint.set(
+                    self.preserve_aspect_ratio && !self.fullscreen,
+                    size_for_orientation_from_size(
+                        self.screen_size(),
+                        self.device_orientation,
+                        self.scale_hack,
+                    ),
+                );
                 log!(
                     "Switched to {} mode.",
                     if self.fullscreen {
@@ -1017,6 +1052,8 @@ impl Window {
         let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
         let device_orientation = options.initial_orientation;
         let fullscreen = options.fullscreen;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let preserve_aspect_ratio = options.preserve_aspect_ratio;
         let portrait_screen_size =
             host_screen_size.unwrap_or_else(|| device_family.portrait_size());
 
@@ -1073,6 +1110,10 @@ impl Window {
         }
 
         if let Some(icon) = icon {
+            #[cfg(target_os = "macos")]
+            let icon = pad_icon_for_dock(&icon);
+            #[cfg(not(target_os = "macos"))]
+            let icon = icon;
             window.set_icon(surface_from_image(&icon));
         }
 
@@ -1139,6 +1180,13 @@ impl Window {
 
         #[cfg(target_os = "macos")]
         let max_height = window.size().1;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let mut aspect_ratio_constraint = native_aspect_ratio::Constraint::new(&window);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        aspect_ratio_constraint.set(
+            preserve_aspect_ratio && !fullscreen,
+            size_for_orientation_from_size(portrait_screen_size, device_orientation, scale_hack),
+        );
 
         let (splash_image, splash_image_is_orientation_specific) = launch_image
             .map(|(image, orientation_specific)| (Some(image), orientation_specific))
@@ -1147,6 +1195,8 @@ impl Window {
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
             video_ctx,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            aspect_ratio_constraint,
             window,
             event_pump,
             event_queue: VecDeque::new(),
@@ -1175,6 +1225,8 @@ impl Window {
             #[cfg(target_os = "macos")]
             viewport_y_offset: 0,
             fullscreen,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            preserve_aspect_ratio,
             scale_hack,
             host_screen_size,
             internal_gl_ins: None,
@@ -1374,6 +1426,19 @@ impl Window {
     ///
     /// Since polling can be quite expensive, this function will skip it if it
     /// was called too recently.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn set_preserve_aspect_ratio(&mut self, enabled: bool) {
+        self.preserve_aspect_ratio = enabled;
+        self.aspect_ratio_constraint.set(
+            enabled && !self.fullscreen,
+            size_for_orientation_from_size(
+                self.screen_size(),
+                self.device_orientation,
+                self.scale_hack,
+            ),
+        );
+    }
+
     pub fn poll_for_events(&mut self, options: &Options) {
         if !self.on_main_stack {
             log!("Warning: poll_for_events called off main stack, skipping");
@@ -2002,8 +2067,7 @@ impl Window {
     pub fn pop_event(&mut self) -> Option<Event> {
         // TEST HOOK: GD autoplay taps for verifying level music headlessly.
         if !self.auto_taps.is_empty() {
-            static POP_FRAMES: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static POP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let frame = POP_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let due: Vec<(f32, f32)> = self
                 .auto_taps
@@ -2024,11 +2088,15 @@ impl Window {
                     coords
                 );
                 self.event_queue
-                    .push_back(Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)])));
+                    .push_back(Event::TouchesDown(HashMap::from([(
+                        FingerId::Mouse,
+                        coords,
+                    )])));
                 self.event_queue
                     .push_back(Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)])));
             }
-            self.auto_taps.retain(|(tap_frame, _, _)| *tap_frame > frame);
+            self.auto_taps
+                .retain(|(tap_frame, _, _)| *tap_frame > frame);
         }
         self.high_priority_event
             .take()
@@ -2588,7 +2656,10 @@ impl Window {
                 sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_FALSE);
                 sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_TRUE);
             }
-            if let Err(err) = self.window.set_fullscreen(sdl2::video::FullscreenType::True) {
+            if let Err(err) = self
+                .window
+                .set_fullscreen(sdl2::video::FullscreenType::True)
+            {
                 log!(
                     "Warning: couldn't return to fullscreen after rotating to {:?}: {}. \
                      The host UI may not permit this orientation.",
@@ -2599,6 +2670,15 @@ impl Window {
         }
 
         self.device_orientation = new_orientation;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        self.aspect_ratio_constraint.set(
+            self.preserve_aspect_ratio && !self.fullscreen,
+            size_for_orientation_from_size(
+                self.screen_size(),
+                self.device_orientation,
+                self.scale_hack,
+            ),
+        );
 
         if self.splash_image.is_some() {
             self.display_splash();
@@ -2642,19 +2722,39 @@ impl Window {
     /// Get the region of the on-screen window (x, y, width, height) used to
     /// display the app content.
     ///
-    /// The aspect ratio of this region always reflects the guest app's view of
-    /// the world, but the scale and orientation might not.
+    /// The scale and aspect ratio of this region depend on the host window and
+    /// the desktop aspect-ratio setting; its orientation follows the guest app.
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
         let (app_width, app_height) = size_for_orientation_from_size(
             self.screen_size(),
             self.device_orientation,
             self.scale_hack,
         );
-        // Preserve the macOS resize workaround in rotate_device(), which
-        // positions an app-sized viewport using viewport_y_offset().
-        #[cfg(target_os = "macos")]
-        if !self.fullscreen {
-            return (0, 0, app_width, app_height);
+        // Use the full drawable when the native constraint is active and the
+        // current client size still matches it. Programmatic resizes, Snap,
+        // maximize and window managers that ignore hints fall back to fitting
+        // the guest image. macOS constrains the outer frame (including the
+        // title bar), so its drawable ratio intentionally uses the full area.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let drawable_size = self.window.drawable_size();
+            #[cfg(target_os = "macos")]
+            let native_ratio_matches = true;
+            #[cfg(not(target_os = "macos"))]
+            let native_ratio_matches = {
+                let lhs = drawable_size.0 as u64 * app_height as u64;
+                let rhs = drawable_size.1 as u64 * app_width as u64;
+                lhs.abs_diff(rhs) <= app_width.max(app_height) as u64
+            };
+            return if self.preserve_aspect_ratio {
+                if self.aspect_ratio_constraint.is_native() && native_ratio_matches {
+                    (0, 0, drawable_size.0, drawable_size.1)
+                } else {
+                    geometry::fit_viewport((app_width, app_height), drawable_size)
+                }
+            } else {
+                (0, 0, drawable_size.0, drawable_size.1)
+            };
         }
 
         // Fit the actual drawable in windowed mode too: the compositor may
@@ -2728,7 +2828,11 @@ impl Window {
     /// Special offset to add to y co-ordinates, only when drawing to screen.
     pub fn viewport_y_offset(&self) -> u32 {
         #[cfg(target_os = "macos")]
-        return self.viewport_y_offset;
+        return if self.fullscreen {
+            self.viewport_y_offset
+        } else {
+            0
+        };
         #[cfg(not(target_os = "macos"))]
         return 0;
     }
@@ -2945,7 +3049,9 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
                         let open_res = {
                             #[cfg(target_os = "android")]
                             {
-                                if url.starts_with("content://") && crate::android_web_view::open_content_uri(&url) {
+                                if url.starts_with("content://")
+                                    && crate::android_web_view::open_content_uri(&url)
+                                {
                                     Ok(())
                                 } else {
                                     sdl2::url::open_url(&url).map_err(|e| e.to_string())
@@ -2983,8 +3089,7 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
 /// calls abort on Android (see [populate_battery_cache]), so
 /// [UIDevice batteryLevel] must never reach SDL_GetPowerInfo directly.
 static BATTERY_CACHED: AtomicBool = AtomicBool::new(false);
-static BATTERY_PERCENT: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(-1);
+static BATTERY_PERCENT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static BATTERY_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Query SDL for the battery. Only call this where JNI calls are safe (the
@@ -3022,14 +3127,12 @@ pub fn refresh_battery_cache() {
 /// This never calls into SDL, so it is safe from any thread or coroutine. The
 /// value is a percentage (0 to 100, or -1 if unknown) and the state.
 pub fn cached_battery_status() -> Option<(i32, BatteryState)> {
-    BATTERY_CACHED
-        .load(Ordering::Acquire)
-        .then(|| {
-            (
-                BATTERY_PERCENT.load(Ordering::Relaxed),
-                BatteryState::from_tag(BATTERY_STATE.load(Ordering::Relaxed)),
-            )
-        })
+    BATTERY_CACHED.load(Ordering::Acquire).then(|| {
+        (
+            BATTERY_PERCENT.load(Ordering::Relaxed),
+            BatteryState::from_tag(BATTERY_STATE.load(Ordering::Relaxed)),
+        )
+    })
 }
 
 pub fn get_battery_status() -> (i32, BatteryState) {

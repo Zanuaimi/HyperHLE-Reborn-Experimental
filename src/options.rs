@@ -93,6 +93,8 @@ impl VsyncMode {
 #[derive(Clone)]
 pub struct Options {
     pub fullscreen: bool,
+    /// Keep the emulated display's aspect ratio when resizing a desktop window.
+    pub preserve_aspect_ratio: bool,
     pub device_family: Option<DeviceFamily>,
     pub auto_device_family: bool,
     /// When set, the guest sees a screen of exactly this size (in points) and
@@ -284,6 +286,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
+            preserve_aspect_ratio: false,
             trainer_disabled: true,
             device_family: None,
             auto_device_family: false,
@@ -393,6 +396,12 @@ impl Options {
 
         if arg == "--fullscreen" {
             self.fullscreen = true;
+        } else if arg == "--no-fullscreen" {
+            self.fullscreen = false;
+        } else if arg == "--preserve-aspect-ratio" {
+            self.preserve_aspect_ratio = true;
+        } else if arg == "--no-preserve-aspect-ratio" {
+            self.preserve_aspect_ratio = false;
         } else if arg == "--fix-music" {
             self.gd_music_bypass = true;
         } else if arg == "--xml-dom-mirror" {
@@ -468,6 +477,8 @@ impl Options {
                 .map_err(|_| "Invalid UI scale factor".to_string())?;
         } else if arg == "--disable-analog-stick-tilt-controls" {
             self.analog_stick_tilt_controls = false;
+        } else if arg == "--enable-analog-stick-tilt-controls" {
+            self.analog_stick_tilt_controls = true;
         } else if let Some(value) = arg.strip_prefix("--deadzone=") {
             self.deadzone = parse_degrees(value, "deadzone")?;
         } else if let Some(value) = arg.strip_prefix("--x-tilt-range=") {
@@ -569,6 +580,8 @@ impl Options {
             self.popup_errors = false;
         } else if arg == "--print-fps" {
             self.print_fps = true;
+        } else if arg == "--no-print-fps" {
+            self.print_fps = false;
         } else if let Some(value) = arg.strip_prefix("--fps-limit=") {
             if value == "off" {
                 self.fps_limit = None;
@@ -642,6 +655,8 @@ impl Options {
             std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
         } else if arg == "--allow-network-access" {
             self.network_access = true;
+        } else if arg == "--no-network-access" {
+            self.network_access = false;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
         } else if let Some(values) = arg.strip_prefix("--dump=") {
@@ -652,6 +667,8 @@ impl Options {
             self.ignore_gl_errors = true;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
+        } else if arg == "--no-trace-gl-errors" {
+            self.trace_gl_errors = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
         } else if arg == "--gles-native" {

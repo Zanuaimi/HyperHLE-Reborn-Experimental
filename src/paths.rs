@@ -112,6 +112,9 @@ pub const APPS_DIR: &str = "touchHLE_apps";
 /// Name of the file intended for the user's own options.
 pub const USER_OPTIONS_FILE: &str = "touchHLE_options.txt";
 
+/// Persistent preferences for the graphical app picker.
+pub const PICKER_SETTINGS_FILE: &str = "touchHLE_picker_settings.txt";
+
 /// Names of files the user can put a wallpaper image (for the app picker) in.
 #[allow(unused)]
 pub const WALLPAPER_FILES: &[&str] = &[
