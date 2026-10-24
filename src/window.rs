@@ -22,7 +22,7 @@ use crate::gles::{
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
-use crate::options::Options;
+use crate::options::{Options, RendererMode};
 use crate::Environment;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
@@ -44,9 +44,9 @@ pub fn angle_backend_available() -> bool {
     !cfg!(target_os = "android") || !ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed)
 }
 
-#[cfg(target_os = "android")]
-fn should_attempt_android_angle(gles_native: bool, angle_unavailable: bool) -> bool {
-    !gles_native && !angle_unavailable
+#[cfg(any(target_os = "android", test))]
+fn should_attempt_android_angle(renderer_mode: RendererMode, angle_unavailable: bool) -> bool {
+    renderer_mode == RendererMode::Angle && !angle_unavailable
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -59,7 +59,8 @@ fn angle_backend_unsafe_on_power_vr_bxm_8_256(description: &str) -> bool {
 
 #[cfg(test)]
 mod android_angle_fallback_tests {
-    use super::angle_backend_unsafe_on_power_vr_bxm_8_256;
+    use super::{angle_backend_unsafe_on_power_vr_bxm_8_256, should_attempt_android_angle};
+    use crate::options::RendererMode;
 
     #[test]
     fn rejects_power_vr_bxm_8_256_vulkan_angle() {
@@ -89,6 +90,16 @@ mod android_angle_fallback_tests {
         assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
             "OpenGL ES 3.2 / Imagination Technologies / PowerVR BXM-8-256"
         ));
+    }
+
+    #[test]
+    fn selects_angle_only_when_requested_and_available() {
+        assert!(should_attempt_android_angle(RendererMode::Angle, false));
+        assert!(!should_attempt_android_angle(
+            RendererMode::NativeGles,
+            false
+        ));
+        assert!(!should_attempt_android_angle(RendererMode::Angle, true));
     }
 }
 
@@ -788,7 +799,7 @@ fn configure_android_angle_driver(use_angle: bool) -> bool {
         // bundled ANGLE; SDL will use Android's system OpenGL ES driver.
         env::remove_var("SDL_VIDEO_EGL_DRIVER");
         env::remove_var("SDL_VIDEO_GL_DRIVER");
-        log!("GLES Native requested; using the Android system OpenGL ES driver.");
+        log!("Native GLES requested; using the Android system OpenGL ES driver.");
         return false;
     }
     const CANDIDATES: &[(&str, &str, &str)] = &[
@@ -969,7 +980,7 @@ impl Window {
         #[cfg(target_os = "android")]
         {
             let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
-            if should_attempt_android_angle(options.gles_native, angle_unavailable) {
+            if should_attempt_android_angle(options.renderer_mode, angle_unavailable) {
                 if configure_android_angle_driver(true) {
                     match Self::new_with_configured_driver(
                         title,
@@ -1036,7 +1047,7 @@ impl Window {
                     });
             }
 
-            if !options.gles_native && angle_unavailable {
+            if options.renderer_mode == RendererMode::Angle && angle_unavailable {
                 log!(
                     "Bundled ANGLE was previously unavailable; using the Android native GLES driver."
                 );

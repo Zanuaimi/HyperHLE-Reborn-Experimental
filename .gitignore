@@ -47,3 +47,6 @@ touchHLE_pvrtc_cache/
 /dist
 xcuserdata/
 *.xcuserstate
+
+# Graphify artifacts
+/graphify-out/

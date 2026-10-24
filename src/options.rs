@@ -89,6 +89,32 @@ impl VsyncMode {
     }
 }
 
+/// Host renderer used for OpenGL ES apps on Android.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RendererMode {
+    /// Use the bundled ANGLE libraries.
+    Angle,
+    /// Use the Android device's native OpenGL ES driver.
+    NativeGles,
+}
+
+impl RendererMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "angle" => Ok(Self::Angle),
+            "native-gles" => Ok(Self::NativeGles),
+            _ => Err(()),
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Angle => "angle",
+            Self::NativeGles => "native-gles",
+        }
+    }
+}
+
 /// Struct containing all user-configurable options.
 #[derive(Clone)]
 pub struct Options {
@@ -235,16 +261,10 @@ pub struct Options {
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
-    /// Prefer the vendor's native OpenGL ES driver over the bundled ANGLE
-    /// libraries on Android. Defaults to `false` ("GLES Native" quick option
-    /// OFF): the bundled ANGLE backend is the predictable default, since
-    /// vendor drivers differ a lot between devices. Enable (`--gles-native`,
-    /// quick option ON) to use the vendor driver instead: it behaves closest
-    /// to real iPhone-era hardware (lenient GLSL ES linking etc.) and avoids
-    /// ANGLE's stricter validation, which breaks some apps' shaders (e.g.
-    /// Gangstar's fragment-only varyings). Only meaningful on Android;
-    /// ignored elsewhere.
-    pub gles_native: bool,
+    /// Select the host OpenGL ES renderer on Android. ANGLE is the default;
+    /// native GLES can be selected for compatibility with vendor-driver quirks.
+    /// Ignored on other platforms.
+    pub renderer_mode: RendererMode,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
     /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
@@ -347,7 +367,7 @@ impl Default for Options {
             ignore_gl_errors: false,
             trace_gl_errors: false,
             verbose_gles: false,
-            gles_native: false,
+            renderer_mode: RendererMode::Angle,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
             // and apps shipped for iOS overwhelmingly upload PVRTC and
@@ -671,10 +691,14 @@ impl Options {
             self.trace_gl_errors = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
+        } else if let Some(value) = arg.strip_prefix("--renderer-mode=") {
+            self.renderer_mode = RendererMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --renderer-mode= (expected angle or native-gles)".to_string()
+            })?;
         } else if arg == "--gles-native" {
-            self.gles_native = true;
+            self.renderer_mode = RendererMode::NativeGles;
         } else if arg == "--no-gles-native" {
-            self.gles_native = false;
+            self.renderer_mode = RendererMode::Angle;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
             // GLES1Native reads this as its source of truth (it has no
@@ -787,6 +811,28 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-force-composition").unwrap());
         assert!(!options.force_composition);
+    }
+
+    #[test]
+    fn renderer_mode_defaults_to_angle_and_accepts_legacy_switches() {
+        let mut options = Options::default();
+        assert_eq!(options.renderer_mode, RendererMode::Angle);
+
+        assert!(options
+            .parse_argument("--renderer-mode=native-gles")
+            .unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::NativeGles);
+
+        assert!(options.parse_argument("--renderer-mode=angle").unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::Angle);
+
+        assert!(options.parse_argument("--gles-native").unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::NativeGles);
+
+        assert!(options.parse_argument("--no-gles-native").unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::Angle);
+
+        assert!(options.parse_argument("--renderer-mode=vulkan").is_err());
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::fs::BundleData;
 use crate::image::Image;
 use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
-use crate::options::Options;
+use crate::options::{Options, RendererMode};
 use crate::paths;
 use crate::window::DeviceOrientation;
 use crate::Environment;
@@ -382,7 +382,7 @@ struct AppPickerDelegateHostObject {
     trace_gl_errors: Option<bool>,
     preserve_aspect_ratio: Option<bool>,
     force_composition: Option<bool>,
-    gles_native: Option<bool>,
+    renderer_mode_tag: Option<i32>,
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
@@ -392,6 +392,9 @@ struct AppPickerDelegateHostObject {
     language_toggle: bool,
     language_scroll_up: bool,
     language_scroll_down: bool,
+    renderer_mode_toggle: bool,
+    renderer_mode_scroll_up: bool,
+    renderer_mode_scroll_down: bool,
     /// Set when a finger goes down on an app icon (`UIControlEventTouchDown`).
     icon_touch_down: id,
     /// Set when a touch that started on an icon stops being a tap.
@@ -412,7 +415,7 @@ struct PickerSettings {
     orientation: Option<DeviceOrientation>,
     fullscreen: bool,
     preserve_aspect_ratio: bool,
-    gles_native: bool,
+    renderer_mode: RendererMode,
     force_composition: bool,
     show_fps: bool,
     trace_gl_errors: bool,
@@ -423,15 +426,41 @@ struct PickerSettings {
     language_tag: Option<i32>,
 }
 
+fn saved_renderer_mode(contents: &str) -> Option<RendererMode> {
+    let mut renderer_mode = None;
+    let mut legacy_mode = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "renderer_mode" => {
+                if let Ok(mode) = RendererMode::from_short_name(value) {
+                    renderer_mode = Some(mode);
+                }
+            }
+            "gles_native" => match value {
+                "true" => legacy_mode = Some(RendererMode::NativeGles),
+                "false" => legacy_mode = Some(RendererMode::Angle),
+                _ => (),
+            }
+            _ => (),
+        }
+    }
+    renderer_mode.or(legacy_mode)
+}
+
 impl PickerSettings {
     fn load(options: &Options, angle_backend_available: bool) -> Self {
-        let (gles_native, _) = quick_options_gles_native_state(options, angle_backend_available);
+        let (renderer_mode, _) =
+            quick_options_renderer_mode_state(options.renderer_mode, angle_backend_available);
         let mut settings = Self {
             scale_hack: None,
             orientation: None,
             fullscreen: options.fullscreen,
             preserve_aspect_ratio: options.preserve_aspect_ratio,
-            gles_native,
+            renderer_mode,
             force_composition: options.force_composition,
             show_fps: options.print_fps,
             trace_gl_errors: options.trace_gl_errors,
@@ -445,6 +474,9 @@ impl PickerSettings {
         let Ok(contents) = std::fs::read_to_string(path) else {
             return settings;
         };
+        if let Some(mode) = saved_renderer_mode(&contents) {
+            settings.renderer_mode = mode;
+        }
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -468,7 +500,6 @@ impl PickerSettings {
                 }
                 "fullscreen" => set_bool(value, &mut settings.fullscreen),
                 "preserve_aspect_ratio" => set_bool(value, &mut settings.preserve_aspect_ratio),
-                "gles_native" => set_bool(value, &mut settings.gles_native),
                 "force_composition" => set_bool(value, &mut settings.force_composition),
                 "show_fps" => set_bool(value, &mut settings.show_fps),
                 "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
@@ -482,6 +513,8 @@ impl PickerSettings {
                 _ => (),
             }
         }
+        settings.renderer_mode =
+            quick_options_renderer_mode_state(settings.renderer_mode, angle_backend_available).0;
         settings
     }
 
@@ -500,7 +533,7 @@ impl PickerSettings {
              orientation={orientation}\n\
              fullscreen={}\n\
              preserve_aspect_ratio={}\n\
-             gles_native={}\n\
+             renderer_mode={}\n\
              force_composition={}\n\
              show_fps={}\n\
              trace_gl_errors={}\n\
@@ -513,7 +546,7 @@ impl PickerSettings {
                 .map_or_else(|| "default".to_string(), |n| n.to_string()),
             self.fullscreen,
             self.preserve_aspect_ratio,
-            self.gles_native,
+            self.renderer_mode.short_name(),
             self.force_composition,
             self.show_fps,
             self.trace_gl_errors,
@@ -703,9 +736,18 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).force_composition = Some(switch_state);
 }
-- (())glesNative:(id)switch { // UISwitch*
-    let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_native = Some(switch_state);
+- (())rendererMode:(id)sender { // UIButton*
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).renderer_mode_tag = Some(tag as i32);
+}
+- (())rendererModeToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).renderer_mode_toggle = true;
+}
+- (())rendererModeScrollUp {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).renderer_mode_scroll_up = true;
+}
+- (())rendererModeScrollDown {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).renderer_mode_scroll_down = true;
 }
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1045,7 +1087,7 @@ fn app_picker_inner(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     env.window_mut()
         .set_preserve_aspect_ratio(picker_settings.preserve_aspect_ratio);
-    let quick_options_gles_native_switch_enabled = angle_backend_available;
+    let renderer_mode_dropdown_enabled = cfg!(target_os = "android") && angle_backend_available;
     let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
     let settings = setup_settings(
         env,
@@ -1053,7 +1095,7 @@ fn app_picker_inner(
         main_view,
         app_frame,
         &picker_settings,
-        quick_options_gles_native_switch_enabled,
+        renderer_mode_dropdown_enabled,
         show_fullscreen_row,
     );
     let mut quick_options_scale_hack = picker_settings.scale_hack;
@@ -1066,9 +1108,13 @@ fn app_picker_inner(
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
     let mut quick_options_cheat_engine = picker_settings.cheat_engine;
-    let mut quick_options_gles_native = picker_settings.gles_native;
+    let mut quick_options_renderer_mode = picker_settings.renderer_mode;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
+        ..Default::default()
+    };
+    let mut renderer_state = DropdownState {
+        selected: Some(renderer_mode_tag(quick_options_renderer_mode)),
         ..Default::default()
     };
     let mut language_state = DropdownState {
@@ -1090,6 +1136,12 @@ fn app_picker_inner(
         &settings.language_dropdown,
         &language_label_for_tag(language_state.selected),
         &language_state,
+    );
+    refresh_dropdown(
+        env,
+        &settings.renderer_dropdown,
+        &renderer_mode_label_for_tag(renderer_state.selected),
+        &renderer_state,
     );
 
     // Built after the settings screen, so that it is drawn on top of it.
@@ -1423,6 +1475,15 @@ fn app_picker_inner(
         } else if std::mem::take(&mut host_obj.settings_show) {
             show_settings_screen(env, main_run_loop, delegate, &settings);
         } else if std::mem::take(&mut host_obj.settings_hide) {
+            if renderer_state.open {
+                renderer_state.open = false;
+                refresh_dropdown(
+                    env,
+                    &settings.renderer_dropdown,
+                    &renderer_mode_label_for_tag(renderer_state.selected),
+                    &renderer_state,
+                );
+            }
             if device_state.open {
                 device_state.open = false;
                 refresh_dropdown(
@@ -1519,6 +1580,41 @@ fn app_picker_inner(
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
             );
+        } else if let Some(tag) = std::mem::take(&mut host_obj.renderer_mode_tag) {
+            renderer_state.selected = Some(tag);
+            renderer_state.open = false;
+            quick_options_renderer_mode = renderer_mode_from_tag(Some(tag));
+            refresh_dropdown(
+                env,
+                &settings.renderer_dropdown,
+                &renderer_mode_label_for_tag(renderer_state.selected),
+                &renderer_state,
+            );
+        } else if std::mem::take(&mut host_obj.renderer_mode_toggle) {
+            renderer_state.open = !renderer_state.open;
+            refresh_dropdown(
+                env,
+                &settings.renderer_dropdown,
+                &renderer_mode_label_for_tag(renderer_state.selected),
+                &renderer_state,
+            );
+        } else if std::mem::take(&mut host_obj.renderer_mode_scroll_up) {
+            renderer_state.scroll = (renderer_state.scroll - 1).max(0);
+            refresh_dropdown(
+                env,
+                &settings.renderer_dropdown,
+                &renderer_mode_label_for_tag(renderer_state.selected),
+                &renderer_state,
+            );
+        } else if std::mem::take(&mut host_obj.renderer_mode_scroll_down) {
+            renderer_state.scroll = (renderer_state.scroll + 1)
+                .min(dropdown_max_scroll(settings.renderer_dropdown.items.len()));
+            refresh_dropdown(
+                env,
+                &settings.renderer_dropdown,
+                &renderer_mode_label_for_tag(renderer_state.selected),
+                &renderer_state,
+            );
         } else if let Some(tag) = std::mem::take(&mut host_obj.language_tag) {
             language_state.selected = Some(tag);
             language_state.open = false;
@@ -1602,8 +1698,6 @@ fn app_picker_inner(
                 .set_preserve_aspect_ratio(preserve_aspect_ratio);
         } else if let Some(force_composition) = std::mem::take(&mut host_obj.force_composition) {
             quick_options_force_composition_override = Some(force_composition);
-        } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
-            quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = fullscreen;
         }
@@ -1612,7 +1706,7 @@ fn app_picker_inner(
         picker_settings.orientation = quick_options_orientation;
         picker_settings.fullscreen = quick_options_fullscreen;
         picker_settings.preserve_aspect_ratio = quick_options_preserve_aspect_ratio;
-        picker_settings.gles_native = quick_options_gles_native;
+        picker_settings.renderer_mode = quick_options_renderer_mode;
         picker_settings.force_composition =
             quick_options_force_composition_override.unwrap_or(env.options.force_composition);
         picker_settings.show_fps = quick_options_show_fps;
@@ -1720,11 +1814,9 @@ fn app_picker_inner(
     } else {
         option_args.push("--no-trace-gl-errors".to_string());
     }
-    // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
-    // default is now OFF, so the switch has to be able to turn the native
-    // driver back on, and the picker's choice should win over any
-    // `--gles-native`/`--no-gles-native` in the options files.
-    option_args.push(quick_options_gles_native_argument(quick_options_gles_native).to_string());
+    // Always passed explicitly so the picker's renderer choice wins over
+    // options-file settings, including legacy --gles-native switches.
+    option_args.push(quick_options_renderer_mode_argument(quick_options_renderer_mode).to_string());
 
     if let Some(tag) = device_state.selected {
         let tag = tag as NSInteger;
@@ -3479,6 +3571,8 @@ enum SettingsRow {
     LanguageDropdown,
     /// Label and switch: (label, selector, initial state, enabled).
     Toggle(&'static str, &'static str, bool, bool),
+    /// Renderer mode dropdown.
+    RendererDropdown,
 }
 
 const SETTINGS_NAV_BAR_HEIGHT: CGFloat = 44.0;
@@ -3487,6 +3581,9 @@ const SETTINGS_GROUP_INSET: CGFloat = 16.0;
 const SETTINGS_ROW_SIDE_INSET: CGFloat = 16.0;
 const SETTINGS_ROW_HEIGHT: CGFloat = 44.0;
 const SETTINGS_SEGMENT_ROW_HEIGHT: CGFloat = 58.0;
+const FORCE_COMPOSITION_LABEL: &str =
+    "Enable Force Composition ( May fix graphics rendering issues )";
+const FORCE_COMPOSITION_ROW_HEIGHT: CGFloat = 64.0;
 const SETTINGS_HEADER_HEIGHT: CGFloat = 28.0;
 const SETTINGS_SECTION_GAP: CGFloat = 10.0;
 /// Width of the dropdown lists (list plus scrollbar).
@@ -3495,6 +3592,7 @@ const SETTINGS_DROPDOWN_MENU_WIDTH: CGFloat = 280.0;
 fn settings_row_height(row: &SettingsRow) -> CGFloat {
     match row {
         SettingsRow::Segmented(..) => SETTINGS_SEGMENT_ROW_HEIGHT,
+        SettingsRow::Toggle(FORCE_COMPOSITION_LABEL, ..) => FORCE_COMPOSITION_ROW_HEIGHT,
         _ => SETTINGS_ROW_HEIGHT,
     }
 }
@@ -3520,6 +3618,8 @@ struct SettingsStuff {
     device_dropdown: SettingsDropdown,
     /// The "Language" dropdown.
     language_dropdown: SettingsDropdown,
+    /// The "Renderer Mode" dropdown.
+    renderer_dropdown: SettingsDropdown,
 }
 
 /// The views of one settings dropdown: a button in a settings row, and a list
@@ -3546,6 +3646,7 @@ struct DropdownSpec {
     item_selector: &'static str,
     scroll_up_selector: &'static str,
     scroll_down_selector: &'static str,
+    button_font_size: CGFloat,
 }
 
 /// The state that the picker keeps for one settings dropdown.
@@ -3599,7 +3700,7 @@ fn setup_settings(
     super_view: id,
     app_frame: CGRect,
     picker_settings: &PickerSettings,
-    gles_native_switch_enabled: bool,
+    renderer_mode_dropdown_enabled: bool,
     show_fullscreen_row: bool,
 ) -> SettingsStuff {
     let width = app_frame.size.width;
@@ -3743,18 +3844,13 @@ fn setup_settings(
     }
     sections.push(("DISPLAY", display_rows));
     let mut graphics_rows = vec![
-            SettingsRow::Toggle(
-                "GLES Native",
-                "glesNative:",
-            picker_settings.gles_native,
-                gles_native_switch_enabled,
-            ),
-            SettingsRow::Toggle(
-                "May fix graphics issues.",
-                "forceComposition:",
+        SettingsRow::RendererDropdown,
+        SettingsRow::Toggle(
+            FORCE_COMPOSITION_LABEL,
+            "forceComposition:",
             picker_settings.force_composition,
-                true,
-            ),
+            true,
+        ),
         SettingsRow::Toggle("Show FPS", "showFPS:", picker_settings.show_fps, true),
         SettingsRow::Toggle(
             "Trace GL errors",
@@ -3769,7 +3865,7 @@ fn setup_settings(
             "preserveAspectRatio:",
             picker_settings.preserve_aspect_ratio,
             true,
-    ));
+        ));
     }
     sections.push(("GRAPHICS", graphics_rows));
     sections.push((
@@ -3799,8 +3895,9 @@ fn setup_settings(
     let mut orientation_buttons: Vec<id> = Vec::new();
     let mut device_dropdown: Option<SettingsDropdown> = None;
     let mut language_dropdown: Option<SettingsDropdown> = None;
+    let mut renderer_dropdown: Option<SettingsDropdown> = None;
     let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
-    // Where the lists of both dropdowns open: just under the navigation bar.
+    // Where dropdown menus open: just under the navigation bar.
     let menu_origin = CGPoint {
         x: (width - SETTINGS_DROPDOWN_MENU_WIDTH) / 2.0,
         y: SETTINGS_NAV_BAR_HEIGHT + status_offset + 12.0,
@@ -3865,21 +3962,29 @@ fn setup_settings(
                     }
                 }
                 SettingsRow::DeviceDropdown => {
+                    let dropdown_width: CGFloat = 190.0;
+                    let label_width = (inner_width - 2.0 * side - dropdown_width - 8.0).max(0.0);
                     let label_view = new_label(
                         env,
-                        rect(side, row_y + 11.0, 150.0, 22.0),
+                        rect(side, row_y + 4.0, label_width, 36.0),
                         "Device model",
-                        16.0,
+                        14.0,
                         false,
                         black,
                     );
+                    () = msg![env; label_view setNumberOfLines:2];
                     () = msg![env; group addSubview:label_view];
                     device_dropdown = Some(make_settings_dropdown(
                         env,
                         delegate,
                         group,
                         settings_view,
-                        rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + 7.0,
+                            dropdown_width,
+                            30.0,
+                        ),
                         menu_origin,
                         device_model_dropdown_spec(),
                     ));
@@ -3904,30 +4009,69 @@ fn setup_settings(
                         language_dropdown_spec(),
                     ));
                 }
+                SettingsRow::RendererDropdown => {
+                    let dropdown_width: CGFloat = 130.0;
+                    let label_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let renderer_label = if cfg!(target_os = "android") {
+                        "Renderer Mode"
+                    } else {
+                        "Renderer Mode (Android only)"
+                    };
+                    let label_view = new_label(
+                        env,
+                        rect(side, row_y + 4.0, label_width, 36.0),
+                        renderer_label,
+                        14.0,
+                        false,
+                        black,
+                    );
+                    () = msg![env; label_view setNumberOfLines:2];
+                    () = msg![env; group addSubview:label_view];
+                    let dropdown = make_settings_dropdown(
+                        env,
+                        delegate,
+                        group,
+                        settings_view,
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + 7.0,
+                            dropdown_width,
+                            30.0,
+                        ),
+                        menu_origin,
+                        renderer_mode_dropdown_spec(),
+                    );
+                    () = msg![env; (dropdown.button) setEnabled:renderer_mode_dropdown_enabled];
+                    renderer_dropdown = Some(dropdown);
+                }
                 SettingsRow::Toggle(label_text, selector, default_state, enabled) => {
-                    let switch_width: CGFloat = 94.0;
+                    let long_label = label_text == FORCE_COMPOSITION_LABEL;
+                    let switch_width: CGFloat = if long_label { 74.0 } else { 94.0 };
+                    let label_height = if long_label { 56.0 } else { 36.0 };
+                    let label_font = if long_label { 14.0 } else { 16.0 };
+                    let label_lines = if long_label { 3 } else { 2 };
+                    let row_height = settings_row_height(row);
                     let label_view = new_label(
                         env,
                         rect(
                             side,
                             row_y + 4.0,
                             inner_width - 2.0 * side - switch_width - 8.0,
-                            36.0,
+                            label_height,
                         ),
                         label_text,
-                        16.0,
+                        label_font,
                         false,
                         black,
                     );
                     () = msg![env; label_view setTextAlignment:UITextAlignmentLeft];
-                    // Long labels wrap onto a second line, as in iOS Settings.
-                    () = msg![env; label_view setNumberOfLines:2];
+                    () = msg![env; label_view setNumberOfLines:label_lines];
                     () = msg![env; group addSubview:label_view];
 
                     let switch: id = msg_class![env; UISwitch alloc];
                     let switch: id = msg![env; switch initWithFrame:(rect(
                         inner_width - side - switch_width,
-                        row_y + 8.5,
+                        row_y + (row_height - 27.0) / 2.0,
                         switch_width,
                         27.0,
                     ))];
@@ -3984,6 +4128,8 @@ fn setup_settings(
             .expect("the settings screen always has a device model row"),
         language_dropdown: language_dropdown
             .expect("the settings screen always has a language row"),
+        renderer_dropdown: renderer_dropdown
+            .expect("the settings screen always has a renderer mode row"),
     }
 }
 
@@ -4001,9 +4147,9 @@ const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 30.0;
 
 /// The choices shown in the device-model dropdown, in display order, as
 /// `(title, tag)` pairs: "Default" (no override), "Auto" (match host screen),
-/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order,
-/// tagged with the model's own picker tag rather than its position, so that
-/// saved settings survive changes to the display order.
+/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order.
+/// Model titles include portrait pixel resolution and use each model's own
+/// picker tag, so saved settings survive changes to the display order.
 fn device_model_entries() -> Vec<(String, NSInteger)> {
     use crate::window::DeviceFamily;
     let mut entries: Vec<(String, NSInteger)> = Vec::new();
@@ -4013,9 +4159,20 @@ fn device_model_entries() -> Vec<(String, NSInteger)> {
         let Some(tag) = family.tag() else {
             continue;
         };
-        entries.push((family.display_name().to_string(), tag as NSInteger));
+        entries.push((device_model_resolution_label(family), tag as NSInteger));
     }
     entries
+}
+
+fn device_model_resolution_label(family: &crate::window::DeviceFamily) -> String {
+    let (width, height) = family.portrait_size();
+    let scale = family.scale_factor() as u32;
+    format!(
+        "{} ({}x{}px)",
+        family.display_name(),
+        width * scale,
+        height * scale
+    )
 }
 
 /// The spec of the "Device model" dropdown.
@@ -4026,6 +4183,7 @@ fn device_model_dropdown_spec() -> DropdownSpec {
         item_selector: "deviceModel:",
         scroll_up_selector: "deviceModelScrollUp",
         scroll_down_selector: "deviceModelScrollDown",
+        button_font_size: 14.0,
     }
 }
 
@@ -4053,6 +4211,45 @@ const LANGUAGE_CHOICES: &[(&str, Option<&str>)] = &[
     ("简体中文", Some("zh-Hans,zh,en")),
 ];
 
+const RENDERER_MODE_ANGLE_TAG: NSInteger = 2000;
+const RENDERER_MODE_NATIVE_GLES_TAG: NSInteger = 2001;
+
+fn renderer_mode_dropdown_spec() -> DropdownSpec {
+    DropdownSpec {
+        entries: vec![
+            ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
+            ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
+        ],
+        toggle_selector: "rendererModeToggle",
+        item_selector: "rendererMode:",
+        scroll_up_selector: "rendererModeScrollUp",
+        scroll_down_selector: "rendererModeScrollDown",
+        button_font_size: 16.0,
+    }
+}
+
+fn renderer_mode_tag(mode: RendererMode) -> i32 {
+    match mode {
+        RendererMode::Angle => RENDERER_MODE_ANGLE_TAG as i32,
+        RendererMode::NativeGles => RENDERER_MODE_NATIVE_GLES_TAG as i32,
+    }
+}
+
+fn renderer_mode_from_tag(tag: Option<i32>) -> RendererMode {
+    match tag.map(|tag| tag as NSInteger) {
+        Some(RENDERER_MODE_NATIVE_GLES_TAG) => RendererMode::NativeGles,
+        _ => RendererMode::Angle,
+    }
+}
+
+fn renderer_mode_label_for_tag(tag: Option<i32>) -> String {
+    match renderer_mode_from_tag(tag) {
+        RendererMode::Angle => "ANGLE",
+        RendererMode::NativeGles => "Native GLES",
+    }
+    .to_string()
+}
+
 /// The spec of the "Language" dropdown.
 fn language_dropdown_spec() -> DropdownSpec {
     DropdownSpec {
@@ -4065,6 +4262,7 @@ fn language_dropdown_spec() -> DropdownSpec {
         item_selector: "language:",
         scroll_up_selector: "languageScrollUp",
         scroll_down_selector: "languageScrollDown",
+        button_font_size: 16.0,
     }
 }
 
@@ -4092,7 +4290,7 @@ fn device_model_label_for_tag(tag: Option<i32>) -> String {
         None | Some(DEVICE_TAG_DEFAULT) => "Default".to_string(),
         Some(DEVICE_TAG_AUTO) => "Auto".to_string(),
         Some(idx) => DeviceFamily::for_tag(idx as usize)
-            .map(|f| f.display_name().to_string())
+            .map(|family| device_model_resolution_label(&family))
             .unwrap_or_else(|| "Default".to_string()),
     }
 }
@@ -4177,6 +4375,7 @@ fn make_settings_dropdown(
         item_selector,
         scroll_up_selector,
         scroll_down_selector,
+        button_font_size,
     } = spec;
     let list_width: CGFloat = 256.0;
     let scrollbar_width: CGFloat = 24.0;
@@ -4205,7 +4404,7 @@ fn make_settings_dropdown(
     () = msg![env; button setFrame:button_frame];
     () = msg![env; button layoutSubviews];
     let button_label: id = msg![env; button titleLabel];
-    let button_font: id = msg_class![env; UIFont systemFontOfSize:(16.0 as CGFloat)];
+    let button_font: id = msg_class![env; UIFont systemFontOfSize:button_font_size];
     () = msg![env; button_label setFont:button_font];
     () = msg![env; button addTarget:delegate
                              action:(env.objc.lookup_selector(toggle_selector).unwrap())
@@ -4614,18 +4813,24 @@ fn quick_options_force_composition_argument(enabled: bool) -> &'static str {
     }
 }
 
-/// Returns `(native_enabled, switch_enabled)` for the probed ANGLE state.
-fn quick_options_gles_native_state(options: &Options, angle_available: bool) -> (bool, bool) {
-    (options.gles_native || !angle_available, angle_available)
+/// Returns the effective renderer mode and whether it can be changed in the picker.
+fn quick_options_renderer_mode_state(
+    renderer_mode: RendererMode,
+    angle_available: bool,
+) -> (RendererMode, bool) {
+    let mode = if renderer_mode == RendererMode::Angle && !angle_available {
+        RendererMode::NativeGles
+    } else {
+        renderer_mode
+    };
+    (mode, angle_available)
 }
 
-/// Launch argument matching the "GLES Native" switch. Always emitted so that
-/// the switch's choice overrides the base default and the options files.
-fn quick_options_gles_native_argument(enabled: bool) -> &'static str {
-    if enabled {
-        "--gles-native"
-    } else {
-        "--no-gles-native"
+/// Explicit launch argument so the picker choice overrides option-file values.
+fn quick_options_renderer_mode_argument(mode: RendererMode) -> &'static str {
+    match mode {
+        RendererMode::Angle => "--renderer-mode=angle",
+        RendererMode::NativeGles => "--renderer-mode=native-gles",
     }
 }
 
@@ -4654,43 +4859,112 @@ mod quick_options_trainer_tests {
 }
 
 #[cfg(test)]
-mod quick_options_gles_native_tests {
+mod device_model_resolution_tests {
+    use super::*;
+    use crate::window::DeviceFamily;
+
+    #[test]
+    fn device_model_labels_show_portrait_pixel_resolution() {
+        let entries = device_model_entries();
+        for family in DeviceFamily::ALL_SELECTABLE {
+            let tag = family.tag().unwrap() as NSInteger;
+            let (label, _) = entries
+                .iter()
+                .find(|(_, entry_tag)| *entry_tag == tag)
+                .unwrap();
+            assert!(label.ends_with("px)"));
+            assert_eq!(&device_model_label_for_tag(Some(tag as i32)), label);
+        }
+
+        for (family, expected) in [
+            (DeviceFamily::iPhone3GS, "iPhone 3GS (320x480px)"),
+            (DeviceFamily::iPhone4, "iPhone 4 (640x960px)"),
+            (DeviceFamily::iPad3, "iPad 3 (1536x2048px)"),
+        ] {
+            assert_eq!(device_model_resolution_label(&family), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod saved_renderer_mode_tests {
     use super::*;
 
     #[test]
-    fn gles_native_switch_follows_backend_availability_and_option_state() {
+    fn migrates_legacy_values_and_prefers_current_setting() {
+        assert_eq!(
+            saved_renderer_mode("gles_native=true"),
+            Some(RendererMode::NativeGles)
+        );
+        assert_eq!(
+            saved_renderer_mode("gles_native=false"),
+            Some(RendererMode::Angle)
+        );
+        assert_eq!(
+            saved_renderer_mode("renderer_mode=native-gles\ngles_native=false"),
+            Some(RendererMode::NativeGles)
+        );
+        assert_eq!(
+            saved_renderer_mode("gles_native=false\nrenderer_mode=native-gles"),
+            Some(RendererMode::NativeGles)
+        );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_renderer_mode_tests {
+    use super::*;
+
+    #[test]
+    fn renderer_mode_dropdown_tags_round_trip() {
+        let angle_tag = renderer_mode_tag(RendererMode::Angle);
+        let native_tag = renderer_mode_tag(RendererMode::NativeGles);
+        assert_eq!(renderer_mode_from_tag(Some(angle_tag)), RendererMode::Angle);
+        assert_eq!(
+            renderer_mode_from_tag(Some(native_tag)),
+            RendererMode::NativeGles
+        );
+        assert_eq!(renderer_mode_label_for_tag(Some(angle_tag)), "ANGLE");
+        assert_eq!(renderer_mode_label_for_tag(Some(native_tag)), "Native GLES");
+    }
+
+    #[test]
+    fn renderer_mode_follows_backend_availability_and_option_state() {
         let mut options = Options::default();
 
-        let (mut enabled, mut switch_enabled) = quick_options_gles_native_state(&options, true);
-        assert!(!enabled);
-        assert!(switch_enabled);
+        let (mut mode, mut dropdown_enabled) =
+            quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::Angle);
+        assert!(dropdown_enabled);
         assert_eq!(
-            quick_options_gles_native_argument(enabled),
-            "--no-gles-native"
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=angle"
         );
 
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
-        assert!(enabled);
-        assert!(!switch_enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, false);
+        assert_eq!(mode, RendererMode::NativeGles);
+        assert!(!dropdown_enabled);
+        assert_eq!(
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=native-gles"
+        );
 
         options.parse_argument("--gles-native").unwrap();
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
-        assert!(enabled);
-        assert!(switch_enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
-
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
-        assert!(enabled);
-        assert!(!switch_enabled);
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::NativeGles);
+        assert!(dropdown_enabled);
+        assert_eq!(
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=native-gles"
+        );
 
         options.parse_argument("--no-gles-native").unwrap();
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
-        assert!(!enabled);
-        assert!(switch_enabled);
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::Angle);
+        assert!(dropdown_enabled);
         assert_eq!(
-            quick_options_gles_native_argument(enabled),
-            "--no-gles-native"
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=angle"
         );
     }
 }

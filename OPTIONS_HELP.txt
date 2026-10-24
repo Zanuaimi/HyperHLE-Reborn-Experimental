@@ -247,6 +247,17 @@ Game controller options:
         movements within a 10px radius will be completely ignored.
 
 Graphics driver options:
+    --renderer-mode=angle
+    --renderer-mode=native-gles
+        Select the host OpenGL ES renderer on Android. ANGLE is the default;
+        native-gles uses the device's native OpenGL ES driver. The app picker's
+        Renderer Mode setting overrides this for launches from the picker.
+
+    --gles-native
+    --no-gles-native
+        Legacy aliases for --renderer-mode=native-gles and
+        --renderer-mode=angle respectively.
+
     --gles2-compat
         Enables touchHLE's experimental OpenGL ES 2.0 subset using the desktop
         OpenGL 2.1 compatibility backend. This is an app-specific option and
@@ -455,15 +466,6 @@ Other options:
         This option exists for debugging black-screen / wrong-render bugs
         and adds a glGetError() round-trip per call, so it should not be
         left on for normal use.
-
-    --gles-native / --no-gles-native
-        Android only. OFF by default (and exposed as the "GLES Native" switch
-        in the app picker's Settings screen): use the bundled ANGLE libraries
-        for OpenGL ES. Pass --gles-native (or switch "GLES Native" on) to use
-        the vendor's native OpenGL ES driver (Adreno/Mali) instead. The
-        native driver behaves closest to real iPhone-era hardware and avoids
-        ANGLE's stricter shader validation, which breaks some apps (e.g.
-        Gangstar), but it differs a lot between devices, so it is opt-in.
 
     --fix-texture-min-filter
         Workaround for apps that rely on the default ES 1.1
