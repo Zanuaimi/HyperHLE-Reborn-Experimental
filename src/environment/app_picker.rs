@@ -4213,12 +4213,17 @@ const LANGUAGE_CHOICES: &[(&str, Option<&str>)] = &[
 
 const RENDERER_MODE_ANGLE_TAG: NSInteger = 2000;
 const RENDERER_MODE_NATIVE_GLES_TAG: NSInteger = 2001;
+const RENDERER_MODE_ANGLE_VULKAN_TAG: NSInteger = 2002;
 
 fn renderer_mode_dropdown_spec() -> DropdownSpec {
     DropdownSpec {
         entries: vec![
             ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
             ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
+            (
+                "ANGLE to Vulkan".to_string(),
+                RENDERER_MODE_ANGLE_VULKAN_TAG,
+            ),
         ],
         toggle_selector: "rendererModeToggle",
         item_selector: "rendererMode:",
@@ -4232,12 +4237,14 @@ fn renderer_mode_tag(mode: RendererMode) -> i32 {
     match mode {
         RendererMode::Angle => RENDERER_MODE_ANGLE_TAG as i32,
         RendererMode::NativeGles => RENDERER_MODE_NATIVE_GLES_TAG as i32,
+        RendererMode::AngleVulkan => RENDERER_MODE_ANGLE_VULKAN_TAG as i32,
     }
 }
 
 fn renderer_mode_from_tag(tag: Option<i32>) -> RendererMode {
     match tag.map(|tag| tag as NSInteger) {
         Some(RENDERER_MODE_NATIVE_GLES_TAG) => RendererMode::NativeGles,
+        Some(RENDERER_MODE_ANGLE_VULKAN_TAG) => RendererMode::AngleVulkan,
         _ => RendererMode::Angle,
     }
 }
@@ -4246,6 +4253,7 @@ fn renderer_mode_label_for_tag(tag: Option<i32>) -> String {
     match renderer_mode_from_tag(tag) {
         RendererMode::Angle => "ANGLE",
         RendererMode::NativeGles => "Native GLES",
+        RendererMode::AngleVulkan => "ANGLE to Vulkan",
     }
     .to_string()
 }
@@ -4818,7 +4826,7 @@ fn quick_options_renderer_mode_state(
     renderer_mode: RendererMode,
     angle_available: bool,
 ) -> (RendererMode, bool) {
-    let mode = if renderer_mode == RendererMode::Angle && !angle_available {
+    let mode = if renderer_mode != RendererMode::NativeGles && !angle_available {
         RendererMode::NativeGles
     } else {
         renderer_mode
@@ -4831,6 +4839,7 @@ fn quick_options_renderer_mode_argument(mode: RendererMode) -> &'static str {
     match mode {
         RendererMode::Angle => "--renderer-mode=angle",
         RendererMode::NativeGles => "--renderer-mode=native-gles",
+        RendererMode::AngleVulkan => "--renderer-mode=angle-vulkan",
     }
 }
 
@@ -4908,6 +4917,10 @@ mod saved_renderer_mode_tests {
             saved_renderer_mode("gles_native=false\nrenderer_mode=native-gles"),
             Some(RendererMode::NativeGles)
         );
+        assert_eq!(
+            saved_renderer_mode("renderer_mode=angle-vulkan"),
+            Some(RendererMode::AngleVulkan)
+        );
     }
 }
 
@@ -4919,13 +4932,22 @@ mod quick_options_renderer_mode_tests {
     fn renderer_mode_dropdown_tags_round_trip() {
         let angle_tag = renderer_mode_tag(RendererMode::Angle);
         let native_tag = renderer_mode_tag(RendererMode::NativeGles);
+        let vulkan_tag = renderer_mode_tag(RendererMode::AngleVulkan);
         assert_eq!(renderer_mode_from_tag(Some(angle_tag)), RendererMode::Angle);
         assert_eq!(
             renderer_mode_from_tag(Some(native_tag)),
             RendererMode::NativeGles
         );
+        assert_eq!(
+            renderer_mode_from_tag(Some(vulkan_tag)),
+            RendererMode::AngleVulkan
+        );
         assert_eq!(renderer_mode_label_for_tag(Some(angle_tag)), "ANGLE");
         assert_eq!(renderer_mode_label_for_tag(Some(native_tag)), "Native GLES");
+        assert_eq!(
+            renderer_mode_label_for_tag(Some(vulkan_tag)),
+            "ANGLE to Vulkan"
+        );
     }
 
     #[test]
@@ -4966,6 +4988,21 @@ mod quick_options_renderer_mode_tests {
             quick_options_renderer_mode_argument(mode),
             "--renderer-mode=angle"
         );
+
+        options
+            .parse_argument("--renderer-mode=angle-vulkan")
+            .unwrap();
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::AngleVulkan);
+        assert!(dropdown_enabled);
+        assert_eq!(
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=angle-vulkan"
+        );
+
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, false);
+        assert_eq!(mode, RendererMode::NativeGles);
+        assert!(!dropdown_enabled);
     }
 }
 

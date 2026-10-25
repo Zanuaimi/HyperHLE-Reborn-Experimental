@@ -37,16 +37,37 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-static ANDROID_ANGLE_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+static ANDROID_ANGLE_LIBRARIES_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
-/// Whether Quick Options may offer ANGLE; unknown support stays enabled until a context probe fails.
+/// Whether Quick Options may offer bundled ANGLE; unknown support stays enabled
+/// until the libraries fail to load.
 pub fn angle_backend_available() -> bool {
-    !cfg!(target_os = "android") || !ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed)
+    !cfg!(target_os = "android") || !ANDROID_ANGLE_LIBRARIES_UNAVAILABLE.load(Ordering::Relaxed)
 }
 
 #[cfg(any(target_os = "android", test))]
 fn should_attempt_android_angle(renderer_mode: RendererMode, angle_unavailable: bool) -> bool {
-    renderer_mode == RendererMode::Angle && !angle_unavailable
+    renderer_mode != RendererMode::NativeGles && !angle_unavailable
+}
+
+#[cfg(any(target_os = "android", test))]
+fn angle_platform_for_renderer_mode(renderer_mode: RendererMode) -> Option<&'static str> {
+    match renderer_mode {
+        RendererMode::Angle => Some("gl"),
+        RendererMode::AngleVulkan => Some("vulkan"),
+        RendererMode::NativeGles => None,
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn angle_driver_matches_mode(renderer_mode: RendererMode, description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    let is_angle = description.contains("angle");
+    match renderer_mode {
+        RendererMode::Angle => is_angle && !description.contains("vulkan"),
+        RendererMode::NativeGles => !is_angle,
+        RendererMode::AngleVulkan => is_angle && description.contains("vulkan"),
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -59,7 +80,10 @@ fn angle_backend_unsafe_on_power_vr_bxm_8_256(description: &str) -> bool {
 
 #[cfg(test)]
 mod android_angle_fallback_tests {
-    use super::{angle_backend_unsafe_on_power_vr_bxm_8_256, should_attempt_android_angle};
+    use super::{
+        angle_backend_unsafe_on_power_vr_bxm_8_256, angle_driver_matches_mode,
+        angle_platform_for_renderer_mode, should_attempt_android_angle,
+    };
     use crate::options::RendererMode;
 
     #[test]
@@ -93,13 +117,53 @@ mod android_angle_fallback_tests {
     }
 
     #[test]
-    fn selects_angle_only_when_requested_and_available() {
+    fn selects_angle_backend_only_when_requested_and_available() {
         assert!(should_attempt_android_angle(RendererMode::Angle, false));
+        assert!(should_attempt_android_angle(
+            RendererMode::AngleVulkan,
+            false
+        ));
         assert!(!should_attempt_android_angle(
             RendererMode::NativeGles,
             false
         ));
         assert!(!should_attempt_android_angle(RendererMode::Angle, true));
+        assert!(!should_attempt_android_angle(
+            RendererMode::AngleVulkan,
+            true
+        ));
+    }
+
+    #[test]
+    fn angle_platform_matches_renderer_mode() {
+        assert_eq!(
+            angle_platform_for_renderer_mode(RendererMode::Angle),
+            Some("gl")
+        );
+        assert_eq!(
+            angle_platform_for_renderer_mode(RendererMode::AngleVulkan),
+            Some("vulkan")
+        );
+        assert_eq!(
+            angle_platform_for_renderer_mode(RendererMode::NativeGles),
+            None
+        );
+        assert!(angle_driver_matches_mode(
+            RendererMode::Angle,
+            "OpenGL ES 3.2 (ANGLE) / ANGLE (OpenGL ES)"
+        ));
+        assert!(angle_driver_matches_mode(
+            RendererMode::AngleVulkan,
+            "OpenGL ES 3.2 (ANGLE) / ANGLE (Vulkan 1.1)"
+        ));
+        assert!(!angle_driver_matches_mode(
+            RendererMode::Angle,
+            "OpenGL ES 3.2 (ANGLE) / ANGLE (Vulkan 1.1)"
+        ));
+        assert!(!angle_driver_matches_mode(
+            RendererMode::AngleVulkan,
+            "OpenGL ES 3.2 / Qualcomm Adreno"
+        ));
     }
 }
 
@@ -789,19 +853,20 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
 /// Configure the host OpenGL ES driver on Android.
 ///
 /// This runs before creating an SDL window/context, because SDL loads EGL and
-/// GLES at context-creation time. `false` clears bundled overrides; `true`
-/// stages the ANGLE libraries when they can be loaded. A successful GL context
-/// is still checked separately to ensure ANGLE actually became active.
+/// GLES at context-creation time. ANGLE's environment override selects its
+/// OpenGL ES or Vulkan backend. A successful context is checked separately to
+/// ensure the requested backend became active.
 #[cfg(target_os = "android")]
-fn configure_android_angle_driver(use_angle: bool) -> bool {
-    if !use_angle {
+fn configure_android_angle_driver(renderer_mode: RendererMode) -> bool {
+    let Some(angle_platform) = angle_platform_for_renderer_mode(renderer_mode) else {
         // Do not leave a stale or user-provided override pointing at the
         // bundled ANGLE; SDL will use Android's system OpenGL ES driver.
         env::remove_var("SDL_VIDEO_EGL_DRIVER");
         env::remove_var("SDL_VIDEO_GL_DRIVER");
+        env::remove_var("ANGLE_DEFAULT_PLATFORM");
         log!("Native GLES requested; using the Android system OpenGL ES driver.");
         return false;
-    }
+    };
     const CANDIDATES: &[(&str, &str, &str)] = &[
         (
             "libEGL_angle.so",
@@ -844,8 +909,10 @@ fn configure_android_angle_driver(use_angle: bool) -> bool {
         // ANGLE's ES 1.1 front-end also resolves higher-version entry points
         // through EGL's get-proc-address mechanism.
         env::set_var("SDL_VIDEO_GL_DRIVER", gles1);
+        env::set_var("ANGLE_DEFAULT_PLATFORM", angle_platform);
         log!(
-            "Using bundled ANGLE for Android OpenGL ES ({} / {}).",
+            "Using bundled ANGLE {} backend for Android OpenGL ES ({} / {}).",
+            angle_platform,
             egl,
             gles1
         );
@@ -856,6 +923,7 @@ fn configure_android_angle_driver(use_angle: bool) -> bool {
     // driver; SDL will use Android's system OpenGL ES fallback.
     env::remove_var("SDL_VIDEO_EGL_DRIVER");
     env::remove_var("SDL_VIDEO_GL_DRIVER");
+    env::remove_var("ANGLE_DEFAULT_PLATFORM");
     log!("Bundled ANGLE is unavailable; using the Android system OpenGL ES driver.");
     false
 }
@@ -969,8 +1037,8 @@ impl Window {
         }
     }
 
-    /// Create the window, retrying with native GLES if bundled ANGLE is unavailable
-    /// or unsafe.
+    /// Create the window, retrying with native GLES if the selected ANGLE backend
+    /// is unavailable or unsafe.
     pub fn new(
         title: &str,
         icon: Option<Image>,
@@ -979,28 +1047,34 @@ impl Window {
     ) -> Result<Window, String> {
         #[cfg(target_os = "android")]
         {
-            let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
-            if should_attempt_android_angle(options.renderer_mode, angle_unavailable) {
-                if configure_android_angle_driver(true) {
+            let angle_libraries_unavailable =
+                ANDROID_ANGLE_LIBRARIES_UNAVAILABLE.load(Ordering::Relaxed);
+            if should_attempt_android_angle(options.renderer_mode, angle_libraries_unavailable) {
+                if configure_android_angle_driver(options.renderer_mode) {
                     match Self::new_with_configured_driver(
                         title,
                         icon.clone(),
                         launch_image.clone(),
                         options,
                     ) {
-                        Ok(window) if window.is_angle_backend() => {
-                            ANDROID_ANGLE_UNAVAILABLE.store(false, Ordering::Relaxed);
+                        Ok(window)
+                            if angle_driver_matches_mode(
+                                options.renderer_mode,
+                                window.gl_driver_description(),
+                            ) =>
+                        {
+                            ANDROID_ANGLE_LIBRARIES_UNAVAILABLE.store(false, Ordering::Relaxed);
                             return Ok(window);
                         }
                         Ok(window) => {
                             let driver = window.gl_driver_description().to_owned();
-                            ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
                             log!(
-                                "ANGLE was requested, but SDL activated a non-ANGLE driver ({}). Retrying with native GLES.",
+                                "ANGLE {:?} was requested, but SDL activated an unexpected backend ({}). Retrying with native GLES.",
+                                options.renderer_mode,
                                 driver
                             );
                             drop(window);
-                            configure_android_angle_driver(false);
+                            configure_android_angle_driver(RendererMode::NativeGles);
                             return Self::new_with_configured_driver(
                                 title,
                                 icon,
@@ -1009,18 +1083,18 @@ impl Window {
                             )
                             .map_err(|native_error| {
                                 format!(
-                                    "ANGLE activated a non-ANGLE driver ({}); native GLES fallback failed ({})",
-                                    driver, native_error
+                                    "ANGLE {:?} activated an unexpected backend ({}); native GLES fallback failed ({})",
+                                    options.renderer_mode, driver, native_error
                                 )
                             });
                         }
                         Err(angle_error) => {
-                            ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
                             log!(
-                                "Bundled ANGLE could not be used: {}. Retrying with the Android native GLES driver.",
+                                "Bundled ANGLE {:?} could not be used: {}. Retrying with the Android native GLES driver.",
+                                options.renderer_mode,
                                 angle_error
                             );
-                            configure_android_angle_driver(false);
+                            configure_android_angle_driver(RendererMode::NativeGles);
                             return Self::new_with_configured_driver(
                                 title,
                                 icon,
@@ -1029,15 +1103,15 @@ impl Window {
                             )
                             .map_err(|native_error| {
                                 format!(
-                                    "Bundled ANGLE could not be used ({}); native GLES fallback failed ({})",
-                                    angle_error, native_error
+                                    "Bundled ANGLE {:?} could not be used ({}); native GLES fallback failed ({})",
+                                    options.renderer_mode, angle_error, native_error
                                 )
                             });
                         }
                     }
                 }
 
-                ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
+                ANDROID_ANGLE_LIBRARIES_UNAVAILABLE.store(true, Ordering::Relaxed);
                 return Self::new_with_configured_driver(title, icon, launch_image, options)
                     .map_err(|native_error| {
                         format!(
@@ -1047,12 +1121,12 @@ impl Window {
                     });
             }
 
-            if options.renderer_mode == RendererMode::Angle && angle_unavailable {
+            if options.renderer_mode != RendererMode::NativeGles && angle_libraries_unavailable {
                 log!(
-                    "Bundled ANGLE was previously unavailable; using the Android native GLES driver."
+                    "Bundled ANGLE libraries were previously unavailable; using the Android native GLES driver."
                 );
             }
-            configure_android_angle_driver(false);
+            configure_android_angle_driver(RendererMode::NativeGles);
         }
 
         Self::new_with_configured_driver(title, icon, launch_image, options)
