@@ -24,6 +24,12 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Collections;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import org.json.JSONException;
+import org.json.JSONObject;
 
 /**
  * A wrapper class over SDLActivity
@@ -84,23 +90,24 @@ public class MainActivity extends SDLActivity {
     // .ipa file picker. Must match window.rs ADD_IPA_COMMAND.
     private static final int MSG_ADD_IPA = 0x8000;
 
-    // Message ID sent from the Rust WebView bridge (see android_web_view.rs)
-    // to notify the emulated app that a page finished loading in a real
-    // WebView overlay. Payload packs (overlay id, action) into one long.
-
     // Request codes for system document pickers started by this activity.
     private static final int REQUEST_ADD_IPA = 1;
     private static final int REQUEST_OPEN_APPS_FOLDER = 2;
 
     // =====================================================================
     // Real WebView overlay support (called from Rust via JNI; see
-    // src/android_web_view.rs). Each UIWebView in the emulated app can
-    // display a genuine Android WebView layered on top of the SDL surface,
-    // with real page loading (HTML/CSS/JS), link navigation, back/forward
-    // and JavaScript evaluation.
+    // src/android_web_view.rs). Page lifecycle events are queued here and
+    // polled by Rust on its emulation thread; never call guest code directly
+    // from Android's WebView/UI thread.
     // =====================================================================
     private static final java.util.HashMap<Integer, android.webkit.WebView> webOverlays =
             new java.util.HashMap<Integer, android.webkit.WebView>();
+    private static final ConcurrentHashMap<Integer, Integer> webOverlayLoadIds =
+            new ConcurrentHashMap<Integer, Integer>();
+    private static final ConcurrentHashMap<Integer, java.util.concurrent.atomic.AtomicInteger>
+            webOverlayPageIds = new ConcurrentHashMap<Integer, java.util.concurrent.atomic.AtomicInteger>();
+    private static final ConcurrentLinkedQueue<String> webOverlayEvents =
+            new ConcurrentLinkedQueue<String>();
     private static int nextWebOverlayId = 1;
 
     // Open a URL in the system browser (or the app that owns the scheme,
@@ -185,25 +192,29 @@ public class MainActivity extends SDLActivity {
         }
     }
 
-    // Create a new overlay WebView loading `url` (may be empty to create it
-    // blank). x/y/w/h are in window pixels; w or h <= 0 means "match the
-    // window" on that axis. Returns the overlay id (always > 0).
-    public static int showWebOverlay(final String url, final int x, final int y,
-                                     final int w, final int h) {
+    // Create a blank overlay WebView. x/y/w/h are in window pixels; w or h <= 0
+    // means "match the window" on that axis. Returns the overlay id (always > 0).
+    public static int showWebOverlay(final int x, final int y, final int w, final int h,
+                                     final boolean networkAccess) {
+        android.app.Activity act = mSingleton;
+        if (act == null) return -1;
         final int id = nextWebOverlayId++;
-        mSingleton.runOnUiThread(new Runnable() {
+        act.runOnUiThread(new Runnable() {
             public void run() {
-                createWebOverlay(id, url, x, y, w, h);
+                createWebOverlay(id, x, y, w, h, networkAccess);
             }
         });
         return id;
     }
 
-    private static void createWebOverlay(int id, String url, int x, int y, int w, int h) {
+    private static void createWebOverlay(int id, int x, int y, int w, int h,
+                                         boolean networkAccess) {
         android.app.Activity act = mSingleton;
         if (act == null) return;
         try {
             android.webkit.WebView wv = new android.webkit.WebView(act);
+            webOverlayLoadIds.put(id, 0);
+            webOverlayPageIds.put(id, new java.util.concurrent.atomic.AtomicInteger(0));
             android.webkit.WebSettings ws = wv.getSettings();
             ws.setJavaScriptEnabled(true);
             ws.setDomStorageEnabled(true);
@@ -213,13 +224,100 @@ public class MainActivity extends SDLActivity {
             ws.setDisplayZoomControls(false);
             ws.setSupportZoom(true);
             ws.setMediaPlaybackRequiresUserGesture(false);
+            ws.setBlockNetworkLoads(!networkAccess);
             wv.setWebChromeClient(new android.webkit.WebChromeClient());
             wv.setWebViewClient(new android.webkit.WebViewClient() {
                 @Override
-                public void onPageFinished(android.webkit.WebView view, String u) {
-                    // The emulated side already fires webViewDidFinishLoad:
-                    // on a short timer after the load starts, so nothing
-                    // needs to be sent back into native code here.
+                public void onPageStarted(android.webkit.WebView view, String url,
+                                          android.graphics.Bitmap favicon) {
+                    int loadId = currentWebOverlayLoadId(id);
+                    int pageId = currentWebOverlayPageId(id);
+                    Log.i(TAG, "WebView page started overlay=" + id + " load=" + loadId
+                            + " page=" + pageId + " url=" + url);
+                    queueWebViewEvent(id, loadId, pageId, "started", url, 0, "");
+                }
+
+                @Override
+                public void onPageFinished(android.webkit.WebView view, String url) {
+                    int loadId = currentWebOverlayLoadId(id);
+                    int pageId = currentWebOverlayPageId(id);
+                    Log.i(TAG, "WebView page finished overlay=" + id + " load=" + loadId
+                            + " page=" + pageId + " url=" + url);
+                    queueWebViewEvent(id, loadId, pageId, "finished", url, 0, "");
+                }
+
+                @Override
+                public boolean shouldOverrideUrlLoading(
+                        android.webkit.WebView view,
+                        android.webkit.WebResourceRequest request) {
+                    if (request.isForMainFrame()) advanceWebOverlayPageId(id);
+                    return false;
+                }
+
+                @SuppressWarnings("deprecation")
+                @Override
+                public boolean shouldOverrideUrlLoading(android.webkit.WebView view, String url) {
+                    advanceWebOverlayPageId(id);
+                    return false;
+                }
+
+                @Override
+                public void onReceivedHttpError(android.webkit.WebView view,
+                                                android.webkit.WebResourceRequest request,
+                                                android.webkit.WebResourceResponse response) {
+                    Log.w(TAG, "WebView HTTP response overlay=" + id + " load="
+                            + currentWebOverlayLoadId(id) + " status=" + response.getStatusCode()
+                            + " url=" + request.getUrl());
+                }
+
+                @SuppressWarnings("deprecation")
+                @Override
+                public void onReceivedError(android.webkit.WebView view, int errorCode,
+                                            String description, String failingUrl) {
+                    boolean mainFrame = failingUrl != null && failingUrl.equals(view.getUrl());
+                    int loadId = currentWebOverlayLoadId(id);
+                    int pageId = currentWebOverlayPageId(id);
+                    reportWebViewError(id, loadId, pageId, failingUrl, errorCode,
+                            description, mainFrame);
+                }
+
+                @Override
+                public void onReceivedSslError(android.webkit.WebView view,
+                                               android.webkit.SslErrorHandler handler,
+                                               android.net.http.SslError error) {
+                    String url = error.getUrl();
+                    String description = "TLS certificate error: " + error.getPrimaryError();
+                    reportWebViewError(id, currentWebOverlayLoadId(id),
+                            currentWebOverlayPageId(id), url, error.getPrimaryError(),
+                            description, url != null && url.equals(view.getUrl()));
+                    handler.cancel();
+                }
+
+                @Override
+                public android.webkit.WebResourceResponse shouldInterceptRequest(
+                        android.webkit.WebView view,
+                        android.webkit.WebResourceRequest request) {
+                    android.net.Uri uri = request.getUrl();
+                    String scheme = uri.getScheme();
+                    if (!networkAccess && scheme != null
+                            && ("http".equalsIgnoreCase(scheme)
+                            || "https".equalsIgnoreCase(scheme))) {
+                        String url = uri.toString();
+                        String description = "Network access is disabled for this app";
+                        int loadId = currentWebOverlayLoadId(id);
+                        Log.w(TAG, "WebView blocked network request overlay=" + id + " load="
+                                + loadId + " url=" + url);
+                        if (request.isForMainFrame()) {
+                            queueWebViewEvent(id, loadId, currentWebOverlayPageId(id),
+                                    "error", url, android.webkit.WebViewClient.ERROR_UNKNOWN,
+                                    description);
+                        }
+                        return new android.webkit.WebResourceResponse(
+                                "text/plain", "utf-8", 403, "Forbidden",
+                                Collections.<String, String>emptyMap(),
+                                new java.io.ByteArrayInputStream(new byte[0]));
+                    }
+                    return super.shouldInterceptRequest(view, request);
                 }
             });
             // Transparent background so the emulated app shows through before
@@ -237,9 +335,6 @@ public class MainActivity extends SDLActivity {
             wv.setTranslationY(y);
             content.bringChildToFront(wv);
 
-            if (url != null && !url.isEmpty()) {
-                wv.loadUrl(url);
-            }
             webOverlays.put(id, wv);
         } catch (Throwable t) {
             Log.e(TAG, "createWebOverlay failed", t);
@@ -247,20 +342,44 @@ public class MainActivity extends SDLActivity {
     }
 
     // Navigate an existing overlay to a new URL.
-    public static void navigateWebOverlay(final int id, final String url) {
-        withWebOverlay(id, new Runnable() {
+    public static void navigateWebOverlay(final int id, final String url, final int loadId) {
+        android.app.Activity act = mSingleton;
+        if (act == null) {
+            reportMissingWebOverlay(id, loadId, url);
+            return;
+        }
+        act.runOnUiThread(new Runnable() {
             public void run() {
-                webOverlays.get(id).loadUrl(url);
+                android.webkit.WebView wv = webOverlays.get(id);
+                if (wv == null) {
+                    reportMissingWebOverlay(id, loadId, url);
+                    return;
+                }
+                beginWebOverlayLoad(id, loadId);
+                wv.loadUrl(url);
             }
         });
     }
 
     // Load raw data (e.g. loadHTMLString:) into an existing overlay.
     public static void loadDataWebOverlay(final int id, final String data,
-                                          final String mime) {
-        withWebOverlay(id, new Runnable() {
+                                          final String mime, final String baseUrl,
+                                          final int loadId) {
+        android.app.Activity act = mSingleton;
+        if (act == null) {
+            reportMissingWebOverlay(id, loadId, baseUrl);
+            return;
+        }
+        act.runOnUiThread(new Runnable() {
             public void run() {
-                webOverlays.get(id).loadDataWithBaseURL(null, data,
+                android.webkit.WebView wv = webOverlays.get(id);
+                if (wv == null) {
+                    reportMissingWebOverlay(id, loadId, baseUrl);
+                    return;
+                }
+                beginWebOverlayLoad(id, loadId);
+                wv.loadDataWithBaseURL(
+                        baseUrl != null && !baseUrl.isEmpty() ? baseUrl : null, data,
                         mime != null ? mime : "text/html", "utf-8", null);
             }
         });
@@ -298,6 +417,8 @@ public class MainActivity extends SDLActivity {
         act.runOnUiThread(new Runnable() {
             public void run() {
                 android.webkit.WebView wv = webOverlays.remove(id);
+                webOverlayLoadIds.remove(id);
+                webOverlayPageIds.remove(id);
                 if (wv == null) return;
                 try {
                     android.view.ViewGroup parent = (android.view.ViewGroup) wv.getParent();
@@ -311,20 +432,106 @@ public class MainActivity extends SDLActivity {
         });
     }
 
-    public static void goBackWebOverlay(final int id) {
+    public static void goBackWebOverlay(final int id, final int loadId) {
         withWebOverlay(id, new Runnable() {
             public void run() {
-                if (webOverlays.get(id).canGoBack()) webOverlays.get(id).goBack();
+                android.webkit.WebView wv = webOverlays.get(id);
+                webOverlayLoadIds.put(id, loadId);
+                if (wv.canGoBack()) {
+                    advanceWebOverlayPageId(id);
+                    wv.goBack();
+                }
             }
         });
     }
 
-    public static void goForwardWebOverlay(final int id) {
+    public static void goForwardWebOverlay(final int id, final int loadId) {
         withWebOverlay(id, new Runnable() {
             public void run() {
-                if (webOverlays.get(id).canGoForward()) webOverlays.get(id).goForward();
+                android.webkit.WebView wv = webOverlays.get(id);
+                webOverlayLoadIds.put(id, loadId);
+                if (wv.canGoForward()) {
+                    advanceWebOverlayPageId(id);
+                    wv.goForward();
+                }
             }
         });
+    }
+
+    public static String pollWebViewEvent() {
+        String event = webOverlayEvents.poll();
+        return event != null ? event : "";
+    }
+
+    private static int currentWebOverlayLoadId(int id) {
+        Integer loadId = webOverlayLoadIds.get(id);
+        return loadId != null ? loadId : 0;
+    }
+
+    private static java.util.concurrent.atomic.AtomicInteger currentWebOverlayPageIds(int id) {
+        return webOverlayPageIds.get(id);
+    }
+
+    private static int currentWebOverlayPageId(int id) {
+        java.util.concurrent.atomic.AtomicInteger pageIds = currentWebOverlayPageIds(id);
+        return pageIds != null ? pageIds.get() : 0;
+    }
+
+    private static int advanceWebOverlayPageId(int id) {
+        java.util.concurrent.atomic.AtomicInteger pageIds = currentWebOverlayPageIds(id);
+        return pageIds != null ? pageIds.incrementAndGet() : 0;
+    }
+
+    private static int beginWebOverlayLoad(int id, int loadId) {
+        webOverlayLoadIds.put(id, loadId);
+        java.util.concurrent.atomic.AtomicInteger pageIds = webOverlayPageIds.get(id);
+        if (pageIds == null) {
+            java.util.concurrent.atomic.AtomicInteger created =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
+            java.util.concurrent.atomic.AtomicInteger previous =
+                    webOverlayPageIds.putIfAbsent(id, created);
+            pageIds = previous != null ? previous : created;
+        }
+        return pageIds.incrementAndGet();
+    }
+
+    private static void reportMissingWebOverlay(int id, int loadId, String url) {
+        int pageId = beginWebOverlayLoad(id, loadId);
+        String eventUrl = url != null && !url.isEmpty() ? url : "about:blank";
+        String description = "The native Android WebView overlay is unavailable";
+        Log.e(TAG, "WebView load failed overlay=" + id + " load=" + loadId + " page="
+                + pageId + " url=" + eventUrl + " description=" + description);
+        queueWebViewEvent(id, loadId, pageId, "error", eventUrl, -1, description);
+    }
+
+    private static void reportWebViewError(int id, int loadId, int pageId, String url, int code,
+                                           String description, boolean mainFrame) {
+        Log.e(TAG, "WebView error overlay=" + id + " load=" + loadId + " page=" + pageId
+                + " code=" + code + " mainFrame=" + mainFrame + " url=" + url
+                + " description=" + description);
+        if (mainFrame) {
+            queueWebViewEvent(id, loadId, pageId, "error", url, code, description);
+        }
+    }
+
+    private static void queueWebViewEvent(int id, int loadId, int pageId, String type, String url,
+                                          int errorCode, String description) {
+        if (loadId <= 0 || pageId <= 0) return;
+        try {
+            JSONObject event = new JSONObject();
+            event.put("overlayId", id);
+            event.put("loadId", loadId);
+            event.put("pageId", pageId);
+            event.put("type", type);
+            event.put("url", url != null && !url.isEmpty() ? url : "about:blank");
+            if ("error".equals(type)) {
+                event.put("errorCode", errorCode);
+                event.put("description", description != null ? description : "WebView load failed");
+            }
+            webOverlayEvents.add(event.toString());
+        } catch (JSONException e) {
+            Log.e(TAG, "Couldn't queue WebView event for " + url, e);
+        }
     }
 
     public static boolean canGoBackWebOverlay(final int id) {
@@ -371,6 +578,7 @@ public class MainActivity extends SDLActivity {
     public static void stopLoadingWebOverlay(final int id) {
         withWebOverlay(id, new Runnable() {
             public void run() {
+                webOverlayLoadIds.put(id, 0);
                 webOverlays.get(id).stopLoading();
             }
         });

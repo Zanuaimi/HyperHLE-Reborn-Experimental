@@ -249,11 +249,9 @@ Game controller options:
 Graphics driver options:
     --renderer-mode=angle
     --renderer-mode=native-gles
-    --renderer-mode=angle-vulkan
-        Select the host OpenGL ES renderer on Android. ANGLE is the default and
-        uses ANGLE's OpenGL ES backend; angle-vulkan selects ANGLE's experimental
-        Vulkan backend, and native-gles uses the device's native OpenGL ES driver.
-        The app picker's Renderer Mode setting overrides this for its launches.
+        Select the host OpenGL ES renderer on Android. ANGLE is the default;
+        native-gles uses the device's native OpenGL ES driver. The app picker's
+        Renderer Mode setting overrides this for launches from the picker.
 
     --gles-native
     --no-gles-native
@@ -449,8 +447,9 @@ Other options:
     --allow-network-access
     --no-network-access
         Allow apps running in touchHLE to access the Internet and the local network,
-        including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, and NSData).
-        Disabled by default.
+        including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, NSData,
+        and UIWebView). Disabled by default. On Android this also opts emulated
+        WebViews into legacy cleartext HTTP; requests are blocked when disabled.
 
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.

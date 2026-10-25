@@ -1170,7 +1170,14 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
         }
     }
 
-    (ui_accelerometer::handle_accelerometer(env), handled)
+    let (webview_deadline, webview_handled) = ui_view::ui_web_view::handle_native_load_events(env);
+    let accelerometer_deadline = ui_accelerometer::handle_accelerometer(env);
+    let next_deadline = match (accelerometer_deadline, webview_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    };
+    (next_deadline, handled || webview_handled)
 }
 
 #[cfg(test)]

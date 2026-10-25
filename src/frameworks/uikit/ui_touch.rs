@@ -74,7 +74,7 @@ pub(super) fn cancel_for_gesture(env: &mut Environment, touches: &[id]) {
     let mut groups: HashMap<id, Vec<id>> = HashMap::new();
     for &touch in touches {
         if !env.framework_state.uikit.ui_touch.cancelled_by_gesture.insert(touch) { continue; }
-        let view: id = msg![env; touch view];
+        let view = touch_delivery_view(env, touch);
         if view != nil { groups.entry(view).or_default().push(touch); }
     }
     for (view, touches) in groups {
@@ -159,8 +159,75 @@ pub(super) struct UITouchHostObject {
     /// Host-side only: guests never need it, and swipe recognition always
     /// operates on registered (non-copied) touch objects.
     start_location: CGPoint,
+    /// Scroll view that took over this touch after a drag crossed threshold.
+    scroll_view: id,
     /// How many Moved updates this touch has received. Diagnostics only.
     move_count: u32,
+}
+
+const SCROLL_VIEW_DRAG_THRESHOLD: f32 = 6.0;
+
+fn did_start_scroll_drag(start: CGPoint, current: CGPoint) -> bool {
+    let dx = current.x - start.x;
+    let dy = current.y - start.y;
+    dx * dx + dy * dy >= SCROLL_VIEW_DRAG_THRESHOLD * SCROLL_VIEW_DRAG_THRESHOLD
+}
+
+fn touch_delivery_view(env: &mut Environment, touch: id) -> id {
+    let scroll_view = env.objc.borrow::<UITouchHostObject>(touch).scroll_view;
+    if scroll_view != nil {
+        scroll_view
+    } else {
+        touch_ivars(env, touch, |v| v.view)
+    }
+}
+
+fn forward_drag_to_scroll_ancestor(env: &mut Environment, child: id, touches: id, event: id) {
+    let touch_array: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; touch_array count];
+    let crossed_threshold = (0..count).any(|i| {
+        let touch: id = msg![env; touch_array objectAtIndex:i];
+        let (start, current) = {
+            let host = env.objc.borrow::<UITouchHostObject>(touch);
+            (host.start_location, touch_ivars(env, touch, |v| v.location))
+        };
+        did_start_scroll_drag(start, current)
+    });
+    if !crossed_threshold {
+        return;
+    }
+
+    let scroll_class: id = msg_class![env; UIScrollView class];
+    let mut ancestor: id = msg![env; child superview];
+    while ancestor != nil {
+        let is_scroll_view: bool = msg![env; ancestor isKindOfClass:scroll_class];
+        if is_scroll_view && msg![env; ancestor scrollEnabled] {
+            let old_offset: CGPoint = msg![env; ancestor contentOffset];
+            () = msg![env; ancestor touchesMoved:touches withEvent:event];
+            let new_offset: CGPoint = msg![env; ancestor contentOffset];
+            if new_offset != old_offset {
+                if msg![env; ancestor canCancelContentTouches] {
+                    let mut phases = Vec::new();
+                    for i in 0..count {
+                        let touch: id = msg![env; touch_array objectAtIndex:i];
+                        let old_phase = touch_ivars(env, touch, |v| {
+                            let old = v.phase;
+                            v.phase = 4;
+                            old
+                        });
+                        phases.push((touch, old_phase));
+                        env.objc.borrow_mut::<UITouchHostObject>(touch).scroll_view = ancestor;
+                    }
+                    () = msg![env; child touchesCancelled:touches withEvent:event];
+                    for (touch, phase) in phases {
+                        touch_ivars(env, touch, |v| v.phase = phase);
+                    }
+                }
+                return;
+            }
+        }
+        ancestor = msg![env; ancestor superview];
+    }
 }
 impl HostObject for UITouchHostObject {}
 
@@ -268,7 +335,15 @@ fn should_remap_touch_location_for_view(env: &mut Environment, view: id) -> bool
 
 #[cfg(test)]
 mod landscape_touch_remap_tests {
-    use super::touchhle_should_use_landscape_touch_remap_for_bundle;
+    use super::{did_start_scroll_drag, touchhle_should_use_landscape_touch_remap_for_bundle};
+    use crate::frameworks::core_graphics::CGPoint;
+
+    #[test]
+    fn scroll_view_takes_over_after_a_six_point_drag() {
+        let start = CGPoint { x: 10.0, y: 10.0 };
+        assert!(!did_start_scroll_drag(start, CGPoint { x: 15.9, y: 10.0 }));
+        assert!(did_start_scroll_drag(start, CGPoint { x: 16.0, y: 10.0 }));
+    }
 
     #[test]
     fn power_rangers_keeps_its_native_landscape_touch_coordinates() {
@@ -431,6 +506,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(UITouchHostObject {
         start_location: CGPoint { x: 0.0, y: 0.0 },
+        scroll_view: nil,
         move_count: 0,
     });
     // The guest allocation must cover the ivars (see `UITouchIvars`): guest
@@ -1202,7 +1278,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             x: coords.0,
             y: coords.1,
         };
-        let view = touch_ivars(env, touch, |v| v.view);
+        let view = touch_delivery_view(env, touch);
         let moved = touch_ivars(env, touch, |v| {
             if v.location == location {
                 false
@@ -1249,7 +1325,23 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let deliver = touches_for_view_delivery(env, v_set);
         let count: NSUInteger = msg![env; deliver count];
         if count != 0 {
+            let scroll_class: id = msg_class![env; UIScrollView class];
+            let view_is_scroll_view: bool = msg![env; view isKindOfClass:scroll_class];
+            let old_offset: CGPoint = if view_is_scroll_view {
+                msg![env; view contentOffset]
+            } else {
+                CGPoint { x: 0.0, y: 0.0 }
+            };
             let _: () = msg![env; view touchesMoved:deliver withEvent:event];
+            let new_offset: CGPoint = if view_is_scroll_view {
+                msg![env; view contentOffset]
+            } else {
+                old_offset
+            };
+            let scroll_view_moved = view_is_scroll_view && new_offset != old_offset;
+            if !scroll_view_moved {
+                forward_drag_to_scroll_ancestor(env, view, deliver, event);
+            }
             touchhle_send_cocos_touch_aliases_to_chain(env, view, "moved", deliver, event);
         }
         release(env, deliver);
@@ -1383,7 +1475,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             x: coords.0,
             y: coords.1,
         };
-        let view = touch_ivars(env, touch, |v| v.view);
+        let view = touch_delivery_view(env, touch);
         touch_ivars(env, touch, |v| {
             v.previous_location = v.location;
             v.location = location;
@@ -1427,7 +1519,12 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // addObject:, which retains), so they remain alive until those sets are
     // released when the autorelease pool drains.
     for (finger_id, touch) in touches_to_remove {
-        env.framework_state.uikit.ui_touch.cancelled_by_gesture.remove(&touch);
+        env.framework_state
+            .uikit
+            .ui_touch
+            .cancelled_by_gesture
+            .remove(&touch);
+        env.objc.borrow_mut::<UITouchHostObject>(touch).scroll_view = nil;
         if let Some(current_touch) = env
             .framework_state
             .uikit

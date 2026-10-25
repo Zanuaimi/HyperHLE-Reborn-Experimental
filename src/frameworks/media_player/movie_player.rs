@@ -529,11 +529,26 @@ fn ensure_background_view(env: &mut Environment, this: id) -> id {
     }
     let view_alloc: id = msg_class![env; UIView alloc];
     let view: id = msg![env; view_alloc init];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; view setBackgroundColor:black];
     retain(env, view);
     env.objc
         .borrow_mut::<MPMoviePlayerControllerHostObject>(this)
         .background_view = view;
     view
+}
+
+fn remove_movie_background_view(env: &mut Environment, player: id) {
+    let background_view = env
+        .objc
+        .borrow::<MPMoviePlayerControllerHostObject>(player)
+        .background_view;
+    if background_view != nil {
+        let parent: id = msg![env; background_view superview];
+        if parent != nil {
+            () = msg![env; background_view removeFromSuperview];
+        }
+    }
 }
 
 /// Reproduce the legacy behavior for movies whose view has not been attached
@@ -627,6 +642,7 @@ fn present_unparented_movie_view(env: &mut Environment, player: id, view: id) {
 }
 
 fn dismiss_unparented_movie_view(env: &mut Environment, player: id) {
+    remove_movie_background_view(env, player);
     let (controller, view) = {
         let host = env
             .objc
@@ -670,12 +686,15 @@ fn clear_movie_frame(env: &mut Environment, player: id) {
 }
 
 fn set_movie_view_hidden(env: &mut Environment, player: id, hidden: bool) {
-    let view = env
-        .objc
-        .borrow::<MPMoviePlayerControllerHostObject>(player)
-        .view;
+    let (view, background_view) = {
+        let host = env.objc.borrow::<MPMoviePlayerControllerHostObject>(player);
+        (host.view, host.background_view)
+    };
     if view != nil {
         () = msg![env; view setHidden:hidden];
+    }
+    if background_view != nil {
+        () = msg![env; background_view setHidden:hidden];
     }
 }
 
@@ -1070,6 +1089,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if !use_movie_player_fix {
         dismiss_unparented_movie_view(env, this);
     }
+    remove_movie_background_view(env, this);
 
     // No need to drain pending notifications: each pending entry holds a
     // +1 retain on the player, so dealloc can only run once all queued
@@ -1102,10 +1122,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)backgroundColor {
-    msg_class![env; UIColor blackColor]
+    let view = ensure_background_view(env, this);
+    msg![env; view backgroundColor]
 }
-- (())setBackgroundColor:(id)_color { // UIColor*
-    // Background color is a visual property; we have no movie view to tint.
+- (())setBackgroundColor:(id)color { // UIColor*
+    let view = ensure_background_view(env, this);
+    () = msg![env; view setBackgroundColor:color];
 }
 
 // --- Scaling mode ---
@@ -1599,11 +1621,15 @@ fn set_movie_fullscreen(env: &mut Environment, player: id, fullscreen: bool) {
     }
 
     let original_frame = if fullscreen && view != nil {
-        let parent: id = msg![env; view superview];
-        if parent != nil {
-            Some(msg![env; view frame])
+        let existing = env
+            .objc
+            .borrow::<MPMoviePlayerControllerHostObject>(player)
+            .fullscreen_original_frame;
+        if existing.is_some() {
+            existing
         } else {
-            None
+            let parent: id = msg![env; view superview];
+            (parent != nil).then(|| msg![env; view frame])
         }
     } else {
         None
@@ -1617,7 +1643,7 @@ fn set_movie_fullscreen(env: &mut Environment, player: id, fullscreen: bool) {
             host.fullscreen_original_frame = original_frame;
             None
         } else {
-            host.fullscreen_original_frame.take()
+            host.fullscreen_original_frame
         }
     };
 
@@ -1627,8 +1653,9 @@ fn set_movie_fullscreen(env: &mut Environment, player: id, fullscreen: bool) {
         }
     } else if view != nil {
         if let Some(frame) = frame_to_restore {
-            () = msg![env; view setFrame:frame];
+            set_view_frame_if_needed(env, view, frame);
         }
+        update_movie_view_frame(env, player, view);
     }
 }
 
@@ -1643,9 +1670,52 @@ fn set_view_frame_if_needed(env: &mut Environment, view: id, frame: CGRect) {
     }
 }
 
+struct MovieViewLayout {
+    frame: CGRect,
+    shows_letterbox: bool,
+}
+
+fn movie_view_layout(
+    bounds: CGRect,
+    video_width: u32,
+    video_height: u32,
+    mode: MPMovieScalingMode,
+) -> MovieViewLayout {
+    let (bw, bh) = (bounds.size.width, bounds.size.height);
+    let (vw, vh) = (video_width as f32, video_height as f32);
+    if mode == MPMovieScalingModeFill || vw <= 0.0 || vh <= 0.0 || bw <= 0.0 || bh <= 0.0 {
+        return MovieViewLayout {
+            frame: bounds,
+            shows_letterbox: false,
+        };
+    }
+    let sx = bw / vw;
+    let sy = bh / vh;
+    // Apple defines None as natural-size playback; AspectFit uses the smaller
+    // scale, while AspectFill uses the larger and clips to the parent bounds.
+    // https://developer.apple.com/documentation/mediaplayer/mpmoviescalingmode
+    let scale = match mode {
+        MPMovieScalingModeNone => 1.0,
+        MPMovieScalingModeAspectFill => sx.max(sy),
+        _ => sx.min(sy),
+    };
+    let width = vw * scale;
+    let height = vh * scale;
+    MovieViewLayout {
+        frame: CGRect {
+            origin: CGPoint {
+                x: bounds.origin.x + (bw - width) / 2.0,
+                y: bounds.origin.y + (bh - height) / 2.0,
+            },
+            size: CGSize { width, height },
+        },
+        shows_letterbox: width < bw || height < bh,
+    }
+}
+
 fn update_movie_view_frame(env: &mut Environment, player: id, view: id) {
     let use_movie_player_fix = fix_movie_player_enabled(env);
-    let (video_info, scaling_mode, fullscreen, has_original_frame) = {
+    let (video_info, scaling_mode, fullscreen, original_frame) = {
         let host = env.objc.borrow::<MPMoviePlayerControllerHostObject>(player);
         (
             host.video_info,
@@ -1655,7 +1725,7 @@ fn update_movie_view_frame(env: &mut Environment, player: id, view: id) {
             } else {
                 host.presentation_view_controller != nil
             },
-            use_movie_player_fix && host.fullscreen_original_frame.is_some(),
+            host.fullscreen_original_frame,
         )
     };
     if !use_movie_player_fix && video_info.is_none() {
@@ -1665,54 +1735,57 @@ fn update_movie_view_frame(env: &mut Environment, player: id, view: id) {
     if parent == nil {
         return;
     }
-    let bounds: CGRect = msg![env; parent bounds];
-    if fullscreen {
-        if use_movie_player_fix && !has_original_frame {
-            let original_frame: CGRect = msg![env; view frame];
-            env.objc
-                .borrow_mut::<MPMoviePlayerControllerHostObject>(player)
-                .fullscreen_original_frame = Some(original_frame);
-        }
-        set_view_frame_if_needed(env, view, bounds);
-        return;
-    }
-    let Some(video_info) = video_info else {
-        return;
+    let parent_bounds: CGRect = msg![env; parent bounds];
+    let bounds = if use_movie_player_fix && !fullscreen {
+        original_frame.unwrap_or(parent_bounds)
+    } else {
+        parent_bounds
     };
-    let video_width = video_info.width as f32;
-    let video_height = video_info.height as f32;
-    let bounds_width = bounds.size.width;
-    let bounds_height = bounds.size.height;
-    if video_width <= 0.0 || video_height <= 0.0 || bounds_width <= 0.0 || bounds_height <= 0.0 {
-        return;
+    if fullscreen && use_movie_player_fix && original_frame.is_none() {
+        let original_frame: CGRect = msg![env; view frame];
+        env.objc
+            .borrow_mut::<MPMoviePlayerControllerHostObject>(player)
+            .fullscreen_original_frame = Some(original_frame);
     }
 
-    let scale_x = bounds_width / video_width;
-    let scale_y = bounds_height / video_height;
-    let scale = match scaling_mode {
-        MPMovieScalingModeNone => scale_x.min(scale_y).min(1.0),
-        MPMovieScalingModeAspectFit => scale_x.min(scale_y),
-        MPMovieScalingModeAspectFill => scale_x.max(scale_y),
-        MPMovieScalingModeFill => {
-            let frame = bounds;
-            set_view_frame_if_needed(env, view, frame);
-            () = msg![env; parent setClipsToBounds:false];
-            return;
-        }
-        _ => scale_x.min(scale_y),
-    };
-    let width = video_width * scale;
-    let height = video_height * scale;
-    let frame = CGRect {
-        origin: CGPoint {
-            x: bounds.origin.x + (bounds_width - width) * 0.5,
-            y: bounds.origin.y + (bounds_height - height) * 0.5,
+    let layout = video_info.map_or(
+        MovieViewLayout {
+            frame: bounds,
+            shows_letterbox: false,
         },
-        size: CGSize { width, height },
-    };
-    set_view_frame_if_needed(env, view, frame);
-    let clips_to_bounds = scaling_mode == MPMovieScalingModeAspectFill;
+        |info| movie_view_layout(bounds, info.width, info.height, scaling_mode),
+    );
+    set_view_frame_if_needed(env, view, layout.frame);
+    update_movie_background(env, player, view, parent, bounds, layout.shows_letterbox);
+    let clips_to_bounds = video_info.is_some()
+        && matches!(
+            scaling_mode,
+            MPMovieScalingModeNone | MPMovieScalingModeAspectFill
+        );
     () = msg![env; parent setClipsToBounds:clips_to_bounds];
+}
+
+fn update_movie_background(
+    env: &mut Environment,
+    player: id,
+    movie_view: id,
+    parent: id,
+    bounds: CGRect,
+    visible: bool,
+) {
+    let background = ensure_background_view(env, player);
+    if background == movie_view {
+        return;
+    }
+    let old_parent: id = msg![env; background superview];
+    if old_parent != parent {
+        if old_parent != nil {
+            () = msg![env; background removeFromSuperview];
+        }
+        () = msg![env; parent insertSubview:background belowSubview:movie_view];
+    }
+    set_view_frame_if_needed(env, background, bounds);
+    () = msg![env; background setHidden:(!visible)];
 }
 
 /// Show the latest decoded frame of each playing movie in its player's view.
@@ -1890,5 +1963,63 @@ pub(super) fn handle_players(env: &mut Environment) {
 
         // Release the retain we took when queuing this notification.
         release(env, player);
+    }
+}
+
+#[cfg(test)]
+mod scaling_tests {
+    use super::{
+        movie_view_layout, MPMovieScalingModeAspectFill, MPMovieScalingModeAspectFit,
+        MPMovieScalingModeFill, MPMovieScalingModeNone,
+    };
+    use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+
+    fn bounds() -> CGRect {
+        CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 1024.0,
+                height: 768.0,
+            },
+        }
+    }
+
+    #[test]
+    fn aspect_fit_letterboxes_720p_video_on_ipad_display() {
+        let layout = movie_view_layout(bounds(), 1280, 720, MPMovieScalingModeAspectFit);
+        assert!((layout.frame.origin.x - 0.0).abs() < 0.01);
+        assert!((layout.frame.origin.y - 96.0).abs() < 0.01);
+        assert!((layout.frame.size.width - 1024.0).abs() < 0.01);
+        assert!((layout.frame.size.height - 576.0).abs() < 0.01);
+        assert!(layout.shows_letterbox);
+    }
+
+    #[test]
+    fn none_mode_keeps_natural_size_and_centers_video() {
+        // Apple scaling-mode definitions:
+        // https://developer.apple.com/documentation/mediaplayer/mpmoviescalingmode
+        let layout = movie_view_layout(bounds(), 1280, 720, MPMovieScalingModeNone);
+        assert!((layout.frame.origin.x + 128.0).abs() < 0.01);
+        assert!((layout.frame.origin.y - 24.0).abs() < 0.01);
+        assert!((layout.frame.size.width - 1280.0).abs() < 0.01);
+        assert!((layout.frame.size.height - 720.0).abs() < 0.01);
+        assert!(layout.shows_letterbox);
+    }
+
+    #[test]
+    fn aspect_fill_crops_without_letterboxing() {
+        let layout = movie_view_layout(bounds(), 1280, 720, MPMovieScalingModeAspectFill);
+        assert!((layout.frame.origin.x + 170.67).abs() < 0.02);
+        assert!((layout.frame.size.width - 1365.33).abs() < 0.02);
+        assert!((layout.frame.size.height - 768.0).abs() < 0.01);
+        assert!(!layout.shows_letterbox);
+    }
+
+    #[test]
+    fn fill_uses_entire_display_without_letterboxing() {
+        let layout = movie_view_layout(bounds(), 1280, 720, MPMovieScalingModeFill);
+        assert!((layout.frame.size.width - 1024.0).abs() < 0.01);
+        assert!((layout.frame.size.height - 768.0).abs() < 0.01);
+        assert!(!layout.shows_letterbox);
     }
 }

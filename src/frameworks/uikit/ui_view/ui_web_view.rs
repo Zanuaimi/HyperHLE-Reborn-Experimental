@@ -8,6 +8,8 @@
 
 use crate::android_web_view;
 use crate::frameworks::core_graphics::{cg_image, CGRect};
+use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
+use crate::frameworks::foundation::ns_error::NSURLErrorDomain;
 use crate::frameworks::foundation::ns_string::{self, to_rust_string};
 use crate::frameworks::foundation::NSUInteger;
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
@@ -20,6 +22,7 @@ use crate::Environment;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 // UIWebViewNavigationType constants
 pub type UIWebViewNavigationType = i32;
@@ -46,8 +49,8 @@ pub const UIDataDetectorTypeAll: UIDataDetectorTypes = u32::MAX as UIDataDetecto
 #[derive(Clone)]
 enum PendingLoad {
     Url(String),
-    /// (payload, MIME type)
-    Data(String, String),
+    /// (payload, MIME type, base URL)
+    Data(String, String, String),
 }
 
 #[derive(Default)]
@@ -71,6 +74,9 @@ struct UIWebViewHostObject {
     current_url: id,
 
     loading: bool,
+    load_id: i32,
+    native_page_id: i32,
+    last_deferred_retry: Option<Instant>,
     /// Simple back/forward stack — NSString* items.
     back_stack: Vec<id>,
     forward_stack: Vec<id>,
@@ -80,11 +86,71 @@ struct UIWebViewHostObject {
     overlay_id: i32,
     /// Load deferred until the view has an on-screen extent.
     pending_load: Option<PendingLoad>,
-    /// How many times the deferred load has been retried on a timer so
+    /// How many times the deferred load has been retried by the run loop so
     /// far (bounded so a view that never gets a frame can't poll forever).
     deferred_polls: u32,
 }
 impl_HostObject_with_superclass!(UIWebViewHostObject);
+
+const DEFERRED_RETRY_INTERVAL: Duration = Duration::from_millis(600);
+const MAX_DEFERRED_RETRIES: u32 = 100;
+const NSURLErrorCancelled: i32 = -999;
+const NSURLErrorTimedOut: i32 = -1001;
+const NSURLErrorNotConnectedToInternet: i32 = -1009;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebViewEventAction {
+    Started,
+    Finished,
+    Failed,
+    Ignore,
+}
+
+fn webview_event_action(
+    event_type: android_web_view::WebViewEventType,
+    event_load_id: i32,
+    event_page_id: i32,
+    current_load_id: i32,
+    current_page_id: i32,
+    loading: bool,
+) -> WebViewEventAction {
+    if event_load_id != current_load_id {
+        return WebViewEventAction::Ignore;
+    }
+    match event_type {
+        android_web_view::WebViewEventType::Started if event_page_id > current_page_id => {
+            WebViewEventAction::Started
+        }
+        android_web_view::WebViewEventType::Finished
+            if loading && (current_page_id == 0 || event_page_id == current_page_id) =>
+        {
+            WebViewEventAction::Finished
+        }
+        android_web_view::WebViewEventType::Error
+            if loading && (current_page_id == 0 || event_page_id == current_page_id) =>
+        {
+            WebViewEventAction::Failed
+        }
+        _ => WebViewEventAction::Ignore,
+    }
+}
+
+fn make_webview_error(
+    env: &mut Environment,
+    domain: &str,
+    code: i32,
+    description: &str,
+    url: &str,
+) -> id {
+    let domain = ns_string::from_rust_string(env, domain.to_owned());
+    let description = ns_string::from_rust_string(env, description.to_owned());
+    let url = ns_string::from_rust_string(env, url.to_owned());
+    let description_key = ns_string::get_static_str(env, "NSLocalizedDescription");
+    let url_key = ns_string::get_static_str(env, "NSErrorFailingURLStringKey");
+    let user_info =
+        dict_from_keys_and_objects(env, &[(description_key, description), (url_key, url)]);
+    msg_class![env; NSError errorWithDomain:domain code:code userInfo:user_info]
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -115,13 +181,18 @@ pub const CLASSES: ClassExports = objc_classes! {
         gap_between_pages: 0.0,
         current_url: nil,
         loading: false,
+        load_id: 0,
+        native_page_id: 0,
+        last_deferred_retry: None,
         back_stack: Vec::new(),
         forward_stack: Vec::new(),
         overlay_id: -2,
         pending_load: None,
         deferred_polls: 0,
     });
-    env.objc.alloc_object(this, host_object, &mut env.mem)
+    let web_view = env.objc.alloc_object(this, host_object, &mut env.mem);
+    env.framework_state.uikit.ui_view.web_views.push(web_view);
+    web_view
 }
 
 // =========================================================================
@@ -158,6 +229,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, current_url);
     for url in back_stack    { release(env, url); }
     for url in forward_stack { release(env, url); }
+    env.framework_state.uikit.ui_view.web_views.retain(|&view| view != this);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
@@ -187,6 +259,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
     log!("UIWebView loadRequest: {}", url_string);
+    cancel_current_load(env, this, "A new request replaced the current WebView load.");
 
     // Push current URL onto back stack before navigating.
     let old_url = env.objc.borrow::<UIWebViewHostObject>(this).current_url;
@@ -202,17 +275,33 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old_url);
     let ns_url = ns_string::from_rust_string(env, url_string.clone());
     {
-        let host = env.objc.borrow_mut::<UIWebViewHostObject>(this);
-        host.current_url = ns_url;
-        host.loading = true;
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).current_url = ns_url;
     }
+    let load_id = begin_load(env, this);
     fire_did_start_load(env, this);
 
-    // Real engine path: hand the request to a genuine Android WebView
-    // overlay; did-finish is scheduled for after the native page loads.
+    let network_access = env.options.network_access;
+    if !network_access_allows_url(&url_string, network_access) {
+        let description = format!(
+            "Network access is disabled. Enable Network access to load {}.",
+            url_string
+        );
+        let error = make_webview_error(
+            env,
+            NSURLErrorDomain,
+            NSURLErrorNotConnectedToInternet,
+            &description,
+            &url_string,
+        );
+        log!("UIWebView: blocked network request to {}", url_string);
+        fail_load(env, this, error);
+        return;
+    }
+
+    // Native completion/error callbacks arrive from MainActivity through the
+    // Android event queue; never report finish merely because loadUrl returned.
     if android_web_view::native_webview_available() {
-        if overlay_load(env, this, Some(&url_string), None) {
-            schedule_did_finish_load(env, this);
+        if overlay_load(env, this, Some(&url_string), None, load_id) {
             return;
         }
         // The bridge is up, but the view has no on-screen extent yet.
@@ -227,8 +316,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
             host_obj.pending_load = Some(PendingLoad::Url(url_string));
             host_obj.deferred_polls = 0;
+            host_obj.last_deferred_retry = Some(Instant::now());
         }
-        schedule_did_finish_load(env, this);
         return;
     }
     log!("UIWebView: native WebView bridge not available; using fallback rendering");
@@ -237,8 +326,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // the PNG as this view's layer contents. We don't stream content, so the
     // load is "finished" as soon as the snapshot is in.
     let frame: CGRect = msg![env; this frame];
-    render_url_to_layer(env, this, &url_string, frame);
-    finish_load(env, this);
+    let rendered = render_url_to_layer(env, this, &url_string, frame);
+    finish_fallback_load(env, this, &url_string, rendered);
 }
 
 - (())loadHTMLString:(id)html     // NSString*
@@ -246,11 +335,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     let html_str = if html != nil {
         to_rust_string(env, html).into_owned()
     } else { String::new() };
+    let base_url = if _base_url != nil {
+        let url: id = msg![env; _base_url description];
+        if url != nil { to_rust_string(env, url).into_owned() } else { String::new() }
+    } else {
+        String::new()
+    };
     log_dbg!("UIWebView loadHTMLString: ({} chars)", html_str.len());
+    cancel_current_load(env, this, "A new request replaced the current WebView load.");
+    let load_id = begin_load(env, this);
+    fire_did_start_load(env, this);
 
     if android_web_view::native_webview_available() {
-        if overlay_load(env, this, None, Some((&html_str, "text/html"))) {
-            schedule_did_finish_load(env, this);
+        if overlay_load(env, this, None, Some((&html_str, "text/html", &base_url)), load_id) {
             return;
         }
         // The bridge is up, but the view has no on-screen extent yet.
@@ -260,26 +357,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         {
             let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
-            host_obj.pending_load = Some(PendingLoad::Data(html_str, "text/html".to_string()));
+            host_obj.pending_load = Some(PendingLoad::Data(
+                html_str,
+                "text/html".to_string(),
+                base_url,
+            ));
             host_obj.deferred_polls = 0;
+            host_obj.last_deferred_retry = Some(Instant::now());
         }
-        schedule_did_finish_load(env, this);
         return;
     }
     log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: write the HTML to a temp file and snapshot it.
-    if !html_str.is_empty() {
-        let idx = SNAP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("touchhle_uiwebview_{}.html", idx));
-        if std::fs::write(&tmp, html_str.as_bytes()).is_ok() {
-            let url = format!("file://{}", tmp.display());
-            let frame: CGRect = msg![env; this frame];
-            render_url_to_layer(env, this, &url, frame);
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    finish_load(env, this);
+    let frame: CGRect = msg![env; this frame];
+    let rendered = render_html_to_layer(env, this, &html_str, frame);
+    finish_fallback_load(env, this, "loadHTMLString", rendered);
 }
 
 - (())loadData:(id)data            // NSData*
@@ -287,7 +380,16 @@ pub const CLASSES: ClassExports = objc_classes! {
       textEncodingName:(id)_enc    // NSString*
        baseURL:(id)_base_url {     // NSURL*
     let mime_str = if mime != nil { to_rust_string(env, mime).into_owned() } else { "(null)".into() };
+    let base_url = if _base_url != nil {
+        let url: id = msg![env; _base_url description];
+        if url != nil { to_rust_string(env, url).into_owned() } else { String::new() }
+    } else {
+        String::new()
+    };
     log_dbg!("UIWebView loadData:MIMEType:{}", mime_str);
+    cancel_current_load(env, this, "A new request replaced the current WebView load.");
+    let load_id = begin_load(env, this);
+    fire_did_start_load(env, this);
 
     // Read the payload out of the guest NSData.
     let payload = if data != nil {
@@ -304,8 +406,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     if android_web_view::native_webview_available() {
-        if overlay_load(env, this, None, Some((&payload, mime_str.as_str()))) {
-            schedule_did_finish_load(env, this);
+        if overlay_load(
+            env,
+            this,
+            None,
+            Some((&payload, mime_str.as_str(), &base_url)),
+            load_id,
+        ) {
             return;
         }
         // The bridge is up, but the view has no on-screen extent yet.
@@ -315,26 +422,19 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         {
             let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
-            host_obj.pending_load = Some(PendingLoad::Data(payload, mime_str));
+            host_obj.pending_load = Some(PendingLoad::Data(payload, mime_str, base_url));
             host_obj.deferred_polls = 0;
+            host_obj.last_deferred_retry = Some(Instant::now());
         }
-        schedule_did_finish_load(env, this);
         return;
     }
     log!("UIWebView: native WebView bridge not available; using fallback rendering");
 
     // Desktop fallback: only HTML payloads can be rendered (temp file route).
-    if mime_str.starts_with("text/html") && !payload.is_empty() {
-        let idx = SNAP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("touchhle_uiwebview_{}.html", idx));
-        if std::fs::write(&tmp, payload.as_bytes()).is_ok() {
-            let url = format!("file://{}", tmp.display());
-            let frame: CGRect = msg![env; this frame];
-            render_url_to_layer(env, this, &url, frame);
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    finish_load(env, this);
+    let frame: CGRect = msg![env; this frame];
+    let rendered = mime_str.starts_with("text/html")
+        && render_html_to_layer(env, this, &payload, frame);
+    finish_fallback_load(env, this, "loadData", rendered);
 }
 
 // =========================================================================
@@ -376,24 +476,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())stopLoading {
     log_dbg!("UIWebView stopLoading");
-    let overlay_id = env.objc.borrow::<UIWebViewHostObject>(this).overlay_id;
-    if overlay_id >= 0 {
-        android_web_view::stop_loading(overlay_id);
-    }
-    env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
-
-    let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
-    if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "webView:didFailLoadWithError:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            let error: id = nil;
-            let _: () = msg![env; delegate webView:this didFailLoadWithError:error];
-        }
-    }
+    cancel_current_load(env, this, "The WebView load was cancelled.");
 }
 
 - (bool)isLoading {
@@ -426,26 +509,31 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.back_stack.pop()
     };
     let Some(back_url) = back_url else { return; };
+    cancel_current_load(env, this, "A back navigation replaced the current WebView load.");
 
-    // Push current to forward stack.
     let current = env.objc.borrow::<UIWebViewHostObject>(this).current_url;
     if current != nil {
         retain(env, current);
         env.objc.borrow_mut::<UIWebViewHostObject>(this).forward_stack.push(current);
     }
     release(env, current);
-
-    // Android: the native WebView keeps its own history; just drive it.
-    let overlay_id = env.objc.borrow::<UIWebViewHostObject>(this).overlay_id;
-    if overlay_id >= 0 && android_web_view::native_webview_available() {
-        android_web_view::go_back(overlay_id);
-    } else if android_web_view::native_webview_available() {
-        let url_str = to_rust_string(env, back_url).into_owned();
-        overlay_load(env, this, Some(&url_str), None);
-    }
     env.objc.borrow_mut::<UIWebViewHostObject>(this).current_url = back_url;
-    env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
-    finish_load(env, this);
+    let url = to_rust_string(env, back_url).into_owned();
+    let load_id = begin_load(env, this);
+    fire_did_start_load(env, this);
+
+    let overlay_id = env.objc.borrow::<UIWebViewHostObject>(this).overlay_id;
+    if overlay_id >= 0 && android_web_view::can_go_back(overlay_id) {
+        android_web_view::go_back(overlay_id, load_id);
+    } else if android_web_view::native_webview_available() {
+        if !overlay_load(env, this, Some(&url), None, load_id) {
+            defer_url_load(env, this, url);
+        }
+    } else {
+        let frame: CGRect = msg![env; this frame];
+        let rendered = render_url_to_layer(env, this, &url, frame);
+        finish_fallback_load(env, this, &url, rendered);
+    }
 }
 
 - (())goForward {
@@ -454,6 +542,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.forward_stack.pop()
     };
     let Some(fwd_url) = fwd_url else { return; };
+    cancel_current_load(env, this, "A forward navigation replaced the current WebView load.");
 
     let current = env.objc.borrow::<UIWebViewHostObject>(this).current_url;
     if current != nil {
@@ -461,17 +550,23 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.objc.borrow_mut::<UIWebViewHostObject>(this).back_stack.push(current);
     }
     release(env, current);
+    env.objc.borrow_mut::<UIWebViewHostObject>(this).current_url = fwd_url;
+    let url = to_rust_string(env, fwd_url).into_owned();
+    let load_id = begin_load(env, this);
+    fire_did_start_load(env, this);
 
     let overlay_id = env.objc.borrow::<UIWebViewHostObject>(this).overlay_id;
-    if overlay_id >= 0 && android_web_view::native_webview_available() {
-        android_web_view::go_forward(overlay_id);
+    if overlay_id >= 0 && android_web_view::can_go_forward(overlay_id) {
+        android_web_view::go_forward(overlay_id, load_id);
     } else if android_web_view::native_webview_available() {
-        let url_str = to_rust_string(env, fwd_url).into_owned();
-        overlay_load(env, this, Some(&url_str), None);
+        if !overlay_load(env, this, Some(&url), None, load_id) {
+            defer_url_load(env, this, url);
+        }
+    } else {
+        let frame: CGRect = msg![env; this frame];
+        let rendered = render_url_to_layer(env, this, &url, frame);
+        finish_fallback_load(env, this, &url, rendered);
     }
-    env.objc.borrow_mut::<UIWebViewHostObject>(this).current_url = fwd_url;
-    env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
-    finish_load(env, this);
 }
 
 // =========================================================================
@@ -635,10 +730,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (())removeFromSuperview {
+    cancel_current_load(env, this, "The WebView was removed while its load was in progress.");
     let overlay_id = env.objc.borrow::<UIWebViewHostObject>(this).overlay_id;
     if overlay_id >= 0 {
         android_web_view::hide(overlay_id);
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).overlay_id = -1;
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).overlay_id = -2;
     }
     // Mirror UIView's removeFromSuperview: detach from the superview. The
     // layer detaches itself from the superlayer; the superview drops `this`
@@ -683,59 +779,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 // MARK: - Native-overlay & async-load internals
 // =========================================================================
-
-// Called by an NSTimer scheduled in loadRequest:/loadHTMLString:/loadData:.
-// The timer argument is the (retained) NSTimer; we release our retain of
-// `this` here to keep refcounts balanced.
-//
-// A deferred load normally retries from -setFrame:, but a view that was
-// sized via initWithFrame: and never re-laid-out never receives -setFrame:
-// again — so this handler doubles as a poll: while a load stays deferred,
-// keep retrying on a timer until the overlay can be shown (or we give up
-// and simply report the load as finished).
-- (())touchhleWebViewLoadDidFinish:(id)_timer {
-    env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
-    let mut poll_again = false;
-    if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
-        retry_pending_load(env, this);
-        if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_some() {
-            let frame: CGRect = msg![env; this frame];
-            // CGRect is #[repr(packed)]: taking a reference to a field is
-            // unaligned (E0793), so copy the values out for the log.
-            let frame_w = frame.size.width;
-            let frame_h = frame.size.height;
-            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
-            host_obj.deferred_polls += 1;
-            if host_obj.deferred_polls == 1 {
-                // Make the poll visible in the log: without this line a
-                // healthy poll cycle is indistinguishable from a dead one
-                // while the view still has no frame.
-                log!(
-                    "UIWebView: deferred load still waiting (frame {}x{}); polling on a timer",
-                    frame_w,
-                    frame_h
-                );
-            }
-            if host_obj.deferred_polls < 100 {
-                poll_again = true;
-            } else {
-                log!(
-                    "UIWebView: giving up on deferred load (view never got a frame)"
-                );
-                host_obj.pending_load = None;
-            }
-        }
-    }
-    if poll_again {
-        // Schedule_did_finish_load re-retains `this`, balancing the
-        // release below; the delegate's webViewDidFinishLoad: fires only
-        // once, after the overlay is really up (or on give-up).
-        schedule_did_finish_load(env, this);
-    } else {
-        fire_did_finish_load(env, this);
-    }
-    release(env, this);
-}
 
 
 
@@ -803,9 +846,13 @@ fn find_chromium_binary() -> Option<PathBuf> {
 }
 
 /// Shell out to headless Chromium to snapshot `url` at `width x height` and
-/// return the resulting PNG bytes. Returns `None` on any failure; callers
-/// are expected to treat that as "leave the layer blank".
-fn snapshot_url_with_chromium(url: &str, width: u32, height: u32) -> Option<Vec<u8>> {
+/// return the PNG bytes, or `None` on failure. Callers report failures to the guest.
+fn snapshot_url_with_chromium(
+    url: &str,
+    width: u32,
+    height: u32,
+    network_access: bool,
+) -> Option<Vec<u8>> {
     let Some(chrome) = find_chromium_binary() else {
         log!("UIWebView bridge: no Chromium binary found; leaving layer blank");
         return None;
@@ -813,7 +860,8 @@ fn snapshot_url_with_chromium(url: &str, width: u32, height: u32) -> Option<Vec<
     let idx = SNAP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("touchhle_uiwebview_{}.png", idx));
     // Chromium refuses to run as root unless given --no-sandbox.
-    let status = Command::new(&chrome)
+    let mut command = Command::new(&chrome);
+    command
         .arg("--headless=new")
         .arg("--disable-gpu")
         .arg("--hide-scrollbars")
@@ -821,7 +869,11 @@ fn snapshot_url_with_chromium(url: &str, width: u32, height: u32) -> Option<Vec<
         .arg("--disable-dev-shm-usage")
         .arg(format!("--window-size={},{}", width, height))
         .arg(format!("--screenshot={}", tmp.display()))
-        .arg(url)
+        .arg(url);
+    if !network_access {
+        command.arg("--disable-networking");
+    }
+    let status = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -842,49 +894,68 @@ fn snapshot_url_with_chromium(url: &str, width: u32, height: u32) -> Option<Vec<
 
 /// Snapshot `url` and install the decoded PNG as the UIWebView's
 /// `layer.contents` so the user sees the rendered web page.
-fn render_url_to_layer(env: &mut Environment, this: id, url: &str, frame: CGRect) {
+fn render_url_to_layer(env: &mut Environment, this: id, url: &str, frame: CGRect) -> bool {
     if cfg!(target_os = "android") {
         // There is no desktop Chromium to shell out to on a phone: the
         // native WebView overlay is the only real rendering path there.
-        // (When the overlay is merely deferred we never get here either.)
-        return;
+        return false;
     }
     if url.is_empty()
         || !(url.starts_with("http://")
             || url.starts_with("https://")
             || url.starts_with("file://"))
     {
-        return;
+        return false;
     }
     let width = (frame.size.width.max(1.0) as u32).max(1);
     let height = (frame.size.height.max(1.0) as u32).max(1);
-    let Some(png) = snapshot_url_with_chromium(url, width, height) else {
-        return;
+    let Some(png) = snapshot_url_with_chromium(url, width, height, env.options.network_access)
+    else {
+        return false;
     };
     let Ok(image) = Image::from_bytes(&png) else {
         log!("UIWebView bridge: could not decode PNG snapshot");
-        return;
+        return false;
     };
     let cg_image = cg_image::from_image(env, image);
     let layer: id = msg![env; this layer];
     let _: () = msg![env; layer setContents:cg_image];
     let _: () = msg![env; this setNeedsDisplay];
     cg_image::CGImageRelease(env, cg_image);
+    true
+}
+
+fn render_html_to_layer(env: &mut Environment, this: id, html: &str, frame: CGRect) -> bool {
+    if html.is_empty() {
+        let layer: id = msg![env; this layer];
+        () = msg![env; layer setContents:nil];
+        () = msg![env; this setNeedsDisplay];
+        return true;
+    }
+    let idx = SNAP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("touchhle_uiwebview_{}.html", idx));
+    if std::fs::write(&tmp, html.as_bytes()).is_err() {
+        return false;
+    }
+    let url = format!("file://{}", tmp.display());
+    let rendered = render_url_to_layer(env, this, &url, frame);
+    let _ = std::fs::remove_file(&tmp);
+    rendered
+}
+
+fn finish_fallback_load(env: &mut Environment, this: id, url: &str, rendered: bool) {
+    if rendered {
+        finish_load(env, this);
+    } else {
+        let description = format!("Host could not render WebView content for {}.", url);
+        let error = make_webview_error(env, "TouchHLEWebViewErrorDomain", 1, &description, url);
+        fail_load(env, this, error);
+    }
 }
 
 // =========================================================================
 // MARK: - Native overlay plumbing
 // =========================================================================
-
-/// Hide (and forget) the native overlay backing `this`, if any. Called from
-/// `UIView`'s `removeFromSuperview` when the removed view is a UIWebView.
-pub(crate) fn webview_did_remove_from_superview(env: &mut Environment, this: id) {
-    let overlay_id = env.objc.borrow::<UIWebViewHostObject>(this).overlay_id;
-    if overlay_id >= 0 {
-        android_web_view::hide(overlay_id);
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).overlay_id = -1;
-    }
-}
 
 /// Map the webview's guest frame to host window pixels and create/position
 /// the native overlay. Returns the overlay id, or `None` if the view has no
@@ -922,9 +993,15 @@ fn overlay_show_or_update(env: &mut Environment, this: id) -> Option<i32> {
     if current == -2 {
         // First show: create the overlay seeded with a blank page; the
         // caller immediately navigates or loads data into it.
-        let oid = android_web_view::show("about:blank", x, y, w, h);
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).overlay_id = oid;
-        Some(oid)
+        let oid = android_web_view::show(x, y, w, h, env.options.network_access);
+        let host = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+        if oid >= 0 {
+            host.overlay_id = oid;
+            Some(oid)
+        } else {
+            host.overlay_id = -2;
+            None
+        }
     } else if current >= 0 {
         android_web_view::set_bounds(current, x, y, w, h);
         Some(current)
@@ -936,15 +1013,40 @@ fn overlay_show_or_update(env: &mut Environment, this: id) -> Option<i32> {
 /// Carry out a load that was deferred because the view had no on-screen
 /// extent when the app initiated it. Called from `-setFrame:`; keeps the
 /// load deferred if the view still can't be shown.
+fn has_webview_extent(frame: (f32, f32), superview: Option<(f32, f32)>) -> bool {
+    (frame.0 > 0.0 && frame.1 > 0.0) || superview.is_some_and(|size| size.0 > 0.0 && size.1 > 0.0)
+}
+
+fn network_access_allows_url(url: &str, network_access: bool) -> bool {
+    android_web_view::network_access_allows_url(url, network_access)
+}
+
+fn defer_url_load(env: &mut Environment, this: id, url: String) {
+    log!(
+        "UIWebView: deferring URL load of {} ({})",
+        url,
+        deferred_load_context(env, this)
+    );
+    let host = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+    host.pending_load = Some(PendingLoad::Url(url));
+    host.deferred_polls = 0;
+    host.last_deferred_retry = Some(Instant::now());
+}
+
 fn retry_pending_load(env: &mut Environment, this: id) {
-    if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_none() {
+    if env
+        .objc
+        .borrow::<UIWebViewHostObject>(this)
+        .pending_load
+        .is_none()
+    {
         return;
     }
     if !android_web_view::native_webview_available() {
         return;
     }
     let frame: CGRect = msg![env; this frame];
-    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+    if !has_webview_extent((frame.size.width, frame.size.height), None) {
         // The view itself has no size yet. The overlay can still be shown
         // from the superview's geometry (see overlay_show_or_update), so
         // only keep waiting when there is no usable superview either.
@@ -965,13 +1067,21 @@ fn retry_pending_load(env: &mut Environment, this: id) {
         .unwrap();
     log!("UIWebView: retrying deferred load now that the view is laid out");
     let shown = match &pending {
-        PendingLoad::Url(url) => overlay_load(env, this, Some(url), None),
-        PendingLoad::Data(payload, mime) => overlay_load(env, this, None, Some((payload, mime))),
+        PendingLoad::Url(url) => {
+            let load_id = env.objc.borrow::<UIWebViewHostObject>(this).load_id;
+            overlay_load(env, this, Some(url), None, load_id)
+        }
+        PendingLoad::Data(payload, mime, base_url) => {
+            let load_id = env.objc.borrow::<UIWebViewHostObject>(this).load_id;
+            overlay_load(env, this, None, Some((payload, mime, base_url)), load_id)
+        }
     };
     if !shown {
         // The overlay still couldn't be shown (e.g. the host window
         // viewport isn't ready); keep the load deferred.
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load = Some(pending);
+        env.objc
+            .borrow_mut::<UIWebViewHostObject>(this)
+            .pending_load = Some(pending);
     }
 }
 
@@ -980,6 +1090,169 @@ fn retry_pending_load(env: &mut Environment, this: id) {
 /// so that a single line shows whether the superview fallback (see
 /// `overlay_show_or_update`) will be able to size the overlay — and so the
 /// line itself identifies builds that carry this diagnostic.
+pub(crate) fn handle_native_load_events(env: &mut Environment) -> (Option<Instant>, bool) {
+    if !android_web_view::native_webview_available() {
+        return (None, false);
+    }
+    let web_views = env.framework_state.uikit.ui_view.web_views.clone();
+    if web_views.is_empty() {
+        return (None, false);
+    }
+
+    let now = Instant::now();
+    let mut handled = false;
+    for &web_view in &web_views {
+        let retry_due = {
+            let host = env.objc.borrow::<UIWebViewHostObject>(web_view);
+            host.pending_load.is_some()
+                && host.last_deferred_retry.map_or(true, |last| {
+                    now.duration_since(last) >= DEFERRED_RETRY_INTERVAL
+                })
+        };
+        if !retry_due {
+            continue;
+        }
+
+        handled = true;
+        env.objc
+            .borrow_mut::<UIWebViewHostObject>(web_view)
+            .last_deferred_retry = Some(now);
+        retry_pending_load(env, web_view);
+        let (polls, current_url) = {
+            let host = env.objc.borrow::<UIWebViewHostObject>(web_view);
+            if host.pending_load.is_none() {
+                continue;
+            }
+            (host.deferred_polls.saturating_add(1), host.current_url)
+        };
+        let url = if current_url != nil {
+            to_rust_string(env, current_url).into_owned()
+        } else {
+            String::new()
+        };
+        env.objc
+            .borrow_mut::<UIWebViewHostObject>(web_view)
+            .deferred_polls = polls;
+        if polls == 1 || polls % 10 == 0 {
+            log!(
+                "UIWebView: deferred load retry {}/{} ({})",
+                polls,
+                MAX_DEFERRED_RETRIES,
+                deferred_load_context(env, web_view)
+            );
+        }
+        if polls >= MAX_DEFERRED_RETRIES {
+            let error = make_webview_error(
+                env,
+                NSURLErrorDomain,
+                NSURLErrorTimedOut,
+                "The WebView did not receive a usable frame before the layout timeout.",
+                &url,
+            );
+            log!(
+                "UIWebView: deferred load failed after {} retries ({})",
+                polls,
+                url
+            );
+            fail_load(env, web_view, error);
+        }
+    }
+
+    while let Some(json) = android_web_view::poll_webview_event() {
+        handled = true;
+        let event = match android_web_view::parse_webview_event(&json) {
+            Ok(event) => event,
+            Err(error) => {
+                log!(
+                    "UIWebView: ignoring malformed Android WebView event: {}",
+                    error
+                );
+                continue;
+            }
+        };
+        let Some(&web_view) = web_views.iter().find(|&&view| {
+            let host = env.objc.borrow::<UIWebViewHostObject>(view);
+            host.overlay_id == event.overlay_id
+        }) else {
+            log!(
+                "UIWebView: ignoring event for removed overlay {}",
+                event.overlay_id
+            );
+            continue;
+        };
+        let action = {
+            let host = env.objc.borrow::<UIWebViewHostObject>(web_view);
+            webview_event_action(
+                event.event_type,
+                event.load_id,
+                event.page_id,
+                host.load_id,
+                host.native_page_id,
+                host.loading,
+            )
+        };
+        if action == WebViewEventAction::Ignore {
+            log!(
+                "UIWebView: ignoring stale {:?} event for overlay {} load {}",
+                event.event_type,
+                event.overlay_id,
+                event.load_id
+            );
+            continue;
+        }
+
+        match action {
+            WebViewEventAction::Started => {
+                let url = ns_string::from_rust_string(env, event.url);
+                let (old_url, should_notify) = {
+                    let host = env.objc.borrow_mut::<UIWebViewHostObject>(web_view);
+                    host.native_page_id = event.page_id;
+                    let should_notify = !host.loading;
+                    host.loading = true;
+                    (std::mem::replace(&mut host.current_url, url), should_notify)
+                };
+                release(env, old_url);
+                if should_notify {
+                    fire_did_start_load(env, web_view);
+                }
+            }
+            WebViewEventAction::Finished => {
+                log!("UIWebView: native page finished: {}", event.url);
+                env.objc
+                    .borrow_mut::<UIWebViewHostObject>(web_view)
+                    .native_page_id = event.page_id;
+                finish_load(env, web_view);
+            }
+            WebViewEventAction::Failed => {
+                log!(
+                    "UIWebView: native page failed: code={} url={} description={}",
+                    event.error_code,
+                    event.url,
+                    event.description
+                );
+                env.objc
+                    .borrow_mut::<UIWebViewHostObject>(web_view)
+                    .native_page_id = event.page_id;
+                let error = make_webview_error(
+                    env,
+                    "AndroidWebViewErrorDomain",
+                    event.error_code,
+                    &event.description,
+                    &event.url,
+                );
+                fail_load(env, web_view, error);
+            }
+            WebViewEventAction::Ignore => unreachable!(),
+        }
+    }
+
+    let active_load = web_views
+        .iter()
+        .any(|&view| env.objc.borrow::<UIWebViewHostObject>(view).loading);
+    let next_poll = active_load.then(|| Instant::now() + Duration::from_millis(50));
+    (next_poll, handled)
+}
+
 fn deferred_load_context(env: &mut Environment, this: id) -> String {
     let frame: CGRect = msg![env; this frame];
     // CGRect is #[repr(packed)]: references to its fields in format args
@@ -1002,41 +1275,25 @@ fn deferred_load_context(env: &mut Environment, this: id) -> String {
 /// Retry deferred loads for every UIWebView in `root`'s view subtree.
 /// Called when a freshly built hierarchy has just been attached to a window
 /// (see `-[UIViewController presentModalViewController:animated:]`): at that
-/// point the containers the app created its webviews in finally exist, so a
-/// load deferred because the webview had no extent can often proceed right
-/// away — synchronously, without depending on the NSTimer poll.
+/// point UIWebViews finally have a superview with a non-zero frame.
 pub(crate) fn retry_pending_loads_in_subtree(env: &mut Environment, root: id) {
     if root == nil {
         return;
     }
-    let uiwebview_class: Class = msg_class![env; UIWebView class];
+    let uiwebview_class: id = msg_class![env; UIWebView class];
     let is_webview: bool = msg![env; root isKindOfClass:uiwebview_class];
-    if is_webview
-        && env
+    if is_webview {
+        let has_pending = env
             .objc
             .borrow::<UIWebViewHostObject>(root)
             .pending_load
-            .is_some()
-    {
-        log!(
-            "UIWebView: view hierarchy is in place; retrying deferred load of {:?}",
-            root
-        );
-        retry_pending_load(env, root);
-        if env
-            .objc
-            .borrow::<UIWebViewHostObject>(root)
-            .pending_load
-            .is_none()
-            && cfg!(target_os = "android")
-        {
-            // The retry just showed the overlay, which completes the load.
-            // The NSTimer that would normally deliver webViewDidFinishLoad:
-            // has never been observed to fire on Android, so finish the
-            // load here instead. (If the timer ever does fire as well, a
-            // second webViewDidFinishLoad: is harmless — real UIWebView
-            // delivers it once per frame navigation.)
-            finish_load(env, root);
+            .is_some();
+        if has_pending {
+            log!(
+                "UIWebView: hierarchy attached; retrying deferred load ({})",
+                deferred_load_context(env, root)
+            );
+            retry_pending_load(env, root);
         }
     }
     let subviews: id = msg![env; root subviews];
@@ -1051,14 +1308,82 @@ pub(crate) fn retry_pending_loads_in_subtree(env: &mut Environment, root: id) {
     }
 }
 
+fn begin_load(env: &mut Environment, this: id) -> android_web_view::WebViewLoadId {
+    let host = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+    host.load_id = host.load_id.wrapping_add(1).max(1);
+    host.loading = true;
+    host.native_page_id = 0;
+    host.pending_load = None;
+    host.deferred_polls = 0;
+    host.last_deferred_retry = None;
+    host.load_id
+}
+
+fn fail_load(env: &mut Environment, this: id, error: id) {
+    let was_loading = {
+        let host = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+        let was_loading = host.loading;
+        host.loading = false;
+        host.pending_load = None;
+        host.last_deferred_retry = None;
+        was_loading
+    };
+    if was_loading {
+        fire_did_fail_load(env, this, error);
+    }
+}
+
+fn cancel_current_load(env: &mut Environment, this: id, description: &str) {
+    let (overlay_id, current_url) = {
+        let host = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+        if !host.loading {
+            return;
+        }
+        host.load_id = host.load_id.wrapping_add(1).max(1);
+        host.loading = false;
+        host.pending_load = None;
+        host.last_deferred_retry = None;
+        (host.overlay_id, host.current_url)
+    };
+    let url = if current_url != nil {
+        to_rust_string(env, current_url).into_owned()
+    } else {
+        String::new()
+    };
+    if overlay_id >= 0 {
+        android_web_view::stop_loading(overlay_id);
+    }
+    let error = make_webview_error(
+        env,
+        NSURLErrorDomain,
+        NSURLErrorCancelled,
+        description,
+        &url,
+    );
+    fire_did_fail_load(env, this, error);
+}
+
+/// Fire `webViewDidFailLoadWithError:` on the delegate (if it responds).
+fn fire_did_fail_load(env: &mut Environment, this: id, error: id) {
+    let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
+    if delegate != nil {
+        let sel = env
+            .objc
+            .register_host_selector("webView:didFailLoadWithError:".to_string(), &mut env.mem);
+        let responds: bool = msg![env; delegate respondsToSelector:sel];
+        if responds {
+            let _: () = msg![env; delegate webView:this didFailLoadWithError:error];
+        }
+    }
+}
+
 /// Fire `webViewDidFinishLoad:` on the delegate (if it responds).
 fn fire_did_finish_load(env: &mut Environment, this: id) {
     let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
     if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "webViewDidFinishLoad:".to_string(),
-            &mut env.mem,
-        );
+        let sel = env
+            .objc
+            .register_host_selector("webViewDidFinishLoad:".to_string(), &mut env.mem);
         let responds: bool = msg![env; delegate respondsToSelector:sel];
         if responds {
             let _: () = msg![env; delegate webViewDidFinishLoad:this];
@@ -1070,33 +1395,14 @@ fn fire_did_finish_load(env: &mut Environment, this: id) {
 fn fire_did_start_load(env: &mut Environment, this: id) {
     let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
     if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "webViewDidStartLoad:".to_string(),
-            &mut env.mem,
-        );
+        let sel = env
+            .objc
+            .register_host_selector("webViewDidStartLoad:".to_string(), &mut env.mem);
         let responds: bool = msg![env; delegate respondsToSelector:sel];
         if responds {
             let _: () = msg![env; delegate webViewDidStartLoad:this];
         }
     }
-}
-
-/// Schedule the async `webViewDidFinishLoad:` callback. On Android a real
-/// page load is in flight, so we delay briefly (matching real-UIWebView
-/// timing); the timer holds a retain of `this` which is released in
-/// `touchhleWebViewLoadDidFinish:`.
-fn schedule_did_finish_load(env: &mut Environment, this: id) {
-    retain(env, this);
-    let sel = env
-        .objc
-        .register_host_selector("touchhleWebViewLoadDidFinish:".to_string(), &mut env.mem);
-    let _timer: id = msg_class![env;
-        NSTimer scheduledTimerWithTimeInterval:0.6
-        target:this
-        selector:sel
-        userInfo:nil
-        repeats:false
-    ];
 }
 
 /// Show (or update) the native overlay and load `url` / `data` into it.
@@ -1106,18 +1412,25 @@ fn overlay_load(
     env: &mut Environment,
     this: id,
     url: Option<&str>,
-    data: Option<(&str, &str)>,
+    data: Option<(&str, &str, &str)>,
+    load_id: android_web_view::WebViewLoadId,
 ) -> bool {
     let Some(overlay) = overlay_show_or_update(env, this) else {
         return false;
     };
-    if let Some((payload, mime)) = data {
-        android_web_view::load_data(overlay, payload, mime);
+    if let Some((payload, mime, base_url)) = data {
+        android_web_view::load_data(overlay, payload, mime, base_url, load_id);
     } else if let Some(url) = url {
         if url.is_empty() {
-            android_web_view::load_data(overlay, "<html><body></body></html>", "text/html");
+            android_web_view::load_data(
+                overlay,
+                "<html><body></body></html>",
+                "text/html",
+                "",
+                load_id,
+            );
         } else {
-            android_web_view::navigate(overlay, url);
+            android_web_view::navigate(overlay, url, load_id);
         }
     }
     true
@@ -1125,8 +1438,17 @@ fn overlay_load(
 
 /// Mark the load as finished and fire `webViewDidFinishLoad:`.
 fn finish_load(env: &mut Environment, this: id) {
-    env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
-    fire_did_finish_load(env, this);
+    let was_loading = {
+        let host = env.objc.borrow_mut::<UIWebViewHostObject>(this);
+        let was_loading = host.loading;
+        host.loading = false;
+        host.pending_load = None;
+        host.last_deferred_retry = None;
+        was_loading
+    };
+    if was_loading {
+        fire_did_finish_load(env, this);
+    }
 }
 
 /// Android's `evaluateJavascript` returns a JSON-encoded value; unwrap the
@@ -1143,8 +1465,105 @@ fn unwrap_js_result(result: &str) -> String {
             .replace("\\n", "\n")
             .replace("\\r", "\r")
             .replace("\\t", "\t")
-            .replace("\\\"","\"")
+            .replace("\\\"", "\"")
             .replace('\u{1}', "\\");
     }
     t.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        has_webview_extent, network_access_allows_url, webview_event_action, WebViewEventAction,
+    };
+    use crate::android_web_view::WebViewEventType;
+
+    #[test]
+    fn native_webview_callbacks_require_current_load_and_page() {
+        let current_load = 4;
+        let page = 7;
+        assert_eq!(
+            webview_event_action(
+                WebViewEventType::Started,
+                current_load,
+                page,
+                current_load,
+                0,
+                true,
+            ),
+            WebViewEventAction::Started
+        );
+        assert_eq!(
+            webview_event_action(
+                WebViewEventType::Finished,
+                current_load,
+                page,
+                current_load,
+                page,
+                true,
+            ),
+            WebViewEventAction::Finished
+        );
+        assert_eq!(
+            webview_event_action(
+                WebViewEventType::Error,
+                current_load,
+                page,
+                current_load,
+                page,
+                true,
+            ),
+            WebViewEventAction::Failed
+        );
+        assert_eq!(
+            webview_event_action(
+                WebViewEventType::Finished,
+                current_load - 1,
+                page,
+                current_load,
+                page,
+                true,
+            ),
+            WebViewEventAction::Ignore
+        );
+        assert_eq!(
+            webview_event_action(
+                WebViewEventType::Finished,
+                current_load,
+                page - 1,
+                current_load,
+                page,
+                true,
+            ),
+            WebViewEventAction::Ignore
+        );
+        assert_eq!(
+            webview_event_action(
+                WebViewEventType::Finished,
+                current_load,
+                page,
+                current_load,
+                page,
+                false,
+            ),
+            WebViewEventAction::Ignore
+        );
+    }
+
+    #[test]
+    fn network_access_gates_http_and_https_but_not_local_content() {
+        assert!(!network_access_allows_url("http://example.test", false));
+        assert!(!network_access_allows_url("https://example.test", false));
+        assert!(network_access_allows_url("HTTP://example.test", true));
+        assert!(network_access_allows_url("file:///game/page.html", false));
+        assert!(network_access_allows_url("data:text/html,ok", false));
+    }
+
+    #[test]
+    fn deferred_webview_requires_own_or_superview_extent() {
+        assert!(!has_webview_extent((0.0, 0.0), None));
+        assert!(!has_webview_extent((0.0, 0.0), Some((0.0, 0.0))));
+        assert!(has_webview_extent((0.0, 0.0), Some((320.0, 480.0))));
+        assert!(has_webview_extent((320.0, 480.0), None));
+    }
 }

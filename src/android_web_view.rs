@@ -20,9 +20,9 @@
 //! build renders webviews with the headless-Chromium snapshot bridge in
 //! `ui_web_view.rs` instead.
 
-
 /// A live overlay id, or `-1` when no overlay could be created.
 pub type OverlayId = i32;
+pub type WebViewLoadId = i32;
 
 #[cfg(target_os = "android")]
 mod imp {
@@ -439,6 +439,7 @@ mod imp {
         stop_loading: *mut c_void,
         open_url: *mut c_void,
         open_content_uri: *mut c_void,
+        poll_webview_event: *mut c_void,
     }
 
     // SAFETY: the class is held as a global reference, which is valid from
@@ -470,18 +471,18 @@ mod imp {
         fn resolve_methods(jni: &Jni, class: *mut c_void) -> Option<JniCache> {
             Some(JniCache {
                 class,
-                show: method(jni, class, "showWebOverlay", "(Ljava/lang/String;IIII)I")?,
-                navigate: method(jni, class, "navigateWebOverlay", "(ILjava/lang/String;)V")?,
+                show: method(jni, class, "showWebOverlay", "(IIIIZ)I")?,
+                navigate: method(jni, class, "navigateWebOverlay", "(ILjava/lang/String;I)V")?,
                 load_data: method(
                     jni,
                     class,
                     "loadDataWebOverlay",
-                    "(ILjava/lang/String;Ljava/lang/String;)V",
+                    "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V",
                 )?,
                 set_bounds: method(jni, class, "setWebOverlayBounds", "(IIIII)V")?,
                 hide: method(jni, class, "hideWebOverlay", "(I)V")?,
-                go_back: method(jni, class, "goBackWebOverlay", "(I)V")?,
-                go_forward: method(jni, class, "goForwardWebOverlay", "(I)V")?,
+                go_back: method(jni, class, "goBackWebOverlay", "(II)V")?,
+                go_forward: method(jni, class, "goForwardWebOverlay", "(II)V")?,
                 can_go_back: method(jni, class, "canGoBackWebOverlay", "(I)Z")?,
                 can_go_forward: method(jni, class, "canGoForwardWebOverlay", "(I)Z")?,
                 eval_js: method(
@@ -493,6 +494,7 @@ mod imp {
                 stop_loading: method(jni, class, "stopLoadingWebOverlay", "(I)V")?,
                 open_url: method(jni, class, "openExternalUrl", "(Ljava/lang/String;)I")?,
                 open_content_uri: method(jni, class, "openContentUri", "(Ljava/lang/String;)I")?,
+                poll_webview_event: method(jni, class, "pollWebViewEvent", "()Ljava/lang/String;")?,
             })
         }
         fn resolve(jni: &Jni) -> Option<JniCache> {
@@ -519,27 +521,26 @@ mod imp {
         }
     }
 
-    pub fn show(url: &str, x: i32, y: i32, w: i32, h: i32) -> OverlayId {
+    pub fn show(x: i32, y: i32, w: i32, h: i32, network_access: bool) -> OverlayId {
         let Some(jni) = Jni::attach() else {
             return -1;
         };
         let Some(c) = cached() else {
             return -1;
         };
-        let url_j = jni.new_jstring(url);
         let args = [
-            JValue { l: url_j },
             JValue { i: x },
             JValue { i: y },
             JValue { i: w },
             JValue { i: h },
+            JValue {
+                z: u8::from(network_access),
+            },
         ];
-        let id = jni.call_static_int(c.class, c.show, &args);
-        jni.delete_local_ref(url_j);
-        id
+        jni.call_static_int(c.class, c.show, &args)
     }
 
-    pub fn navigate(id: OverlayId, url: &str) {
+    pub fn navigate(id: OverlayId, url: &str, load_id: WebViewLoadId) {
         let Some(jni) = Jni::attach() else {
             return;
         };
@@ -547,12 +548,18 @@ mod imp {
             return;
         };
         let url_j = jni.new_jstring(url);
-        let args = [JValue { i: id }, JValue { l: url_j }];
+        let args = [JValue { i: id }, JValue { l: url_j }, JValue { i: load_id }];
         jni.call_static_void(c.class, c.navigate, &args);
         jni.delete_local_ref(url_j);
     }
 
-    pub fn load_data(id: OverlayId, data: &str, mime: &str) {
+    pub fn load_data(
+        id: OverlayId,
+        data: &str,
+        mime: &str,
+        base_url: &str,
+        load_id: WebViewLoadId,
+    ) {
         let Some(jni) = Jni::attach() else {
             return;
         };
@@ -561,10 +568,18 @@ mod imp {
         };
         let data_j = jni.new_jstring(data);
         let mime_j = jni.new_jstring(mime);
-        let args = [JValue { i: id }, JValue { l: data_j }, JValue { l: mime_j }];
+        let base_url_j = jni.new_jstring(base_url);
+        let args = [
+            JValue { i: id },
+            JValue { l: data_j },
+            JValue { l: mime_j },
+            JValue { l: base_url_j },
+            JValue { i: load_id },
+        ];
         jni.call_static_void(c.class, c.load_data, &args);
         jni.delete_local_ref(data_j);
         jni.delete_local_ref(mime_j);
+        jni.delete_local_ref(base_url_j);
     }
 
     pub fn set_bounds(id: OverlayId, x: i32, y: i32, w: i32, h: i32) {
@@ -594,24 +609,32 @@ mod imp {
         jni.call_static_void(c.class, c.hide, &int_args(id));
     }
 
-    pub fn go_back(id: OverlayId) {
+    pub fn go_back(id: OverlayId, load_id: WebViewLoadId) {
         let Some(jni) = Jni::attach() else {
             return;
         };
         let Some(c) = cached() else {
             return;
         };
-        jni.call_static_void(c.class, c.go_back, &int_args(id));
+        jni.call_static_void(
+            c.class,
+            c.go_back,
+            &[JValue { i: id }, JValue { i: load_id }],
+        );
     }
 
-    pub fn go_forward(id: OverlayId) {
+    pub fn go_forward(id: OverlayId, load_id: WebViewLoadId) {
         let Some(jni) = Jni::attach() else {
             return;
         };
         let Some(c) = cached() else {
             return;
         };
-        jni.call_static_void(c.class, c.go_forward, &int_args(id));
+        jni.call_static_void(
+            c.class,
+            c.go_forward,
+            &[JValue { i: id }, JValue { i: load_id }],
+        );
     }
 
     pub fn can_go_back(id: OverlayId) -> bool {
@@ -658,6 +681,15 @@ mod imp {
 
     /// Whether the native WebView bridge is usable (used by `ui_web_view.rs`
     /// to decide between the native path and the desktop Chromium fallback).
+    pub fn poll_webview_event() -> Option<String> {
+        let jni = Jni::attach()?;
+        let c = cached()?;
+        let event = jni.call_static_object(c.class, c.poll_webview_event, &[]);
+        let event_json = jni.jstring_to_rust(event);
+        jni.delete_local_ref(event);
+        event_json.filter(|event| !event.is_empty())
+    }
+
     pub fn native_webview_available() -> bool {
         CACHE.get().is_some()
     }
@@ -698,18 +730,25 @@ mod imp {
 
 #[cfg(not(target_os = "android"))]
 mod imp {
-    use super::OverlayId;
+    use super::{OverlayId, WebViewLoadId};
 
     pub fn populate_jni_cache() {}
-    pub fn show(_url: &str, _x: i32, _y: i32, _w: i32, _h: i32) -> OverlayId {
+    pub fn show(_x: i32, _y: i32, _w: i32, _h: i32, _network_access: bool) -> OverlayId {
         -1
     }
-    pub fn navigate(_id: OverlayId, _url: &str) {}
-    pub fn load_data(_id: OverlayId, _data: &str, _mime: &str) {}
+    pub fn navigate(_id: OverlayId, _url: &str, _load_id: WebViewLoadId) {}
+    pub fn load_data(
+        _id: OverlayId,
+        _data: &str,
+        _mime: &str,
+        _base_url: &str,
+        _load_id: WebViewLoadId,
+    ) {
+    }
     pub fn set_bounds(_id: OverlayId, _x: i32, _y: i32, _w: i32, _h: i32) {}
     pub fn hide(_id: OverlayId) {}
-    pub fn go_back(_id: OverlayId) {}
-    pub fn go_forward(_id: OverlayId) {}
+    pub fn go_back(_id: OverlayId, _load_id: WebViewLoadId) {}
+    pub fn go_forward(_id: OverlayId, _load_id: WebViewLoadId) {}
     pub fn can_go_back(_id: OverlayId) -> bool {
         false
     }
@@ -720,6 +759,10 @@ mod imp {
         None
     }
     pub fn stop_loading(_id: OverlayId) {}
+    pub fn poll_webview_event() -> Option<String> {
+        None
+    }
+
     pub fn native_webview_available() -> bool {
         false
     }
@@ -732,3 +775,124 @@ mod imp {
 }
 
 pub use imp::*;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebViewEventType {
+    Started,
+    Finished,
+    Error,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct WebViewEvent {
+    pub overlay_id: OverlayId,
+    pub load_id: WebViewLoadId,
+    pub page_id: WebViewLoadId,
+    pub event_type: WebViewEventType,
+    pub url: String,
+    pub error_code: i32,
+    pub description: String,
+}
+
+pub fn parse_webview_event(json: &str) -> Result<WebViewEvent, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let event_type = match value["type"].as_str() {
+        Some("started") => WebViewEventType::Started,
+        Some("finished") => WebViewEventType::Finished,
+        Some("error") => WebViewEventType::Error,
+        _ => return Err("unknown WebView event type".into()),
+    };
+    let overlay_id = value["overlayId"]
+        .as_i64()
+        .and_then(|id| OverlayId::try_from(id).ok())
+        .filter(|&id| id > 0)
+        .ok_or("invalid overlayId")?;
+    let load_id = value["loadId"]
+        .as_i64()
+        .and_then(|id| WebViewLoadId::try_from(id).ok())
+        .filter(|&id| id > 0)
+        .ok_or("invalid loadId")?;
+    let page_id = value["pageId"]
+        .as_i64()
+        .and_then(|id| WebViewLoadId::try_from(id).ok())
+        .filter(|&id| id > 0)
+        .ok_or("invalid pageId")?;
+    let url = value["url"]
+        .as_str()
+        .filter(|url| !url.is_empty())
+        .ok_or("missing url")?
+        .to_owned();
+    let (error_code, description) = if event_type == WebViewEventType::Error {
+        (
+            value["errorCode"]
+                .as_i64()
+                .and_then(|code| i32::try_from(code).ok())
+                .ok_or("invalid errorCode")?,
+            value["description"]
+                .as_str()
+                .ok_or("missing error description")?
+                .to_owned(),
+        )
+    } else {
+        (0, String::new())
+    };
+    Ok(WebViewEvent {
+        overlay_id,
+        load_id,
+        page_id,
+        event_type,
+        url,
+        error_code,
+        description,
+    })
+}
+
+pub fn network_access_allows_url(url: &str, network_access: bool) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return true;
+    };
+    !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") || network_access
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_webview_event, WebViewEventType};
+
+    #[test]
+    fn parses_native_webview_success_and_failure_events() {
+        let success = parse_webview_event(
+            r#"{"overlayId":7,"loadId":1,"pageId":2,"type":"finished","url":"https://example.test/a?q=1"}"#,
+        )
+        .unwrap();
+        assert_eq!(success.overlay_id, 7);
+        assert_eq!(success.load_id, 1);
+        assert_eq!(success.page_id, 2);
+        assert_eq!(success.event_type, WebViewEventType::Finished);
+        assert_eq!(success.url, "https://example.test/a?q=1");
+
+        let failure = parse_webview_event(
+            r#"{"overlayId":7,"loadId":1,"pageId":2,"type":"error","url":"http://example.test/","errorCode":-2,"description":"host not found"}"#,
+        )
+        .unwrap();
+        assert_eq!(failure.load_id, 1);
+        assert_eq!(failure.event_type, WebViewEventType::Error);
+        assert_eq!(failure.error_code, -2);
+        assert_eq!(failure.description, "host not found");
+    }
+
+    #[test]
+    fn rejects_unknown_native_webview_event_types() {
+        assert!(parse_webview_event(
+            r#"{"overlayId":1,"loadId":1,"pageId":1,"type":"mystery","url":"https://example.test"}"#
+        )
+        .is_err());
+        assert!(
+            parse_webview_event(r#"{"overlayId":1,"loadId":1,"pageId":1,"type":"finished"}"#)
+                .is_err()
+        );
+        assert!(parse_webview_event(
+            r#"{"overlayId":2147483648,"loadId":1,"pageId":1,"type":"finished","url":"https://example.test"}"#
+        )
+        .is_err());
+    }
+}

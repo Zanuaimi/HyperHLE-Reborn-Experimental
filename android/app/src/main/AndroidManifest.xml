@@ -81,9 +81,13 @@
     <uses-feature android:name="android.hardware.camera.front" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
+    <!-- WebView must be able to load legacy HTTP when the emulator's explicit
+         Network access option is enabled. MainActivity.WebViewClient blocks
+         HTTP and HTTPS requests when that option is disabled. -->
     <application
         android:allowBackup="true"
         android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true"
         android:icon="${icon}"
         android:label="@string/app_name"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">

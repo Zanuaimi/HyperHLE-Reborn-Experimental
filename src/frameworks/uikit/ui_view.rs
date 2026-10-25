@@ -76,6 +76,7 @@ impl Default for AnimationBlockState {
 #[derive(Default)]
 pub struct State {
     pub(super) views: Vec<id>,
+    pub(super) web_views: Vec<id>,
     pub ui_image_view: ui_image_view::State,
     pub ui_window: ui_window::State,
     pub(super) animation_block: AnimationBlockState,

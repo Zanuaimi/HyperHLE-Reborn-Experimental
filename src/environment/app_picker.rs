@@ -21,7 +21,7 @@ use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_font::{
-    UITextAlignmentCenter, UITextAlignmentLeft, UITextAlignmentRight,
+    UILineBreakModeWordWrap, UITextAlignmentCenter, UITextAlignmentLeft, UITextAlignmentRight,
 };
 use crate::frameworks::uikit::ui_gesture_recognizer::{
     UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
@@ -1208,6 +1208,9 @@ fn app_picker_inner(
     // process exits.
     let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
+        sync_dropdown_scroll(env, &settings.device_dropdown, &mut device_state);
+        sync_dropdown_scroll(env, &settings.language_dropdown, &mut language_state);
+        sync_dropdown_scroll(env, &settings.renderer_dropdown, &mut renderer_state);
 
         if status_time_updated_at.elapsed() >= Duration::from_secs(10) {
             status_time_updated_at = Instant::now();
@@ -3582,7 +3585,7 @@ const SETTINGS_ROW_SIDE_INSET: CGFloat = 16.0;
 const SETTINGS_ROW_HEIGHT: CGFloat = 44.0;
 const SETTINGS_SEGMENT_ROW_HEIGHT: CGFloat = 58.0;
 const FORCE_COMPOSITION_LABEL: &str =
-    "Enable Force Composition ( May fix graphics rendering issues )";
+    "Enable Force Composition\n(May fix graphics rendering issues)";
 const FORCE_COMPOSITION_ROW_HEIGHT: CGFloat = 64.0;
 const SETTINGS_HEADER_HEIGHT: CGFloat = 28.0;
 const SETTINGS_SECTION_GAP: CGFloat = 10.0;
@@ -3629,6 +3632,8 @@ struct SettingsDropdown {
     button: id,
     /// The list (hidden until the button is tapped).
     menu: id,
+    /// Scrollable list content inside `menu`.
+    scroll_view: id,
     /// Dims the screen behind the open list; tapping it closes the list.
     dimmer: id,
     /// One button per choice, in the order of the spec's entries.
@@ -3674,12 +3679,15 @@ fn refresh_dropdown(
     state: &DropdownState,
 ) {
     set_dropdown_open(env, dropdown.menu, dropdown.dimmer, state.open);
+    let offset = state.scroll as CGFloat * DEVICE_MENU_ITEM_HEIGHT;
+    let content_offset = CGPoint { x: 0.0, y: offset };
+    () = msg![env; (dropdown.scroll_view) setContentOffset:content_offset];
     update_dropdown_menu(
         env,
+        dropdown.scroll_view,
         &dropdown.items,
         dropdown.thumb,
         state.selected,
-        state.scroll,
     );
     let arrow = if state.open { "▲" } else { "▼" };
     let title = ns_string::from_rust_string(env, format!("{label} {arrow}"));
@@ -3690,6 +3698,20 @@ fn refresh_dropdown(
 /// The largest scroll offset for a list of `item_count` entries.
 fn dropdown_max_scroll(item_count: usize) -> isize {
     (item_count as isize).saturating_sub(DEVICE_MENU_VISIBLE_ITEMS as isize)
+}
+
+fn sync_dropdown_scroll(
+    env: &mut Environment,
+    dropdown: &SettingsDropdown,
+    state: &mut DropdownState,
+) {
+    if !state.open {
+        return;
+    }
+    let offset: CGPoint = msg![env; (dropdown.scroll_view) contentOffset];
+    state.scroll = ((offset.y / DEVICE_MENU_ITEM_HEIGHT).round() as isize)
+        .clamp(0, dropdown_max_scroll(dropdown.items.len()));
+    update_dropdown_scroll_position(env, dropdown.scroll_view, &dropdown.items, dropdown.thumb);
 }
 
 /// Builds the Settings screen: a navigation bar with a "Done" button, and a
@@ -4045,11 +4067,14 @@ fn setup_settings(
                     renderer_dropdown = Some(dropdown);
                 }
                 SettingsRow::Toggle(label_text, selector, default_state, enabled) => {
-                    let long_label = label_text == FORCE_COMPOSITION_LABEL;
-                    let switch_width: CGFloat = if long_label { 74.0 } else { 94.0 };
-                    let label_height = if long_label { 56.0 } else { 36.0 };
-                    let label_font = if long_label { 14.0 } else { 16.0 };
-                    let label_lines = if long_label { 3 } else { 2 };
+                    let force_composition_label = label_text == FORCE_COMPOSITION_LABEL;
+                    // Keep every switch the same size; let long labels wrap
+                    // within the remaining row width instead of shrinking the
+                    // control or drawing text underneath it.
+                    let switch_width: CGFloat = 94.0;
+                    let label_height = if force_composition_label { 56.0 } else { 36.0 };
+                    let label_font = if force_composition_label { 13.0 } else { 16.0 };
+                    let label_lines = if force_composition_label { 3 } else { 2 };
                     let row_height = settings_row_height(row);
                     let label_view = new_label(
                         env,
@@ -4065,6 +4090,7 @@ fn setup_settings(
                         black,
                     );
                     () = msg![env; label_view setTextAlignment:UITextAlignmentLeft];
+                    () = msg![env; label_view setLineBreakMode:UILineBreakModeWordWrap];
                     () = msg![env; label_view setNumberOfLines:label_lines];
                     () = msg![env; group addSubview:label_view];
 
@@ -4213,17 +4239,12 @@ const LANGUAGE_CHOICES: &[(&str, Option<&str>)] = &[
 
 const RENDERER_MODE_ANGLE_TAG: NSInteger = 2000;
 const RENDERER_MODE_NATIVE_GLES_TAG: NSInteger = 2001;
-const RENDERER_MODE_ANGLE_VULKAN_TAG: NSInteger = 2002;
 
 fn renderer_mode_dropdown_spec() -> DropdownSpec {
     DropdownSpec {
         entries: vec![
             ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
             ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
-            (
-                "ANGLE to Vulkan".to_string(),
-                RENDERER_MODE_ANGLE_VULKAN_TAG,
-            ),
         ],
         toggle_selector: "rendererModeToggle",
         item_selector: "rendererMode:",
@@ -4237,23 +4258,21 @@ fn renderer_mode_tag(mode: RendererMode) -> i32 {
     match mode {
         RendererMode::Angle => RENDERER_MODE_ANGLE_TAG as i32,
         RendererMode::NativeGles => RENDERER_MODE_NATIVE_GLES_TAG as i32,
-        RendererMode::AngleVulkan => RENDERER_MODE_ANGLE_VULKAN_TAG as i32,
     }
 }
 
 fn renderer_mode_from_tag(tag: Option<i32>) -> RendererMode {
     match tag.map(|tag| tag as NSInteger) {
         Some(RENDERER_MODE_NATIVE_GLES_TAG) => RendererMode::NativeGles,
-        Some(RENDERER_MODE_ANGLE_VULKAN_TAG) => RendererMode::AngleVulkan,
         _ => RendererMode::Angle,
     }
 }
 
+/// Human-readable renderer mode label for the selected dropdown item.
 fn renderer_mode_label_for_tag(tag: Option<i32>) -> String {
     match renderer_mode_from_tag(tag) {
         RendererMode::Angle => "ANGLE",
         RendererMode::NativeGles => "Native GLES",
-        RendererMode::AngleVulkan => "ANGLE to Vulkan",
     }
     .to_string()
 }
@@ -4310,56 +4329,70 @@ fn device_model_label_for_tag(tag: Option<i32>) -> String {
 /// the rest in dark gray. The scrollbar thumb is moved to reflect `scroll`.
 fn update_dropdown_menu(
     env: &mut Environment,
+    scroll_view: id,
     items: &[id],
     thumb: id,
     selected: Option<i32>,
-    scroll: isize,
 ) {
-    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
-    let list_width: CGFloat = 256.0;
-    let max_scroll = (items.len() as isize).saturating_sub(DEVICE_MENU_VISIBLE_ITEMS as isize);
-
-    for (j, &item) in items.iter().enumerate() {
-        let y_pos = ((j as isize - scroll) as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
-        let is_visible = y_pos >= 0.0 && y_pos < visible_menu_height;
-        () = msg![env; item setHidden:(!is_visible)];
-        if is_visible {
-            let item_frame = CGRect {
-                origin: CGPoint { x: 0.0, y: y_pos },
-                size: CGSize {
-                    width: list_width,
-                    height: DEVICE_MENU_ITEM_HEIGHT,
-                },
-            };
-            () = msg![env; item setFrame:item_frame];
-        }
+    update_dropdown_scroll_position(env, scroll_view, items, thumb);
+    for &item in items {
         let tag: NSInteger = msg![env; item tag];
         let is_selected = selected.is_some_and(|v| v as NSInteger == tag);
-        let color = if is_selected { ui_color(env, 0.08, 0.40, 0.78, 1.0) } else { ui_color(env, 1.0, 1.0, 1.0, 1.0) };
-        let text_color: id = if is_selected { msg_class![env; UIColor whiteColor] } else { msg_class![env; UIColor blackColor] };
+        let color = if is_selected {
+            ui_color(env, 0.08, 0.40, 0.78, 1.0)
+        } else {
+            ui_color(env, 1.0, 1.0, 1.0, 1.0)
+        };
+        let text_color: id = if is_selected {
+            msg_class![env; UIColor whiteColor]
+        } else {
+            msg_class![env; UIColor blackColor]
+        };
         () = msg![env; item setBackgroundColor:color];
         () = msg![env; item setTitleColor:text_color forState:UIControlStateNormal];
     }
+}
 
-    // Position the scrollbar thumb proportionally to the scroll offset.
+fn update_dropdown_scroll_position(
+    env: &mut Environment,
+    scroll_view: id,
+    items: &[id],
+    thumb: id,
+) {
+    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
+    let offset: CGPoint = msg![env; scroll_view contentOffset];
+    for (j, &item) in items.iter().enumerate() {
+        let item_top = j as CGFloat * DEVICE_MENU_ITEM_HEIGHT - offset.y;
+        let visible = item_top + DEVICE_MENU_ITEM_HEIGHT > 0.0 && item_top < visible_menu_height;
+        let hidden: bool = msg![env; item isHidden];
+        let should_hide = !visible;
+        if hidden != should_hide {
+            () = msg![env; item setHidden:should_hide];
+        }
+    }
+    let max_offset =
+        ((items.len() as CGFloat) * DEVICE_MENU_ITEM_HEIGHT - visible_menu_height).max(0.0);
     let thumb_height: CGFloat = 54.0;
     let travel = (visible_menu_height - thumb_height).max(0.0);
-    let thumb_y = if max_scroll > 0 {
-        (scroll as CGFloat / max_scroll as CGFloat) * travel
+    let thumb_y = if max_offset > 0.0 {
+        (offset.y / max_offset).clamp(0.0, 1.0) * travel
     } else {
         0.0
     };
-    let thumb_frame = CGRect {
-        origin: CGPoint {
-            x: list_width,
-            y: thumb_y,
-        },
-        size: CGSize {
-            width: 24.0,
-            height: thumb_height,
-        },
-    };
-    () = msg![env; thumb setFrame:thumb_frame];
+    let frame: CGRect = msg![env; thumb frame];
+    if (frame.origin.y - thumb_y).abs() > 0.01 {
+        let thumb_frame = CGRect {
+            origin: CGPoint {
+                x: 256.0,
+                y: thumb_y,
+            },
+            size: CGSize {
+                width: 24.0,
+                height: thumb_height,
+            },
+        };
+        () = msg![env; thumb setFrame:thumb_frame];
+    }
 }
 
 /// Builds a settings dropdown: a button in a settings row, whose title shows
@@ -4436,9 +4469,21 @@ fn make_settings_dropdown(
     () = msg![env; menu_view setHidden:true];
     () = msg![env; root_view addSubview:menu_view];
 
-    // List items: one button per choice. Items that fall outside the initially
-    // visible window are hidden; scrolling reveals them (see
-    // `update_dropdown_menu`).
+    let scroll_view: id = msg_class![env; UIScrollView alloc];
+    let scroll_view_frame = rect(0.0, 0.0, list_width, visible_menu_height);
+    let scroll_view: id = msg![env; scroll_view initWithFrame:scroll_view_frame];
+    () = msg![env; scroll_view setClipsToBounds:true];
+    () = msg![env; scroll_view setShowsVerticalScrollIndicator:false];
+    () = msg![env; scroll_view setScrollEnabled:true];
+    let content_size = CGSize {
+        width: list_width,
+        height: entries.len() as CGFloat * DEVICE_MENU_ITEM_HEIGHT,
+    };
+    () = msg![env; scroll_view setContentSize:content_size];
+    () = msg![env; menu_view addSubview:scroll_view];
+
+    // List items stay in content coordinates; UIScrollView moves them during
+    // finger drags. Offscreen rows are also hidden for layer clipping.
     let item_selector = env.objc.lookup_selector(item_selector).unwrap();
     let white: id = msg_class![env; UIColor whiteColor];
     let mut items: Vec<id> = Vec::new();
@@ -4459,13 +4504,10 @@ fn make_settings_dropdown(
         () = msg![env; item_btn setFrame:item_frame];
         () = msg![env; item_btn layoutSubviews];
         () = msg![env; item_btn setTag:tag];
-        if y_pos >= visible_menu_height {
-            () = msg![env; item_btn setHidden:true];
-        }
         () = msg![env; item_btn addTarget:delegate
                                    action:item_selector
                          forControlEvents:UIControlEventTouchUpInside];
-        () = msg![env; menu_view addSubview:item_btn];
+        () = msg![env; scroll_view addSubview:item_btn];
         items.push(item_btn);
     }
 
@@ -4543,6 +4585,7 @@ fn make_settings_dropdown(
     SettingsDropdown {
         button,
         menu: menu_view,
+        scroll_view,
         dimmer,
         items,
         thumb: thumb_view,
@@ -4826,7 +4869,7 @@ fn quick_options_renderer_mode_state(
     renderer_mode: RendererMode,
     angle_available: bool,
 ) -> (RendererMode, bool) {
-    let mode = if renderer_mode != RendererMode::NativeGles && !angle_available {
+    let mode = if renderer_mode == RendererMode::Angle && !angle_available {
         RendererMode::NativeGles
     } else {
         renderer_mode
@@ -4839,7 +4882,6 @@ fn quick_options_renderer_mode_argument(mode: RendererMode) -> &'static str {
     match mode {
         RendererMode::Angle => "--renderer-mode=angle",
         RendererMode::NativeGles => "--renderer-mode=native-gles",
-        RendererMode::AngleVulkan => "--renderer-mode=angle-vulkan",
     }
 }
 
@@ -4917,10 +4959,6 @@ mod saved_renderer_mode_tests {
             saved_renderer_mode("gles_native=false\nrenderer_mode=native-gles"),
             Some(RendererMode::NativeGles)
         );
-        assert_eq!(
-            saved_renderer_mode("renderer_mode=angle-vulkan"),
-            Some(RendererMode::AngleVulkan)
-        );
     }
 }
 
@@ -4932,21 +4970,19 @@ mod quick_options_renderer_mode_tests {
     fn renderer_mode_dropdown_tags_round_trip() {
         let angle_tag = renderer_mode_tag(RendererMode::Angle);
         let native_tag = renderer_mode_tag(RendererMode::NativeGles);
-        let vulkan_tag = renderer_mode_tag(RendererMode::AngleVulkan);
         assert_eq!(renderer_mode_from_tag(Some(angle_tag)), RendererMode::Angle);
         assert_eq!(
             renderer_mode_from_tag(Some(native_tag)),
             RendererMode::NativeGles
         );
-        assert_eq!(
-            renderer_mode_from_tag(Some(vulkan_tag)),
-            RendererMode::AngleVulkan
-        );
         assert_eq!(renderer_mode_label_for_tag(Some(angle_tag)), "ANGLE");
         assert_eq!(renderer_mode_label_for_tag(Some(native_tag)), "Native GLES");
         assert_eq!(
-            renderer_mode_label_for_tag(Some(vulkan_tag)),
-            "ANGLE to Vulkan"
+            renderer_mode_dropdown_spec().entries,
+            vec![
+                ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
+                ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
+            ]
         );
     }
 
@@ -4989,20 +5025,6 @@ mod quick_options_renderer_mode_tests {
             "--renderer-mode=angle"
         );
 
-        options
-            .parse_argument("--renderer-mode=angle-vulkan")
-            .unwrap();
-        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
-        assert_eq!(mode, RendererMode::AngleVulkan);
-        assert!(dropdown_enabled);
-        assert_eq!(
-            quick_options_renderer_mode_argument(mode),
-            "--renderer-mode=angle-vulkan"
-        );
-
-        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, false);
-        assert_eq!(mode, RendererMode::NativeGles);
-        assert!(!dropdown_enabled);
     }
 }
 
