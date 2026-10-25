@@ -44,46 +44,9 @@ pub fn angle_backend_available() -> bool {
     !cfg!(target_os = "android") || !ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed)
 }
 
-/// Whether this build can offer the experimental Android arm64 Zink mode.
-pub fn zink_backend_available() -> bool {
-    cfg!(all(target_os = "android", target_arch = "aarch64"))
-}
-
-#[cfg(target_os = "android")]
-fn android_library_load_error(name: &str) -> Option<String> {
-    use std::ffi::CString;
-    let cname = CString::new(name).ok()?;
-    unsafe {
-        let handle = libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if handle.is_null() {
-            let error = libc::dlerror();
-            Some(if error.is_null() {
-                format!("could not load {name}")
-            } else {
-                std::ffi::CStr::from_ptr(error)
-                    .to_string_lossy()
-                    .into_owned()
-            })
-        } else {
-            libc::dlclose(handle);
-            None
-        }
-    }
-}
-
-#[cfg(target_os = "android")]
-fn can_load_android_library(name: &str) -> bool {
-    android_library_load_error(name).is_none()
-}
-
 #[cfg(any(target_os = "android", test))]
 fn should_attempt_android_angle(renderer_mode: RendererMode, angle_unavailable: bool) -> bool {
     renderer_mode == RendererMode::Angle && !angle_unavailable
-}
-
-#[cfg(any(target_os = "android", test))]
-fn is_zink_backend(description: &str) -> bool {
-    description.to_ascii_lowercase().contains("zink")
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -96,9 +59,7 @@ fn angle_backend_unsafe_on_power_vr_bxm_8_256(description: &str) -> bool {
 
 #[cfg(test)]
 mod android_angle_fallback_tests {
-    use super::{
-        angle_backend_unsafe_on_power_vr_bxm_8_256, is_zink_backend, should_attempt_android_angle,
-    };
+    use super::{angle_backend_unsafe_on_power_vr_bxm_8_256, should_attempt_android_angle};
     use crate::options::RendererMode;
 
     #[test]
@@ -108,12 +69,6 @@ mod android_angle_fallback_tests {
             "ANGLE (Vulkan 1.1.170 (PowerVR BXM-8-256 (0x35010101)))",
         );
         assert!(angle_backend_unsafe_on_power_vr_bxm_8_256(renderer));
-    }
-
-    #[test]
-    fn only_accepts_zink_driver_description() {
-        assert!(is_zink_backend("OpenGL ES 2.0 Mesa 26.2.5 (zink / Vulkan)"));
-        assert!(!is_zink_backend("OpenGL ES 3.2 Qualcomm Adreno 750"));
     }
 
     #[test]
@@ -144,7 +99,6 @@ mod android_angle_fallback_tests {
             RendererMode::NativeGles,
             false
         ));
-        assert!(!should_attempt_android_angle(RendererMode::Zink, false));
         assert!(!should_attempt_android_angle(RendererMode::Angle, true));
     }
 }
@@ -880,11 +834,10 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
 #[cfg(target_os = "android")]
 fn configure_android_angle_driver(use_angle: bool) -> bool {
     if !use_angle {
-        // Do not leave stale driver overrides behind when switching modes.
+        // Do not leave a stale or user-provided override pointing at the
+        // bundled ANGLE; SDL will use Android's system OpenGL ES driver.
         env::remove_var("SDL_VIDEO_EGL_DRIVER");
         env::remove_var("SDL_VIDEO_GL_DRIVER");
-        env::remove_var("MESA_LOADER_DRIVER_OVERRIDE");
-        env::remove_var("ANGLE_DEFAULT_PLATFORM");
         log!("Native GLES requested; using the Android system OpenGL ES driver.");
         return false;
     }
@@ -901,12 +854,25 @@ fn configure_android_angle_driver(use_angle: bool) -> bool {
         ),
     ];
 
-    env::remove_var("MESA_LOADER_DRIVER_OVERRIDE");
-    env::remove_var("ANGLE_DEFAULT_PLATFORM");
+    fn can_load(name: &str) -> bool {
+        use std::ffi::CString;
+        let Ok(cname) = CString::new(name) else {
+            return false;
+        };
+        // RTLD_NOW = 2. Load, and immediately unload if it succeeded.
+        unsafe {
+            let handle = libc::dlopen(cname.as_ptr(), 2);
+            if handle.is_null() {
+                false
+            } else {
+                libc::dlclose(handle);
+                true
+            }
+        }
+    }
+
     for &(egl, gles1, gles2) in CANDIDATES {
-        let libraries_loadable = can_load_android_library(egl)
-            && can_load_android_library(gles1)
-            && can_load_android_library(gles2);
+        let libraries_loadable = can_load(egl) && can_load(gles1) && can_load(gles2);
         if !libraries_loadable {
             continue;
         }
@@ -929,30 +895,8 @@ fn configure_android_angle_driver(use_angle: bool) -> bool {
     // driver; SDL will use Android's system OpenGL ES fallback.
     env::remove_var("SDL_VIDEO_EGL_DRIVER");
     env::remove_var("SDL_VIDEO_GL_DRIVER");
-    env::remove_var("MESA_LOADER_DRIVER_OVERRIDE");
     log!("Bundled ANGLE is unavailable; using the Android system OpenGL ES driver.");
     false
-}
-
-#[cfg(target_os = "android")]
-fn configure_android_zink_driver() -> Result<(), String> {
-    env::remove_var("ANGLE_DEFAULT_PLATFORM");
-    env::set_var("MESA_LOADER_DRIVER_OVERRIDE", "zink");
-    env::set_var("SDL_VIDEO_EGL_DRIVER", "libEGL_zink.so");
-    env::set_var("SDL_VIDEO_GL_DRIVER", "libGLESv2_zink.so");
-
-    for library in ["libEGL_zink.so", "libGLESv2_zink.so"] {
-        if let Some(error) = android_library_load_error(library) {
-            env::remove_var("MESA_LOADER_DRIVER_OVERRIDE");
-            env::remove_var("SDL_VIDEO_EGL_DRIVER");
-            env::remove_var("SDL_VIDEO_GL_DRIVER");
-            return Err(format!(
-                "Could not load Mesa Zink library {library}: {error}. Zink requires Android API 26+ and a Vulkan-capable driver."
-            ));
-        }
-    }
-    log!("Using Mesa Zink for Android OpenGL ES.");
-    Ok(())
 }
 
 pub struct Window {
@@ -1065,7 +1009,7 @@ impl Window {
     }
 
     /// Create the window, retrying with native GLES if bundled ANGLE is unavailable
-    /// or unsafe. Zink is explicit and never falls back silently.
+    /// or unsafe.
     pub fn new(
         title: &str,
         icon: Option<Image>,
@@ -1074,18 +1018,6 @@ impl Window {
     ) -> Result<Window, String> {
         #[cfg(target_os = "android")]
         {
-            if options.renderer_mode == RendererMode::Zink {
-                configure_android_zink_driver()?;
-                let window = Self::new_with_configured_driver(title, icon, launch_image, options)?;
-                if !is_zink_backend(window.gl_driver_description()) {
-                    return Err(format!(
-                        "Mesa Zink was requested, but the active renderer is {}",
-                        window.gl_driver_description()
-                    ));
-                }
-                return Ok(window);
-            }
-
             let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
             if should_attempt_android_angle(options.renderer_mode, angle_unavailable) {
                 if configure_android_angle_driver(true) {
@@ -1160,11 +1092,6 @@ impl Window {
                 );
             }
             configure_android_angle_driver(false);
-        }
-
-        #[cfg(not(target_os = "android"))]
-        if options.renderer_mode == RendererMode::Zink {
-            return Err("Vulkan via Zink is only available in Android arm64 builds".to_string());
         }
 
         Self::new_with_configured_driver(title, icon, launch_image, options)

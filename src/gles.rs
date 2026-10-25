@@ -1806,10 +1806,6 @@ pub fn create_gles1_ctx_no_parent_stack(
         .unwrap_or(false);
     let list: &[GLESImplementation] = match forced {
         Some(_) => &forced_list[..],
-        None if options.renderer_mode == crate::options::RendererMode::Zink => {
-            // Zink exposes GLES 2.0; translate the guest's GLES 1.1 API onto it.
-            &[GLESImplementation::GLES1OnGLES2]
-        }
         None => match options.gles1_implementation {
             Some(ref preference) => std::slice::from_ref(preference),
             None if using_angle => &[

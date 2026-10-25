@@ -456,16 +456,9 @@ fn saved_renderer_mode(contents: &str) -> Option<RendererMode> {
 }
 
 impl PickerSettings {
-    fn load(
-        options: &Options,
-        angle_backend_available: bool,
-        zink_backend_available: bool,
-    ) -> Self {
-        let (renderer_mode, _) = quick_options_renderer_mode_state(
-            options.renderer_mode,
-            angle_backend_available,
-            zink_backend_available,
-        );
+    fn load(options: &Options, angle_backend_available: bool) -> Self {
+        let (renderer_mode, _) =
+            quick_options_renderer_mode_state(options.renderer_mode, angle_backend_available);
         let mut settings = Self {
             scale_hack: None,
             orientation: None,
@@ -524,12 +517,8 @@ impl PickerSettings {
                 _ => (),
             }
         }
-        settings.renderer_mode = quick_options_renderer_mode_state(
-            settings.renderer_mode,
-            angle_backend_available,
-            zink_backend_available,
-        )
-        .0;
+        settings.renderer_mode =
+            quick_options_renderer_mode_state(settings.renderer_mode, angle_backend_available).0;
         settings
     }
 
@@ -1097,20 +1086,11 @@ fn app_picker_inner(
     };
 
     let angle_backend_available = crate::window::angle_backend_available();
-    let zink_backend_available = crate::window::zink_backend_available();
-    let mut picker_settings = PickerSettings::load(
-        &env.options,
-        angle_backend_available,
-        zink_backend_available,
-    );
+    let mut picker_settings = PickerSettings::load(&env.options, angle_backend_available);
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     env.window_mut()
         .set_preserve_aspect_ratio(picker_settings.preserve_aspect_ratio);
-    let (_, renderer_mode_dropdown_enabled) = quick_options_renderer_mode_state(
-        picker_settings.renderer_mode,
-        angle_backend_available,
-        zink_backend_available,
-    );
+    let renderer_mode_dropdown_enabled = cfg!(target_os = "android") && angle_backend_available;
     let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
     let settings = setup_settings(
         env,
@@ -1119,8 +1099,6 @@ fn app_picker_inner(
         app_frame,
         &picker_settings,
         renderer_mode_dropdown_enabled,
-        angle_backend_available,
-        zink_backend_available,
         show_fullscreen_row,
     );
     let mut quick_options_scale_hack = picker_settings.scale_hack;
@@ -3818,8 +3796,6 @@ fn setup_settings(
     app_frame: CGRect,
     picker_settings: &PickerSettings,
     renderer_mode_dropdown_enabled: bool,
-    angle_backend_available: bool,
-    zink_backend_available: bool,
     show_fullscreen_row: bool,
 ) -> SettingsStuff {
     let width = app_frame.size.width;
@@ -4158,10 +4134,7 @@ fn setup_settings(
                             30.0,
                         ),
                         menu_origin,
-                        renderer_mode_dropdown_spec(
-                            angle_backend_available,
-                            zink_backend_available,
-                        ),
+                        renderer_mode_dropdown_spec(),
                     );
                     () = msg![env; (dropdown.button) setEnabled:renderer_mode_dropdown_enabled];
                     renderer_dropdown = Some(dropdown);
@@ -4338,19 +4311,13 @@ const LANGUAGE_CHOICES: &[(&str, Option<&str>)] = &[
 
 const RENDERER_MODE_ANGLE_TAG: NSInteger = 2000;
 const RENDERER_MODE_NATIVE_GLES_TAG: NSInteger = 2001;
-const RENDERER_MODE_ZINK_TAG: NSInteger = 2002;
 
-fn renderer_mode_dropdown_spec(angle_available: bool, zink_available: bool) -> DropdownSpec {
-    let mut entries = Vec::new();
-    if angle_available {
-        entries.push(("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG));
-    }
-    entries.push(("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG));
-    if zink_available {
-        entries.push(("Vulkan via Zink".to_string(), RENDERER_MODE_ZINK_TAG));
-    }
+fn renderer_mode_dropdown_spec() -> DropdownSpec {
     DropdownSpec {
-        entries,
+        entries: vec![
+            ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
+            ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
+        ],
         toggle_selector: "rendererModeToggle",
         item_selector: "rendererMode:",
         scroll_selector: "rendererModeScroll:forEvent:",
@@ -4362,14 +4329,12 @@ fn renderer_mode_tag(mode: RendererMode) -> i32 {
     match mode {
         RendererMode::Angle => RENDERER_MODE_ANGLE_TAG as i32,
         RendererMode::NativeGles => RENDERER_MODE_NATIVE_GLES_TAG as i32,
-        RendererMode::Zink => RENDERER_MODE_ZINK_TAG as i32,
     }
 }
 
 fn renderer_mode_from_tag(tag: Option<i32>) -> RendererMode {
     match tag.map(|tag| tag as NSInteger) {
         Some(RENDERER_MODE_NATIVE_GLES_TAG) => RendererMode::NativeGles,
-        Some(RENDERER_MODE_ZINK_TAG) => RendererMode::Zink,
         _ => RendererMode::Angle,
     }
 }
@@ -4379,7 +4344,6 @@ fn renderer_mode_label_for_tag(tag: Option<i32>) -> String {
     match renderer_mode_from_tag(tag) {
         RendererMode::Angle => "ANGLE",
         RendererMode::NativeGles => "Native GLES",
-        RendererMode::Zink => "Zink",
     }
     .to_string()
 }
@@ -4945,20 +4909,13 @@ fn quick_options_force_composition_argument(enabled: bool) -> &'static str {
 fn quick_options_renderer_mode_state(
     renderer_mode: RendererMode,
     angle_available: bool,
-    zink_available: bool,
 ) -> (RendererMode, bool) {
-    let mode = match renderer_mode {
-        RendererMode::Angle if !angle_available => RendererMode::NativeGles,
-        RendererMode::Zink if !zink_available => {
-            if angle_available {
-                RendererMode::Angle
-            } else {
-                RendererMode::NativeGles
-            }
-        }
-        _ => renderer_mode,
+    let mode = if renderer_mode == RendererMode::Angle && !angle_available {
+        RendererMode::NativeGles
+    } else {
+        renderer_mode
     };
-    (mode, angle_available || zink_available)
+    (mode, angle_available)
 }
 
 /// Explicit launch argument so the picker choice overrides option-file values.
@@ -4966,7 +4923,6 @@ fn quick_options_renderer_mode_argument(mode: RendererMode) -> &'static str {
     match mode {
         RendererMode::Angle => "--renderer-mode=angle",
         RendererMode::NativeGles => "--renderer-mode=native-gles",
-        RendererMode::Zink => "--renderer-mode=zink",
     }
 }
 
@@ -5055,39 +5011,20 @@ mod quick_options_renderer_mode_tests {
     fn renderer_mode_dropdown_tags_round_trip() {
         let angle_tag = renderer_mode_tag(RendererMode::Angle);
         let native_tag = renderer_mode_tag(RendererMode::NativeGles);
-        let zink_tag = renderer_mode_tag(RendererMode::Zink);
         assert_eq!(renderer_mode_from_tag(Some(angle_tag)), RendererMode::Angle);
         assert_eq!(
             renderer_mode_from_tag(Some(native_tag)),
             RendererMode::NativeGles
         );
-        assert_eq!(renderer_mode_from_tag(Some(zink_tag)), RendererMode::Zink);
         assert_eq!(renderer_mode_label_for_tag(Some(angle_tag)), "ANGLE");
         assert_eq!(renderer_mode_label_for_tag(Some(native_tag)), "Native GLES");
-        assert_eq!(renderer_mode_label_for_tag(Some(zink_tag)), "Zink");
         assert_eq!(
-            renderer_mode_dropdown_spec(true, true).entries,
-            vec![
-                ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
-                ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
-                ("Vulkan via Zink".to_string(), RENDERER_MODE_ZINK_TAG),
-            ]
-        );
-        assert_eq!(
-            renderer_mode_dropdown_spec(true, false).entries,
+            renderer_mode_dropdown_spec().entries,
             vec![
                 ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
                 ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
             ]
         );
-        assert_eq!(
-            renderer_mode_dropdown_spec(false, true).entries,
-            vec![
-                ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
-                ("Vulkan via Zink".to_string(), RENDERER_MODE_ZINK_TAG),
-            ]
-        );
-        assert_eq!(renderer_mode_dropdown_spec(false, false).entries.len(), 1);
     }
 
     #[test]
@@ -5095,7 +5032,7 @@ mod quick_options_renderer_mode_tests {
         let mut options = Options::default();
 
         let (mut mode, mut dropdown_enabled) =
-            quick_options_renderer_mode_state(options.renderer_mode, true, false);
+            quick_options_renderer_mode_state(options.renderer_mode, true);
         assert_eq!(mode, RendererMode::Angle);
         assert!(dropdown_enabled);
         assert_eq!(
@@ -5103,8 +5040,7 @@ mod quick_options_renderer_mode_tests {
             "--renderer-mode=angle"
         );
 
-        (mode, dropdown_enabled) =
-            quick_options_renderer_mode_state(options.renderer_mode, false, false);
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, false);
         assert_eq!(mode, RendererMode::NativeGles);
         assert!(!dropdown_enabled);
         assert_eq!(
@@ -5112,32 +5048,24 @@ mod quick_options_renderer_mode_tests {
             "--renderer-mode=native-gles"
         );
 
-        options.parse_argument("--renderer-mode=zink").unwrap();
-        (mode, dropdown_enabled) =
-            quick_options_renderer_mode_state(options.renderer_mode, true, true);
-        assert_eq!(mode, RendererMode::Zink);
+        options.parse_argument("--gles-native").unwrap();
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::NativeGles);
         assert!(dropdown_enabled);
         assert_eq!(
             quick_options_renderer_mode_argument(mode),
-            "--renderer-mode=zink"
+            "--renderer-mode=native-gles"
         );
 
-        (mode, dropdown_enabled) =
-            quick_options_renderer_mode_state(options.renderer_mode, true, false);
-        assert_eq!(mode, RendererMode::Angle);
-        assert!(dropdown_enabled);
-
-        options.parse_argument("--gles-native").unwrap();
-        (mode, dropdown_enabled) =
-            quick_options_renderer_mode_state(options.renderer_mode, true, false);
-        assert_eq!(mode, RendererMode::NativeGles);
-        assert!(dropdown_enabled);
-
         options.parse_argument("--no-gles-native").unwrap();
-        (mode, dropdown_enabled) =
-            quick_options_renderer_mode_state(options.renderer_mode, true, false);
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
         assert_eq!(mode, RendererMode::Angle);
         assert!(dropdown_enabled);
+        assert_eq!(
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=angle"
+        );
+
     }
 }
 
