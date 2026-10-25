@@ -249,9 +249,13 @@ Game controller options:
 Graphics driver options:
     --renderer-mode=angle
     --renderer-mode=native-gles
+    --renderer-mode=zink
         Select the host OpenGL ES renderer on Android. ANGLE is the default;
-        native-gles uses the device's native OpenGL ES driver. The app picker's
-        Renderer Mode setting overrides this for launches from the picker.
+        native-gles uses the device's native driver. zink uses Mesa's experimental
+        OpenGL-over-Vulkan driver, requires Android API 26+ and a Vulkan driver,
+        and is packaged in release arm64 APKs. Guest GLES 1.1 uses HyperHLE's
+        GLES1OnGLES2 compatibility layer in this mode. Results vary by device.
+        The app picker's Renderer Mode setting overrides this for picker launches.
 
     --gles-native
     --no-gles-native

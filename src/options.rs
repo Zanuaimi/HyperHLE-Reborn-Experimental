@@ -96,6 +96,8 @@ pub enum RendererMode {
     Angle,
     /// Use the Android device's native OpenGL ES driver.
     NativeGles,
+    /// Use Mesa's Zink OpenGL-over-Vulkan driver (Android API 26+).
+    Zink,
 }
 
 impl RendererMode {
@@ -103,6 +105,7 @@ impl RendererMode {
         match name {
             "angle" => Ok(Self::Angle),
             "native-gles" => Ok(Self::NativeGles),
+            "zink" => Ok(Self::Zink),
             _ => Err(()),
         }
     }
@@ -111,6 +114,7 @@ impl RendererMode {
         match self {
             Self::Angle => "angle",
             Self::NativeGles => "native-gles",
+            Self::Zink => "zink",
         }
     }
 }
@@ -262,8 +266,9 @@ pub struct Options {
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
     /// Select the host OpenGL ES renderer on Android. ANGLE is the default;
-    /// native GLES can be selected for compatibility with vendor-driver quirks.
-    /// Ignored on other platforms.
+    /// native GLES uses the system driver; Zink is an experimental Mesa Vulkan
+    /// backend requiring Android API 26+ and packaged Zink libraries. Ignored
+    /// on other platforms.
     pub renderer_mode: RendererMode,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
@@ -710,7 +715,7 @@ impl Options {
             self.verbose_gles = true;
         } else if let Some(value) = arg.strip_prefix("--renderer-mode=") {
             self.renderer_mode = RendererMode::from_short_name(value).map_err(|_| {
-                "Invalid value for --renderer-mode= (expected angle or native-gles)".to_string()
+                "Invalid value for --renderer-mode= (expected angle, native-gles, or zink)".to_string()
             })?;
         } else if arg == "--gles-native" {
             self.renderer_mode = RendererMode::NativeGles;
@@ -848,6 +853,9 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-gles-native").unwrap());
         assert_eq!(options.renderer_mode, RendererMode::Angle);
+
+        assert!(options.parse_argument("--renderer-mode=zink").unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::Zink);
 
         assert!(options.parse_argument("--renderer-mode=vulkan").is_err());
     }
