@@ -135,6 +135,8 @@ pub static LAST_HOST_CALL_SYMBOL_LEN: std::sync::atomic::AtomicUsize =
 pub enum GuestTermination {
     Exit(i32),
     Signal(i32),
+    /// The desktop game window was closed; reopen the app picker.
+    ReturnToPicker,
 }
 
 impl GuestTermination {
@@ -144,6 +146,7 @@ impl GuestTermination {
             Self::Exit(code) => code & 0xff,
             // Shell convention; do not send a host signal to the emulator.
             Self::Signal(signal) => 128 + signal,
+            Self::ReturnToPicker => 0,
         }
     }
 }
@@ -672,8 +675,9 @@ impl Environment {
                 });
             Some(Box::new(window::Window::new(
                 &format!(
-                    "{} (touchHLE {}{}{})",
+                    "{} ({} {}{}{})",
                     bundle.display_name(),
+                    super::DISPLAY_NAME,
                     super::branding(),
                     if super::branding().is_empty() {
                         ""
@@ -1155,9 +1159,8 @@ impl Environment {
         let launch_image = None;
 
         assert!(!options.headless);
-        // On macOS, leave NSApp's icon alone so Launch Services keeps the
-        // bundled HyperHLE.icns icon. SDL_SetWindowIcon would replace the Dock
-        // icon with the app picker's fallback artwork.
+        // On macOS, passing no icon restores the bundle's Dock icon after a
+        // game has replaced it through SDL_SetWindowIcon.
         #[cfg(target_os = "macos")]
         let window_icon = {
             let _ = icon;
@@ -1167,7 +1170,8 @@ impl Environment {
         let window_icon = Some(icon);
         let window = Some(Box::new(window::Window::new(
             &format!(
-                "touchHLE {}{}{}",
+                "{} {}{}{}",
+                super::DISPLAY_NAME,
                 super::branding(),
                 if super::branding().is_empty() {
                     ""
@@ -1910,6 +1914,12 @@ impl Environment {
                 assert!(thread.host_context.is_none());
                 thread.host_context = Some(curr_host_context);
                 return None;
+            }
+
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if self.window.as_ref().is_some_and(|window| window.close_requested()) {
+                self.threads[self.current_thread].host_context = Some(curr_host_context);
+                return Some(GuestTermination::ReturnToPicker);
             }
 
             if stepping {
