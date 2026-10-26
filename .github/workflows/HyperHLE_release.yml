@@ -49,6 +49,17 @@ jobs:
       # honours this variable, so this single line parallelises all of them
       # without touching any build script. Only matters on a cold cache.
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      # `Cargo.toml` ships `codegen-units = 1` with `lto = "fat"`, so the LTO
+      # pass and the final machine-code generation run as a single unit and
+      # leave three of this runner's four cores idle for the tail of the build.
+      # Partitioning the post-LTO code generation costs well under a percent of
+      # runtime and buys several minutes here. Scoped to the Intel build on
+      # purpose: the arm64 leg keeps the shipped `1`, so only the slower
+      # runner changes. Benchmark before widening it (see
+      # dev-scripts/ci-performance-macos-x86_64.md, phase 3a).
+      # '1' (not an empty string) for the arm64 leg: it matches `Cargo.toml`,
+      # and an empty value would be a profile parse error, not "use default".
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.target == 'x86_64-apple-darwin' && '16' || '1' }}
 
     steps:
       - name: Checkout touchHLE
@@ -459,6 +470,9 @@ jobs:
     runs-on: macos-latest
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
+      # See the comment in build-osx. This job installs ninja, but the `cmake`
+      # crate passes no generator, so CMake still defaults to Unix Makefiles.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
       - name: Checkout touchHLE
@@ -557,6 +571,9 @@ jobs:
     runs-on: windows-2022
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
+      # See the comment in build-osx: `cmake --build` without `--parallel`
+      # compiles SDL2/OpenAL Soft/libxml2/Dynarmic one file at a time.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
     - name: Checkout touchHLE

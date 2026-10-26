@@ -355,8 +355,15 @@ content, so a regression there can only be a workflow-level bug.
 
 ## 6. Implementation status
 
-Applied in `.github/workflows/HyperHLE_release.yml`:
+Applied in `.github/workflows/HyperHLE_release.yml` and
+`.github/workflows/cleanup-caches.yml`:
 
+- **Phase 3a** — `CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"` on the Intel
+  macOS build only (`"1"` for the arm64 leg, which is `Cargo.toml`'s value; the
+  value must never be empty, that is a profile parse error rather than "use the
+  default"). See the note on parity below.
+- **F7** — `CMAKE_BUILD_PARALLEL_LEVEL: "2"` on `build-osx`, `test-macos`,
+  `build-win` and `build-ios`.
 - **Phase 0** — new `ci_timings` `workflow_dispatch` input, default `false`.
   When set, the macOS build runs with `--timings` and uploads
   `cargo-timings-<target>` artifacts (`if: always()`, `if-no-files-found:
@@ -375,8 +382,17 @@ Applied in `.github/workflows/HyperHLE_release.yml`:
   is kept; only `check-hyperhle-release` and `publish` need history), and the
   `hdiutil` retry back-off is now 2/4/6/8 s instead of 5/10/15/20 s.
 
-Not applied, deliberately: phase 3 (a/b/c), because it changes the shipped
-binary and needs a measured before/after. Two notes for whoever picks it up:
+Not applied, deliberately: phases 3b and 3c (thin LTO, lld), because they
+change the shipped binary and need a measured before/after.
+
+**Parity note for 3a.** Setting `codegen-units` through the environment means
+CI's Intel artifact is tuned differently from the arm64 artifact, from the
+Windows/Linux/Android artifacts, and from any local `cargo build --release`. If
+the benchmark is neutral, the tidier end state is to move the setting into
+`Cargo.toml` (`codegen-units = 16` alongside `lto = "fat"`) so every build
+matches, and then drop the per-target expression from the workflow.
+
+Two notes for whoever picks up the rest:
 
 - `test-macos` has a new job name, so its rust-cache starts empty: its first
   run compiles the dev profile cold (~13 min). That is *off* the critical path.
@@ -498,8 +514,10 @@ macOS).
       job's `needs` and `if`.
 - [x] Phase 2: `save-if` on all five rust-cache uses; pin `@v2`.
 - [ ] Phase 2 follow-up: delete stale cache entries (>10 GB budget).
-- [ ] Phase 3a: `CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"`; compare
-      `--print-fps` before/after on one heavy game.
+- [x] Phase 3a: `CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"` for the Intel
+      build, `"1"` for arm64.
+- [ ] Phase 3a follow-up: compare `--print-fps` before/after on one heavy game;
+      if neutral, move the setting into `Cargo.toml` so every build matches.
 - [x] F7: `CMAKE_BUILD_PARALLEL_LEVEL` on the macOS jobs (cold-cache native
       builds were serial `make`).
 - [x] F8: scheduled cache pruning (`.github/workflows/cleanup-caches.yml`),
