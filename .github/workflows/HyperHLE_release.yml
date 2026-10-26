@@ -41,6 +41,14 @@ jobs:
             runner: macos-15
             artifact: HyperHLE_macOS_AArch64
     runs-on: ${{ matrix.runner }}
+    env:
+      # The `cmake` crate runs `cmake --build` without `--parallel`, and CMake
+      # picks its platform default generator (Unix Makefiles here), so the
+      # vendored SDL2, OpenAL Soft, libxml2 and Dynarmic trees were compiled
+      # one source file at a time on a 4-core runner. CMake's `--build`
+      # honours this variable, so this single line parallelises all of them
+      # without touching any build script. Only matters on a cold cache.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
       - name: Checkout touchHLE
@@ -160,6 +168,9 @@ jobs:
   # why none of that lives in `build-osx` any more.
   test-macos:
     runs-on: macos-15-intel
+    env:
+      # See the comment in build-osx.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
       - name: Checkout touchHLE

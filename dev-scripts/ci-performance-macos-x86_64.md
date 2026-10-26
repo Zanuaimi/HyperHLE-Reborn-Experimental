@@ -386,6 +386,110 @@ binary and needs a measured before/after. Two notes for whoever picks it up:
   stale entries (`gh api -X DELETE repos/<owner>/<repo>/actions/caches/<id>`,
   currently 10.59 GB against a 10 GB budget) fixes it.
 
+
+## 8. Round 2: what is left after phases 1-2
+
+With tests off the critical path, the x86_64 job is essentially one step:
+`Build`. So every remaining second is either "compile less" or "compile the
+same thing faster". Two things were found that cost time without any
+trade-off, and both are now applied.
+
+### F7 — the vendored CMake trees were compiled serially (**applied**)
+
+`src/cpu/dynarmic_wrapper/build.rs`, `src/audio/openal_soft_wrapper/build.rs`
+and `src/frameworks/libxml2_wrapper/build.rs` all call `cmake::Config::build()`
+with no `build_arg`, and no generator is selected, so CMake uses its platform
+default ("Unix Makefiles"). `cmake --build` without `--parallel` runs `make`
+with no `-j`: **one source file at a time** for SDL2, OpenAL Soft, libxml2 and
+Dynarmic, on a 4-core runner.
+
+CMake's `--build` honours `CMAKE_BUILD_PARALLEL_LEVEL`, so this needs no build
+script change:
+
+```yaml
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+```
+
+Applied to `build-osx` and `test-macos`. It only helps when those trees are
+actually compiled, i.e. on a cold cache - which, given F2, is frequent, and is
+exactly where 26-minute runs came from. Start at `2` because cargo may run
+several build scripts concurrently; `4` is worth a try once the timings are in.
+
+### F8 — nothing reclaims the cache budget (**applied**)
+
+The 10 GB budget is enforced by LRU eviction, and the repository simply kept
+growing until the macOS x86_64 entry was the thing evicted. Manual deletion is
+not a fix. `.github/workflows/cleanup-caches.yml` now runs weekly (and on
+demand) and deletes entries that are older than 21 days or that push total
+usage above 8 GB, oldest-used first, and writes a summary of what went. It
+uses only `actions: write`, and cache entries are pure accelerators, so it
+cannot break a build.
+
+### F9 — possibly a second whole-program link (measure first)
+
+The package declares `crate-type = ["cdylib", "rlib"]` for the iOS host. The
+macOS release job only ships the executable, so if `cargo build --release`
+also links `libtouchHLE.dylib`, that is a second full fat-LTO link of the
+entire crate for an artefact nobody uploads. `cargo build --timings` (the
+`ci_timings` input) will show whether a separate cdylib unit exists; if it
+does, `cargo build --release --bin touchHLE --target ...` should drop it.
+Worth checking before changing the command, because whether cargo emits the
+cdylib for a `--bin` build is not obvious from the manifests.
+
+### F10 — the remaining knobs, with their real trade-offs
+
+| Knob | Effect | Cost |
+|---|---|---|
+| `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` | restores parallel codegen at the LTO tail (currently single-core) | a fraction of a percent of runtime |
+| `CARGO_PROFILE_RELEASE_LTO=thin` (x86_64 only) | another 20-35% off `Build` | 1-3% slower emulation on Intel Macs |
+| `CARGO_PROFILE_RELEASE_OPT_LEVEL=2` | 20-30% off codegen | a few percent slower, everywhere |
+| `Swatinem/rust-cache` `cache-targets: "false"` on the fast jobs | frees ~1.5 GB of budget | cold rebuilds for jobs that currently take 6 minutes |
+
+Do the first one first: it is one `env:` line, it is the only one whose cost is
+negligible, and it attacks the biggest remaining block.
+
+### F11 — sccache: not with the GHA cache backend
+
+`sccache` (via `mozilla-actions/sccache-action`) would cache individual `rustc`
+and `cc` invocations across runs and survive `target/` eviction, which is
+attractive given F2. But its GHA backend stores into **the same 10 GB budget**,
+competing with the builds it is meant to accelerate. Only worth it with an
+external backend (S3/GCS), which needs credentials. Not recommended here.
+
+### F12 — cross-building x86_64 on the Apple Silicon runner
+
+The arm64 leg does the same work in 10.2 minutes on a 3-core M1 while the Intel
+leg needs 13.4 on 4 cores, so an M1 core is roughly 1.7x faster here. Building
+`x86_64-apple-darwin` on `macos-15` (`rustup target add` + `--target`) would
+move the work to the faster cores, but every `cmake`-based wrapper needs
+`CMAKE_OSX_ARCHITECTURES=x86_64` plumbed through (SDL2, OpenAL Soft, libxml2,
+Dynarmic) or the link fails with "building for macOS-x86_64 but attempting to
+link in object file built for macOS-arm64". TestApp cannot run there, which is
+fine now that tests are a separate job. Estimated 13.4 -> 9-11 minutes warm;
+worth it only after F10, and it is the largest diff of any option here.
+
+### F13 - the bottleneck moves
+
+After F10, x86_64 lands around 11-13 minutes and stops being the critical path:
+`build-win` (12m42s) and `build-ios` (12m38s) take over, plus the 1.7 minute
+publish job. Further macOS work then buys nothing. The same F7/F10 treatment
+applies to those two jobs (they also build SDL and dynarmic serially; Windows
+and iOS were deliberately left alone here because the question was about
+macOS).
+
+### Micro-wins not worth a PR on their own
+
+- `cargo build --locked`: skips registry/index resolution. Safe only if
+  `Cargo.lock` is always in sync; it fails the build rather than updating.
+- The DMG step runs `cargo run -p touchHLE_version` twice, compiling that crate
+  in the **dev** profile (a second profile for a 4-file crate, ~10-20 s total).
+  Building `-p touchHLE_version` in release alongside the main build and calling
+  `target/<triple>/release/touchHLE_version_bin` removes it.
+- `timeout-minutes:` on every job, so a hung build cannot occupy a runner.
+- `hdiutil create -format ULFO`: faster (lzfse) than the default UDZO, at the
+  cost of a larger DMG. Only matters if F5-like retries appear.
+
 ## 7. Checklist
 
 - [x] Phase 0: `ci_timings` input + `--timings` upload (run once with it on,
@@ -396,5 +500,11 @@ binary and needs a measured before/after. Two notes for whoever picks it up:
 - [ ] Phase 2 follow-up: delete stale cache entries (>10 GB budget).
 - [ ] Phase 3a: `CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"`; compare
       `--print-fps` before/after on one heavy game.
-- [ ] Re-measure the job table; decide whether 3b/3c are still worth it, or
-      whether the next target is `build-win` / `build-ios`.
+- [x] F7: `CMAKE_BUILD_PARALLEL_LEVEL` on the macOS jobs (cold-cache native
+      builds were serial `make`).
+- [x] F8: scheduled cache pruning (`.github/workflows/cleanup-caches.yml`),
+      21-day / 8 GB budget.
+- [ ] F9: read `cargo --timings`; if a cdylib link unit exists, try
+      `--bin touchHLE`.
+- [ ] Re-measure the job table; decide whether 3b/3c or F12 are still worth it,
+      or whether the next target is `build-win` / `build-ios`.
