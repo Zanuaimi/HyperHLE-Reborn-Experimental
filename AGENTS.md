@@ -43,3 +43,10 @@ This repo contains two products:
 - The SQLite DB is auto-created and seeded with demo data on first startup.
 - Submitting reports requires GitHub OAuth (`GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` env vars); without these, the app works in read-only mode.
 - The triage JSON API requires `APPDB_TRIAGE_TOKEN` env var.
+
+## Session notes
+
+There is a dated handoff for the in-flight CI/graphics work in `HANDOFF.md`
+(Minigore render investigation, release-workflow measurements, environment
+gotchas). It is session context rather than project documentation - update or
+delete it once it is stale.
