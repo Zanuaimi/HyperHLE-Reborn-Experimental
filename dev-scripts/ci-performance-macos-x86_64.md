@@ -410,6 +410,37 @@ Applied in `.github/workflows/HyperHLE_release.yml` and
 Not applied, deliberately: phases 3b and 3c (thin LTO, lld), because they
 change the shipped binary and need a measured before/after.
 
+### First run of these changes (PR #1, run 40281051199, pull_request)
+
+Every job passed, including the new `test-macos` (which is also the first
+compile of the EAGL presenter change in the same PR). Job wall-clock:
+
+| Job | duration | notes |
+|---|---|---|
+| build-osx (x86_64) | **25.4** | `Build` 23.2 |
+| build-win | 15.6 | slowest observed for this job so far |
+| test-macos | 13.3 | `Test` 10.4, dev profile cold (new job name) |
+| build-osx (aarch64) | 12.4 | |
+| build-ios | 10.2 | |
+| build-linux | 8.0 | |
+| build-android | 5.9 | |
+
+What this does and does not show:
+
+- **Phase 1 is confirmed.** `test-macos` at 13.3 minutes is well inside the
+  x86_64 job's 25.4, so the tests no longer extend the critical path, and a
+  failing test still blocks publishing (`needs` + `if`).
+- **The 3a gain is still unmeasured.** This run looks like a cache miss
+  (`Cache Rust build artifacts` took 5 s, where a hit restores about half a
+  gigabyte), so `Build` was cold: 23.2 minutes against 25.78 for the earlier
+  cold runs and 13.35 warm. One cold sample cannot separate the
+  `codegen-units` and `CMAKE_BUILD_PARALLEL_LEVEL` effects from cache luck, and
+  PR runs do not save cache (`save-if`), so this is the least favourable case.
+  Measure 3a on trunk pushes, where the cache is warm, or dispatch with
+  `ci_timings` and read the split.
+- `check-hyperhle-release` and `publish-hyperhle-release` were skipped on the
+  pull request, as they should be: this workflow cannot publish from a branch.
+
 **Parity note for 3a.** Setting `codegen-units` through the environment means
 CI's Intel artifact is tuned differently from the arm64 artifact, from the
 Windows/Linux/Android artifacts, and from any local `cargo build --release`. If
@@ -558,7 +589,8 @@ have *not* been given is the `codegen-units` override, and no
       `--bin touchHLE`.
 - [ ] Re-measure the job table; decide whether 3b/3c or F12 are still worth it,
       or whether the next target is `build-win` / `build-ios`.
-- [ ] None of this has been executed yet. Every number here comes from earlier
-      `trunk` runs; the workflow edits in this branch (Phases 1, 2, 3a, F4, F7,
-      F8) have not had a single CI run, so treat the §4 projections as
-      projections until one green run confirms them.
+- [x] Executed once: PR #1 / run 40281051199, all jobs green, `publish`
+      correctly skipped. `test-macos` 13.3 min, x86_64 25.4 min (cold cache).
+- [ ] Measure 3a on a warm cache - the run above was a miss, so the
+      `Build` improvement from `codegen-units` is not established yet. The §4
+      projections stay projections until then.
