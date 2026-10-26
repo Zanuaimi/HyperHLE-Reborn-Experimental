@@ -6,8 +6,10 @@ job finishes in 6–13 minutes; this one takes 24–39. Because
 workflow's duration.
 
 Phases 0, 1 and 2 of this plan are implemented in
-`.github/workflows/HyperHLE_release.yml`; phase 3 (changing what is compiled)
-is left as a decision. The measurement sections below are kept as the
+`.github/workflows/HyperHLE_release.yml`, and so is phase 3a
+(`codegen-units`) as a per-target `env:` override. Phase 3b/3c (thin LTO,
+`ld64.lld`) change what is compiled and are left as a decision; §6 records
+exactly what shipped. The measurement sections below are kept as the
 justification for the changes.
 
 ## 1. Measurements
@@ -116,12 +118,15 @@ six build jobs. The version string needs `git rev-parse HEAD`, `git status` and
 those targets); on macOS/Linux it is optional if `vendor/boost` exists. Keep it,
 but it is the second-largest pure-overhead item after LLVM.
 
-### F5 — The DMG step can burn up to 75 s of `sleep` on a bad day
+### F5 — The `hdiutil` retry loop is a guard, and it is left alone
 
-The `hdiutil` retry loop backs off 5/10/15/20 s. Its 0.25 min in the samples was
-clean; the comment in the workflow says it does fail periodically on arm64
-runners. Tighten the backoff (2/4/6/8 s) and it stays a guard instead of a
-timeout.
+The DMG step retries `hdiutil create` up to five times, backing off
+5/10/15/20 s, so a failing run can add 50 s of `sleep`. In all four samples the
+step took 0.25 min and never retried, and the back-off only runs once the step
+has already failed, i.e. on a run that would otherwise ship no DMG. Shortening
+it would save nothing measurable on a successful build while reducing the
+margin on the failure it exists for, so the loop stays as it is. (This was the
+one item in this plan that was tried and reverted.)
 
 ### F6 — Not a problem, for the record
 
@@ -134,6 +139,10 @@ DMG. Ignore it.
 Order is by savings-per-risk. Phases 1 and 2 change nothing about what is
 compiled or shipped; phase 3 does, and needs a decision.
 
+The YAML below is the design sketch that was implemented, not a copy of the
+current workflow - edit `.github/workflows/HyperHLE_release.yml`, and see §6 for
+where the shipped version differs.
+
 ### Phase 0 — measure once (10 min, do it first)
 
 ```yaml
@@ -145,7 +154,12 @@ compiled or shipped; phase 3 does, and needs a decision.
         if: always()
         with:
           name: cargo-timings-${{ matrix.target }}
-          path: target/${{ matrix.target }}/cargo-timings/
+          # As shipped, both candidate locations are listed: Cargo documents
+          # `<target-dir>/cargo-timings`, and a `--target` build may put it
+          # under the per-target tree.
+          path: |
+            target/cargo-timings/
+            target/${{ matrix.target }}/cargo-timings/
 ```
 
 `cargo-timings/cargo-timing.html` splits the 13 min between native dependency
@@ -235,6 +249,8 @@ make publishing depend on both.
 ```
 
 And in `publish-hyperhle-release`: add `test-macos` to `needs` and to the `if:`.
+
+The `key:` lines in this sketch were **not** applied - see §6, under phase 2.
 
 Tests still gate the release — they just no longer hold the DMG hostage. Their
 wall-clock (~10–13 min) is already within the range of the Windows and iOS jobs,
@@ -382,9 +398,14 @@ Applied in `.github/workflows/HyperHLE_release.yml` and
   derives its key from the job name (`v0-rust-build-osx-Darwin-x64-…` in the
   existing cache inventory), and an explicit key would have discarded the warm
   entries and forced one cold ~26 minute build.
-- **Phase 4 (F4, F5)** — `fetch-depth: 1` on the build jobs (`fetch-tags: true`
-  is kept; only `check-hyperhle-release` and `publish` need history), and the
-  `hdiutil` retry back-off is now 2/4/6/8 s instead of 5/10/15/20 s.
+- **F4** — `fetch-depth: 1` on the build jobs (`fetch-tags: true` is kept; only
+  `check-hyperhle-release` and `publish` need history). This is safe because
+  the version string only uses `rev-parse` and `status`; `describe --tags` feeds
+  a warning that `src/version/build.rs` skips when the command fails.
+- **F5** — *not applied.* The `hdiutil` back-off was briefly shortened to
+  2/4/6/8 s, then reverted to the existing 5/10/15/20 s: it only runs after the
+  step has already failed, so there was no gain to measure and one less retry
+  margin on the failure it exists for.
 
 Not applied, deliberately: phases 3b and 3c (thin LTO, lld), because they
 change the shipped binary and need a measured before/after.
@@ -407,7 +428,7 @@ Two notes for whoever picks up the rest:
   currently 10.59 GB against a 10 GB budget) fixes it.
 
 
-## 8. Round 2: what is left after phases 1-2
+## 7. Round 2: what is left after phases 1-2
 
 With tests off the critical path, the x86_64 job is essentially one step:
 `Build`. So every remaining second is either "compile less" or "compile the
@@ -431,10 +452,15 @@ script change:
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
 ```
 
-Applied to `build-osx` and `test-macos`. It only helps when those trees are
-actually compiled, i.e. on a cold cache - which, given F2, is frequent, and is
-exactly where 26-minute runs came from. Start at `2` because cargo may run
-several build scripts concurrently; `4` is worth a try once the timings are in.
+Applied to `build-osx`, `test-macos`, `build-win` and `build-ios`. It only
+helps when those trees are actually compiled, i.e. on a cold cache - which,
+given F2, is frequent, and is exactly where 26-minute runs came from. The gain
+differs per job: on Windows the `cmake` crate picks the Visual Studio generator
+and `cmake --build` forwards the value to MSBuild as `/m` (a full win); on iOS,
+`platform/ios/scripts/build-sdl-shared.sh` already passes `-G Ninja`, so only
+the Rust-side wrappers (OpenAL Soft, libxml2, Dynarmic) gain there. Start at
+`2` because cargo may run several build scripts concurrently; `4` is worth a
+try once the timings are in.
 
 ### F8 — nothing reclaims the cache budget (**applied**)
 
@@ -493,10 +519,10 @@ worth it only after F10, and it is the largest diff of any option here.
 
 After F10, x86_64 lands around 11-13 minutes and stops being the critical path:
 `build-win` (12m42s) and `build-ios` (12m38s) take over, plus the 1.7 minute
-publish job. Further macOS work then buys nothing. The same F7/F10 treatment
-applies to those two jobs (they also build SDL and dynarmic serially; Windows
-and iOS were deliberately left alone here because the question was about
-macOS).
+publish job. Further macOS work then buys nothing. Those two jobs also build SDL and
+Dynarmic, and they now get `CMAKE_BUILD_PARALLEL_LEVEL` as well (§6); what they
+have *not* been given is the `codegen-units` override, and no
+`--timings`-driven measurement of either job has been done.
 
 ### Micro-wins not worth a PR on their own
 
@@ -510,7 +536,7 @@ macOS).
 - `hdiutil create -format ULFO`: faster (lzfse) than the default UDZO, at the
   cost of a larger DMG. Only matters if F5-like retries appear.
 
-## 7. Checklist
+## 8. Checklist
 
 - [x] Phase 0: `ci_timings` input + `--timings` upload (run once with it on,
       read `cargo-timing.html`, note the LTO/link/native-deps split).
@@ -523,10 +549,16 @@ macOS).
 - [ ] Phase 3a follow-up: compare `--print-fps` before/after on one heavy game;
       if neutral, move the setting into `Cargo.toml` so every build matches.
 - [x] F7: `CMAKE_BUILD_PARALLEL_LEVEL` on the macOS jobs (cold-cache native
-      builds were serial `make`).
+      builds were serial `make`), and on `build-win` / `build-ios`.
+- [x] F5: measured the `hdiutil` loop (0.25 min, never retried); deliberately
+      left unchanged.
 - [x] F8: scheduled cache pruning (`.github/workflows/cleanup-caches.yml`),
       21-day / 8 GB budget.
 - [ ] F9: read `cargo --timings`; if a cdylib link unit exists, try
       `--bin touchHLE`.
 - [ ] Re-measure the job table; decide whether 3b/3c or F12 are still worth it,
       or whether the next target is `build-win` / `build-ios`.
+- [ ] None of this has been executed yet. Every number here comes from earlier
+      `trunk` runs; the workflow edits in this branch (Phases 1, 2, 3a, F4, F7,
+      F8) have not had a single CI run, so treat the §4 projections as
+      projections until one green run confirms them.

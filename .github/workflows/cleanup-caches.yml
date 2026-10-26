@@ -1,11 +1,11 @@
 name: Prune Actions caches
 
-# GitHub gives a repository 10 GB of Actions cache storage. This repository was
-# over it (10.59 GB across 39 entries on 2026-10-26), and because the limit is
-# enforced by evicting least-recently-used entries, the macOS x86_64
-# `rust-cache` entry kept disappearing - which turns a 13 minute release build
-# into a 26 minute cold one. See
-# dev-scripts/ci-performance-macos-x86_64.md.
+# GitHub gives a repository 10 GB of Actions cache storage, enforced by evicting
+# least-recently-used entries. This repository was over it (10.59 GB across 39
+# entries on 2026-10-26), which competes with the seven release jobs for room.
+# The macOS x86_64 build is the job that cannot afford a miss: the same commit
+# graph produced `Build` steps of 13.35 minutes warm and 25.78 minutes cold.
+# See dev-scripts/ci-performance-macos-x86_64.md.
 #
 # This job keeps usage under a budget, nobody has to remember to do it, and it
 # is safe to run at any time: cache entries are pure build accelerators.

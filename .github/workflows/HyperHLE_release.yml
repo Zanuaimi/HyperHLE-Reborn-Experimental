@@ -66,15 +66,17 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
-          # Only the version string needs Git (`rev-parse`, `status`,
-          # `describe --tags`), not history.
+          # The version string needs `rev-parse HEAD` and `git status`;
+          # `describe --tags` only feeds a version-mismatch warning that is
+          # skipped when it fails. Neither needs history, so depth 1 (plus
+          # tags) is enough.
           fetch-depth: 1
           fetch-tags: true
 
       # `save-if` keeps pull-request runs from storing a new entry per
       # Cargo.lock hash: the repository has a 10 GB cache budget shared by
-      # seven jobs, and evicting this key turns a 13 minute release build into
-      # a 26 minute cold one.
+      # seven jobs, and losing this key takes the `Build` step from about 13
+      # minutes to about 26. See dev-scripts/ci-performance-macos-x86_64.md.
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -117,7 +119,12 @@ jobs:
         uses: actions/upload-artifact@main
         with:
           name: cargo-timings-${{ matrix.target }}
-          path: target/${{ matrix.target }}/cargo-timings/
+          # Cargo documents `<target-dir>/cargo-timings`; a `--target` build
+          # may place it under the per-target tree instead, so both are listed
+          # and whichever exists is uploaded.
+          path: |
+            target/cargo-timings/
+            target/${{ matrix.target }}/cargo-timings/
           if-no-files-found: ignore
 
       - name: Create .app bundle and DMG
@@ -155,9 +162,7 @@ jobs:
               echo "hdiutil create still failed after $max_attempts attempts" >&2
               exit 1
             fi
-            # Short back-off: this is a guard against a stale Spotlight mount,
-            # not a reason to spend over a minute sleeping inside the job.
-            sleep_secs=$((attempt * 2))
+            sleep_secs=$((attempt * 5))
             echo "hdiutil create failed (attempt $attempt); retrying in ${sleep_secs}s" >&2
             if [ -d "/Volumes/touchHLE" ]; then
               hdiutil detach -force "/Volumes/touchHLE" || true
