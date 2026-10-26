@@ -363,7 +363,11 @@ Applied in `.github/workflows/HyperHLE_release.yml` and
   value must never be empty, that is a profile parse error rather than "use the
   default"). See the note on parity below.
 - **F7** — `CMAKE_BUILD_PARALLEL_LEVEL: "2"` on `build-osx`, `test-macos`,
-  `build-win` and `build-ios`.
+  `build-win` and `build-ios`. Expected gain differs per job: on Windows the
+  `cmake` crate uses the Visual Studio generator and `--build` forwards the
+  value to MSBuild as `/m`; on iOS, `platform/ios/scripts/build-sdl-shared.sh`
+  already passes `-G Ninja` (parallel by default), so only the Rust-side
+  wrappers (OpenAL Soft, libxml2, Dynarmic) gain there.
 - **Phase 0** — new `ci_timings` `workflow_dispatch` input, default `false`.
   When set, the macOS build runs with `--timings` and uploads
   `cargo-timings-<target>` artifacts (`if: always()`, `if-no-files-found:

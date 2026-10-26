@@ -470,8 +470,11 @@ jobs:
     runs-on: macos-latest
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
-      # See the comment in build-osx. This job installs ninja, but the `cmake`
-      # crate passes no generator, so CMake still defaults to Unix Makefiles.
+      # See the comment in build-osx. SDL2 itself is fine here:
+      # platform/ios/scripts/build-sdl-shared.sh passes `-G Ninja`, and Ninja
+      # parallelises by default. This covers the Rust-side wrappers (OpenAL
+      # Soft, libxml2, Dynarmic), which go through the `cmake` crate with no
+      # generator and therefore fall back to serial Unix Makefiles.
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
@@ -572,7 +575,9 @@ jobs:
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
       # See the comment in build-osx: `cmake --build` without `--parallel`
-      # compiles SDL2/OpenAL Soft/libxml2/Dynarmic one file at a time.
+      # compiles SDL2/OpenAL Soft/libxml2/Dynarmic one file at a time. The
+      # `cmake` crate selects the Visual Studio generator here, and `--build`
+      # forwards this value to MSBuild as `/m`.
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
