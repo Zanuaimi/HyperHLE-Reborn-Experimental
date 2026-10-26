@@ -7,6 +7,10 @@ on:
         description: Publish a HyperHLE release (after all builds succeed)
         type: boolean
         default: false
+      ci_timings:
+        description: Upload cargo --timings reports (CI performance work)
+        type: boolean
+        default: false
   push:
     branches: [ "trunk" ]
   pull_request:
@@ -37,17 +41,46 @@ jobs:
             runner: macos-15
             artifact: HyperHLE_macOS_AArch64
     runs-on: ${{ matrix.runner }}
+    env:
+      # The `cmake` crate runs `cmake --build` without `--parallel`, and CMake
+      # picks its platform default generator (Unix Makefiles here), so the
+      # vendored SDL2, OpenAL Soft, libxml2 and Dynarmic trees were compiled
+      # one source file at a time on a 4-core runner. CMake's `--build`
+      # honours this variable, so this single line parallelises all of them
+      # without touching any build script. Only matters on a cold cache.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      # `Cargo.toml` ships `codegen-units = 1` with `lto = "fat"`, so the LTO
+      # pass and the final machine-code generation run as a single unit and
+      # leave three of this runner's four cores idle for the tail of the build.
+      # Partitioning the post-LTO code generation costs well under a percent of
+      # runtime and buys several minutes here. Scoped to the Intel build on
+      # purpose: the arm64 leg keeps the shipped `1`, so only the slower
+      # runner changes. Benchmark before widening it (see
+      # dev-scripts/ci-performance-macos-x86_64.md, phase 3a).
+      # '1' (not an empty string) for the arm64 leg: it matches `Cargo.toml`,
+      # and an empty value would be a profile parse error, not "use default".
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.target == 'x86_64-apple-darwin' && '16' || '1' }}
 
-    steps:  
+    steps:
       - name: Checkout touchHLE
         uses: actions/checkout@main
         with:
           submodules: recursive
-          fetch-depth: 0
+          # The version string needs `rev-parse HEAD` and `git status`;
+          # `describe --tags` only feeds a version-mismatch warning that is
+          # skipped when it fails. Neither needs history, so depth 1 (plus
+          # tags) is enough.
+          fetch-depth: 1
           fetch-tags: true
-          
+
+      # `save-if` keeps pull-request runs from storing a new entry per
+      # Cargo.lock hash: the repository has a 10 GB cache budget shared by
+      # seven jobs, and losing this key takes the `Build` step from about 13
+      # minutes to about 26. See dev-scripts/ci-performance-macos-x86_64.md.
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@master
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost  
         id: cache-boost  
@@ -72,34 +105,27 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
-      # TestApp is built with LLVM 12 against the common-3.0 SDK, as in
-      # touchHLE's CI. These steps were removed in 49d9d48e.
-      - name: Try to get cached copy of LLVM
-        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
-        id: cache-llvm
-        uses: actions/cache@main
+      # `cargo test` is NOT run here. TestApp needs LLVM 12 and the
+      # common-3.0 SDK, compiles the whole dependency graph a second time in
+      # the dev profile, and produces nothing this job ships - yet it used to
+      # hold back the DMG, and therefore every release, by 7-11 minutes. It
+      # now runs in the `test-macos` job, in parallel with this one. See
+      # dev-scripts/ci-performance-macos-x86_64.md.
+      - name: Build
+        run: cargo build --target ${{ matrix.target }} --release ${{ inputs.ci_timings && '--timings' || '' }}
+
+      - name: Upload cargo build timings
+        if: ${{ always() && inputs.ci_timings }}
+        uses: actions/upload-artifact@main
         with:
-          path: tests/llvm
-          key: llvm_12_0_0_macOS_x64
-
-      - if: ${{ matrix.target == 'x86_64-apple-darwin' && steps.cache-llvm.outputs.cache-hit != 'true' }}
-        name: Download LLVM
-        run: curl -L -O "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.0/clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz"
-
-      - if: ${{ matrix.target == 'x86_64-apple-darwin' && steps.cache-llvm.outputs.cache-hit != 'true' }}
-        name: Extract LLVM
-        run: tar -xf clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz && mkdir tests/llvm && mv clang+llvm-12.0.0-x86_64-apple-darwin/* tests/llvm
-
-      - name: Get copy of common-3.0-sdk
-        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
-        run: cd tests && curl -L https://github.com/touchHLE/common-3.0-sdk/releases/latest/download/common-3.0.sdk-macOS-universal.tar.gz | tar xzv
-
-      - name: Test
-        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
-        run: cargo test --target ${{ matrix.target }}
-        
-      - name: Build  
-        run: cargo build --target ${{ matrix.target }} --release
+          name: cargo-timings-${{ matrix.target }}
+          # Cargo documents `<target-dir>/cargo-timings`; a `--target` build
+          # may place it under the per-target tree instead, so both are listed
+          # and whichever exists is uploaded.
+          path: |
+            target/cargo-timings/
+            target/${{ matrix.target }}/cargo-timings/
+          if-no-files-found: ignore
 
       - name: Create .app bundle and DMG
         # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
@@ -151,6 +177,76 @@ jobs:
           name: ${{ matrix.artifact }}
           path: touchHLE_${{ matrix.target }}.dmg
 
+  # Runs the Rust unit tests and the TestApp integration tests in parallel with
+  # the release builds. Publishing still waits for this job, so a failing test
+  # still blocks a release - it just no longer sits on the artifact critical
+  # path. TestApp needs its own toolchain (LLVM 12 + common-3.0 SDK), which is
+  # why none of that lives in `build-osx` any more.
+  test-macos:
+    runs-on: macos-15-intel
+    env:
+      # See the comment in build-osx.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+
+    steps:
+      - name: Checkout touchHLE
+        uses: actions/checkout@main
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          fetch-tags: true
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
+
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@main
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_macos
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.29.0"
+
+      # TestApp is built with LLVM 12 against the common-3.0 SDK, as in
+      # touchHLE's CI. These steps were removed in 49d9d48e.
+      - name: Try to get cached copy of LLVM
+        id: cache-llvm
+        uses: actions/cache@main
+        with:
+          path: tests/llvm
+          key: llvm_12_0_0_macOS_x64
+
+      - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
+        name: Download LLVM
+        run: curl -L -O "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.0/clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz"
+
+      - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
+        name: Extract LLVM
+        run: tar -xf clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz && mkdir tests/llvm && mv clang+llvm-12.0.0-x86_64-apple-darwin/* tests/llvm
+
+      - name: Get copy of common-3.0-sdk
+        run: cd tests && curl -L https://github.com/touchHLE/common-3.0-sdk/releases/latest/download/common-3.0.sdk-macOS-universal.tar.gz | tar xzv
+
+      - name: Install Rust target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Test
+        run: cargo test --target x86_64-apple-darwin
+
   build-linux:
     runs-on: ubuntu-latest
 
@@ -190,7 +286,9 @@ jobs:
             libegl1-mesa-dev
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@master
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost
         id: cache-boost
@@ -377,6 +475,12 @@ jobs:
     runs-on: macos-latest
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
+      # See the comment in build-osx. SDL2 itself is fine here:
+      # platform/ios/scripts/build-sdl-shared.sh passes `-G Ninja`, and Ninja
+      # parallelises by default. This covers the Rust-side wrappers (OpenAL
+      # Soft, libxml2, Dynarmic), which go through the `cmake` crate with no
+      # generator and therefore fall back to serial Unix Makefiles.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
       - name: Checkout touchHLE
@@ -405,9 +509,10 @@ jobs:
         run: rustup target add aarch64-apple-ios
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@master
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> build/rust-ios-native"
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost
         id: cache-boost
@@ -474,6 +579,11 @@ jobs:
     runs-on: windows-2022
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
+      # See the comment in build-osx: `cmake --build` without `--parallel`
+      # compiles SDL2/OpenAL Soft/libxml2/Dynarmic one file at a time. The
+      # `cmake` crate selects the Visual Studio generator here, and `--build`
+      # forwards this value to MSBuild as `/m`.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
     - name: Checkout touchHLE
@@ -482,7 +592,9 @@ jobs:
         submodules: recursive
         
     - name: Cache Rust build artifacts
-      uses: Swatinem/rust-cache@master
+      uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
     - name: Try to get cached copy of Boost  
       id: cache-boost  
@@ -572,11 +684,12 @@ jobs:
         run: ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
-    needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win, build-ios]
+    needs: [check-hyperhle-release, build-osx, test-macos, build-linux, build-android, build-win, build-ios]
     if: >-
       needs.check-hyperhle-release.result == 'success' &&
       needs.check-hyperhle-release.outputs.should_release == 'true' &&
       needs.build-osx.result == 'success' &&
+      needs.test-macos.result == 'success' &&
       needs.build-linux.result == 'success' &&
       needs.build-android.result == 'success' &&
       needs.build-win.result == 'success' &&

@@ -1,0 +1,96 @@
+name: Prune Actions caches
+
+# GitHub gives a repository 10 GB of Actions cache storage, enforced by evicting
+# least-recently-used entries. This repository was over it (10.59 GB across 39
+# entries on 2026-10-26), which competes with the seven release jobs for room.
+# The macOS x86_64 build is the job that cannot afford a miss: the same commit
+# graph produced `Build` steps of 13.35 minutes warm and 25.78 minutes cold.
+# See dev-scripts/ci-performance-macos-x86_64.md.
+#
+# This job keeps usage under a budget, nobody has to remember to do it, and it
+# is safe to run at any time: cache entries are pure build accelerators.
+
+on:
+  schedule:
+    # Weekly, Monday 03:17 UTC - before the working week fills the cache up.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      budget_gb:
+        description: Keep total cache usage under this many GB
+        type: string
+        default: "8"
+      max_age_days:
+        description: Also delete entries unused for this many days
+        type: string
+        default: "21"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    env:
+      BUDGET_GB: ${{ inputs.budget_gb || '8' }}
+      MAX_AGE_DAYS: ${{ inputs.max_age_days || '21' }}
+    steps:
+      - name: Delete stale and over-budget caches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const GB = 1024 ** 3;
+            const budget = Number(process.env.BUDGET_GB) * GB;
+            const maxAgeMs = Number(process.env.MAX_AGE_DAYS) * 86400e3;
+            const now = Date.now();
+
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCacheList,
+              { ...context.repo, per_page: 100 },
+            );
+
+            // Oldest first: the tail of this list is what the eviction would
+            // have taken anyway.
+            caches.sort(
+              (a, b) => Date.parse(a.last_accessed_at) - Date.parse(b.last_accessed_at),
+            );
+
+            let total = caches.reduce((sum, c) => sum + c.size_in_bytes, 0);
+            const before = total;
+            const deleted = [];
+
+            for (const cache of caches) {
+              const age = now - Date.parse(cache.last_accessed_at);
+              const tooOld = age > maxAgeMs;
+              const overBudget = total > budget;
+              if (!tooOld && !overBudget) continue;
+
+              try {
+                await github.rest.actions.deleteActionsCacheById({
+                  ...context.repo,
+                  cache_id: cache.id,
+                });
+                total -= cache.size_in_bytes;
+                deleted.push(
+                  `${(cache.size_in_bytes / GB).toFixed(2)} GB  ` +
+                    `${String(Math.round(age / 86400e3)).padStart(4)} d  ${cache.key}`,
+                );
+              } catch (error) {
+                // A concurrent run may have evicted it already; keep going.
+                core.warning(`could not delete ${cache.key}: ${error.message}`);
+              }
+            }
+
+            const toGb = (bytes) => (bytes / GB).toFixed(2);
+            core.summary
+              .addHeading('Actions cache prune')
+              .addRaw(
+                `Before: **${toGb(before)} GB** in ${caches.length} entries\n\n` +
+                  `After: **${toGb(total)} GB** (budget ${toGb(budget)} GB, ` +
+                  `max age ${process.env.MAX_AGE_DAYS} days)\n\n`,
+              )
+              .addRaw(deleted.length ? '```\n' + deleted.join('\n') + '\n```' : 'Nothing deleted.');
+            await core.summary.write();
+
+            core.info(`deleted ${deleted.length} entries, ${toGb(before - total)} GB freed`);

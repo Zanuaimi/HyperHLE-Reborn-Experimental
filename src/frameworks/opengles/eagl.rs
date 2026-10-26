@@ -30,7 +30,7 @@ use crate::Environment;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Copy, Clone)]
@@ -1135,57 +1135,36 @@ pub const CLASSES: ClassExports = objc_classes! {
         // the biggest per-frame cost. It's now an explicit choice
         // (--present-mode=readback) or an automatic fallback when the GPU
         // route demonstrably produces black frames on this driver.
-        let use_readback = match env.options.present_mode {
-            PresentMode::Readback => {
-                if backend_is_es2 && !backend_is_translator {
-                    // The readback path speaks ES 1.1 (OES framebuffer entry
-                    // points); the shader presenter is the only option on a
-                    // real ES 2.0 driver.
-                    log_once!(
-                        "--present-mode=readback is not available on an OpenGL ES 2.0 backend; presenting directly"
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
-            PresentMode::Direct => false,
-            // The ES 1.1-on-ES 2.0 translator can't run either GPU presenter
-            // (its glDrawArrays is the fixed-function emulation itself), so
-            // it keeps using readback unless explicitly overridden.
-            PresentMode::Auto => {
-                // Native ES 1.1 games keep the readback presenter by default.
-                // The GPU-copy path changes guest-visible fixed-function state
-                // in ways 2D engines (cocos2d etc.) notice — sprite
-                // blending/tinting breaks even though the frame is not black,
-                // so the automatic black-frame fallback never triggers. ES 2.0
-                // backends keep the fast GPU path (its save/restore is exact,
-                // and that is where the 3D games live).
-                backend_is_translator
-                    || backend_is_native_es1
-                    || (backend_is_es2 && direct_present_is_broken())
-            }
+        let backend = PresentBackend {
+            is_translator: backend_is_translator,
+            is_native_es1: backend_is_native_es1,
+            is_es2: backend_is_es2,
+            direct_present_broken: direct_present_is_broken(),
         };
+        let decision = select_present_route(env.options.present_mode, backend);
+        let use_readback = decision.route == PresentRoute::Readback;
         {
             static LOGGED: std::sync::Once = std::sync::Once::new();
             LOGGED.call_once(|| {
                 log!(
                     "EAGL presenter: fullscreen layer {:?} will be presented via {} \
-                     (present_mode={:?}, translator={}, native_es1={}, es2={}) \
-                     [this log will only be shown once]",
+                     (present_mode={:?}, force_composition={}, translator={}, \
+                     native_es1={}, es2={}): {} [this log will only be shown once]",
                     drawable,
-                    if use_readback {
-                        "glReadPixels readback + compositor"
-                    } else {
-                        "GPU copy (direct)"
-                    },
+                    decision.route.describe(),
                     env.options.present_mode,
-                    backend_is_translator,
-                    backend_is_native_es1,
-                    backend_is_es2,
+                    env.options.force_composition,
+                    backend.is_translator,
+                    backend.is_native_es1,
+                    backend.is_es2,
+                    decision.reason,
                 );
             });
         }
+        // One line per later change of route (e.g. the black-frame probe
+        // giving up on the GPU presenter mid-session), so a bug report that
+        // only shows part of the log still says how the frame got to screen.
+        note_present_route(decision, drawable, env.options.present_mode, backend);
         if use_readback {
             log_dbg!(
                 "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} through RAM readback.",
@@ -1284,9 +1263,14 @@ pub const CLASSES: ClassExports = objc_classes! {
             static SLOW_PATH_LOGGED: std::sync::Once = std::sync::Once::new();
             SLOW_PATH_LOGGED.call_once(|| {
                 log!(
-                    "EAGL presenter: no fullscreen layer found; presenting renderbuffer \
-                     {:#x} to layer {:?} via RAM readback (slow path). [this log will \
-                     only be shown once]",
+                    "EAGL presenter: no fullscreen layer found ({}); presenting \
+                     renderbuffer {:#x} to layer {:?} via RAM readback + Core \
+                     Animation compositing. [this log will only be shown once]",
+                    if env.options.force_composition {
+                        "composition is forced by --force-composition"
+                    } else {
+                        "the drawable does not cover the screen as an opaque layer"
+                    },
                     renderbuffer,
                     drawable
                 );
@@ -2238,6 +2222,169 @@ static DIRECT_PRESENT_PROBE_SUCCESSES: AtomicU32 = AtomicU32::new(0);
 /// Has the detector concluded that presenting on the GPU doesn't work here?
 fn direct_present_is_broken() -> bool {
     DIRECT_PRESENT_BROKEN.load(Ordering::Relaxed)
+}
+
+/// How a frame the app rendered into a fullscreen `CAEAGLLayer` reaches the
+/// screen.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PresentRoute {
+    /// `glReadPixels()` the renderbuffer into system RAM, then let the Core
+    /// Animation compositor put it on the screen. It is the same technique the
+    /// `--force-composition` slow path uses, and the closest available model of
+    /// iOS, where `presentRenderbuffer:` hands the drawable to Core Animation
+    /// (Apple: "the contents of the renderbuffer are displayed when this
+    /// method returns").
+    Readback,
+    /// Copy the renderbuffer into a texture and draw it into the window
+    /// directly. Much cheaper, but it runs the copy through the same GL
+    /// context the app is using, so on strict drivers it can perturb state
+    /// that fixed-function 2D engines notice.
+    Direct,
+}
+
+impl PresentRoute {
+    /// Short description used in the presenter log.
+    fn describe(self) -> &'static str {
+        match self {
+            PresentRoute::Readback => "glReadPixels readback + compositor",
+            PresentRoute::Direct => "GPU copy (direct)",
+        }
+    }
+}
+
+/// A chosen route together with the reason it won, so the log explains the
+/// presentation setup instead of leaving the user to infer it.
+#[derive(Copy, Clone, Debug)]
+struct PresentDecision {
+    route: PresentRoute,
+    /// Why `route` was chosen. Never empty; the reason is part of the
+    /// diagnostic output for "this game renders wrong" reports.
+    reason: &'static str,
+}
+
+/// The host-state facts the presenter route depends on. Grouped so the
+/// decision function stays a pure function of explicit inputs and can be
+/// unit-tested without a GL context.
+#[derive(Copy, Clone, Debug)]
+struct PresentBackend {
+    /// The GLES 1.1-on-GLES 2.0 translator backend. Its `glDrawArrays` *is*
+    /// the fixed-function emulation, so it can't run either GPU presenter.
+    is_translator: bool,
+    /// A native OpenGL ES 1.1 driver (the normal Android ES 1.1 case).
+    is_native_es1: bool,
+    /// A real OpenGL ES 2.0/3.0 driver.
+    is_es2: bool,
+    /// The black-frame probe proved the GPU-copy presenter produces black
+    /// frames on this driver (see [direct_present_is_broken]).
+    direct_present_broken: bool,
+}
+
+/// Which route was used for the last fullscreen frame, so a change (for
+/// example the black-frame probe flipping `auto` to readback) is reported
+/// once instead of being invisible. [PRESENT_ROUTE_UNSET] until the first
+/// presented frame.
+///
+/// One record is enough for the whole process because the route depends on
+/// `--present-mode` and the driver, not on the drawable; the probe result it
+/// can follow is global too.
+static LAST_PRESENT_ROUTE: AtomicU8 = AtomicU8::new(PRESENT_ROUTE_UNSET);
+const PRESENT_ROUTE_UNSET: u8 = u8::MAX;
+
+fn present_route_code(route: PresentRoute) -> u8 {
+    match route {
+        PresentRoute::Direct => 0,
+        PresentRoute::Readback => 1,
+    }
+}
+
+fn present_route_from_code(code: u8) -> PresentRoute {
+    if code == 1 {
+        PresentRoute::Readback
+    } else {
+        PresentRoute::Direct
+    }
+}
+
+/// Report a change of presentation route. Silent on the first presented
+/// frame, because the one-shot "will be presented via" line already covers
+/// it; after that this prints exactly one line per route change.
+fn note_present_route(
+    decision: PresentDecision,
+    drawable: id,
+    present_mode: PresentMode,
+    backend: PresentBackend,
+) {
+    let current = present_route_code(decision.route);
+    let previous = LAST_PRESENT_ROUTE.swap(current, Ordering::Relaxed);
+    if previous == current || previous == PRESENT_ROUTE_UNSET {
+        return;
+    }
+    log!(
+        "EAGL presenter: layer {:?} presentation changed from {} to {}: {} \
+         [present_mode={:?}, probe_says_direct_is_black={}]",
+        drawable,
+        present_route_from_code(previous).describe(),
+        decision.route.describe(),
+        decision.reason,
+        present_mode,
+        backend.direct_present_broken,
+    );
+}
+
+/// Pick the presentation route for one fullscreen EAGL frame that is eligible
+/// for the fast path, and say why.
+///
+/// This is the policy that `presentRenderbuffer:` used to inline. It is a pure
+/// function of `--present-mode` and the backend so that it can be tested
+/// without a GL context; the behaviour is unchanged.
+///
+/// Note that a frame presented with `--force-composition` never reaches here:
+/// that option makes `find_fullscreen_eagl_layer()` return nil, so the whole
+/// fast-path branch is skipped and the slow path reads the renderbuffer back
+/// and composites it, whatever this function would have chosen. That is what
+/// makes the switch a workaround for rendering problems; on a backend whose
+/// `auto` policy already reads back, it changes nothing at all.
+fn select_present_route(
+    present_mode: PresentMode,
+    backend: PresentBackend,
+) -> PresentDecision {
+    // The readback path speaks ES 1.1 (OES framebuffer entry points); the
+    // shader presenter is the only option on a real ES 2.0 driver.
+    let can_readback = !(backend.is_es2 && !backend.is_translator);
+    let decision = |route: PresentRoute, reason: &'static str| PresentDecision { route, reason };
+
+    match present_mode {
+        PresentMode::Readback if can_readback => {
+            decision(PresentRoute::Readback, "--present-mode=readback")
+        }
+        PresentMode::Readback => decision(
+            PresentRoute::Direct,
+            "--present-mode=readback is unavailable on an ES 2.0 driver",
+        ),
+        PresentMode::Direct => decision(PresentRoute::Direct, "--present-mode=direct"),
+        // Native ES 1.1 games keep the readback presenter by default. The
+        // GPU-copy path changes guest-visible fixed-function state in ways 2D
+        // engines (cocos2d etc.) notice - sprite blending/tinting breaks even
+        // though the frame is not black, so the automatic black-frame fallback
+        // never triggers. ES 2.0 backends keep the fast GPU path (its
+        // save/restore is exact, and that is where the 3D games live).
+        PresentMode::Auto if backend.is_translator => decision(
+            PresentRoute::Readback,
+            "auto: the ES 1.1-on-ES 2.0 translator cannot run a GPU presenter",
+        ),
+        PresentMode::Auto if backend.is_native_es1 => decision(
+            PresentRoute::Readback,
+            "auto: a native ES 1.1 driver reads back and composites by default",
+        ),
+        PresentMode::Auto if backend.is_es2 && backend.direct_present_broken => decision(
+            PresentRoute::Readback,
+            "auto: the GPU-copy presenter was proven to produce black frames here",
+        ),
+        PresentMode::Auto => decision(
+            PresentRoute::Direct,
+            "auto: a native ES 2.0 driver presents on the GPU",
+        ),
+    }
 }
 
 /// Should this frame be probed? Also advances the frame counter.
@@ -3831,4 +3978,95 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         }
     }
     false
+}
+
+#[cfg(test)]
+mod present_route_tests {
+    use super::{select_present_route, PresentBackend, PresentRoute};
+    use crate::options::PresentMode;
+
+    /// The normal Android ES 1.1 case: a native ES 1.1 driver, nothing else.
+    const NATIVE_ES1: PresentBackend = PresentBackend {
+        is_translator: false,
+        is_native_es1: true,
+        is_es2: false,
+        direct_present_broken: false,
+    };
+    const ES2: PresentBackend = PresentBackend {
+        is_translator: false,
+        is_native_es1: false,
+        is_es2: true,
+        direct_present_broken: false,
+    };
+    const TRANSLATOR: PresentBackend = PresentBackend {
+        is_translator: true,
+        is_native_es1: false,
+        is_es2: true,
+        direct_present_broken: false,
+    };
+    /// `ES2` on a driver where the black-frame probe fired.
+    const ES2_PRESENT_IS_BLACK: PresentBackend = PresentBackend {
+        is_translator: false,
+        is_native_es1: false,
+        is_es2: true,
+        direct_present_broken: true,
+    };
+    const ALL_BACKENDS: [PresentBackend; 4] =
+        [NATIVE_ES1, ES2, TRANSLATOR, ES2_PRESENT_IS_BLACK];
+    const ALL_MODES: [PresentMode; 3] =
+        [PresentMode::Auto, PresentMode::Direct, PresentMode::Readback];
+
+    fn route(mode: PresentMode, backend: PresentBackend) -> PresentRoute {
+        select_present_route(mode, backend).route
+    }
+
+    #[test]
+    fn auto_keeps_reading_back_on_es1_and_presents_on_the_gpu_on_es2() {
+        assert_eq!(route(PresentMode::Auto, NATIVE_ES1), PresentRoute::Readback);
+        assert_eq!(route(PresentMode::Auto, TRANSLATOR), PresentRoute::Readback);
+        assert_eq!(route(PresentMode::Auto, ES2), PresentRoute::Direct);
+        // A driver where the GPU presenter goes black keeps reading back.
+        assert_eq!(
+            route(PresentMode::Auto, ES2_PRESENT_IS_BLACK),
+            PresentRoute::Readback
+        );
+    }
+
+    #[test]
+    fn explicit_present_modes_are_honoured() {
+        for backend in ALL_BACKENDS {
+            // `--present-mode=direct` always presents on the GPU.
+            assert_eq!(route(PresentMode::Direct, backend), PresentRoute::Direct);
+        }
+        // Readback is unavailable on a real ES 2.0 driver - the readback path
+        // speaks ES 1.1 OES entry points - but works everywhere else.
+        assert_eq!(
+            route(PresentMode::Readback, NATIVE_ES1),
+            PresentRoute::Readback
+        );
+        assert_eq!(
+            route(PresentMode::Readback, TRANSLATOR),
+            PresentRoute::Readback
+        );
+        assert_eq!(route(PresentMode::Readback, ES2), PresentRoute::Direct);
+    }
+
+    #[test]
+    fn every_decision_explains_itself() {
+        // The reason ends up in bug reports and sits inside a single log
+        // line, so it must never be empty, contain a line break, or carry
+        // doubled spaces from an editing slip.
+        for backend in ALL_BACKENDS {
+            for mode in ALL_MODES {
+                let reason = select_present_route(mode, backend).reason;
+                assert!(!reason.is_empty());
+                assert!(!reason.contains("  "), "doubled space in {reason:?}");
+                assert!(!reason.contains('\n'), "stray newline in {reason:?}");
+                assert!(
+                    reason.chars().count() <= 80,
+                    "reason too long for one log line: {reason:?}"
+                );
+            }
+        }
+    }
 }
