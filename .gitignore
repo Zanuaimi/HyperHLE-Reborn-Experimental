@@ -50,3 +50,9 @@ xcuserdata/
 
 # Graphify artifacts
 /graphify-out/
+/.agents/agents
+/.agents
+/.opencode/agents
+/.opencode
+/.serena/memories
+/.serena
