@@ -209,15 +209,24 @@ picker switch that is off by default. Changes:
    mean "since the previous present".
 3. **`log_drawable_capabilities_once`** (new, in `eagl.rs`, called from both
    presenters before the read) prints `ALPHA_BITS` / `DEPTH_BITS` /
-   `STENCIL_BITS` / `SAMPLES` and the guest's fixed-function state at the first
-   presented frame. Values are `-1` / `false` when a backend rejects the query.
+   `STENCIL_BITS` and the guest's fixed-function state at the first presented
+   frame. ES 1.1 with a real fixed-function pipeline only (native ES 1.1 and
+   ES1-on-GL2): it returns immediately when `gles.is_es2()`, because several of
+   those enums are invalid outside ES 1.1 — the ES1-on-ES2 translator would
+   forward them to an ES 2.0 host and the app would see a `GL_INVALID_ENUM` of
+   ours in its own error queue — and the state being described does not exist
+   there anyway. It does not call `glGetError`, for the same reason: the app may
+   be polling it.
 4. **`log_nonopaque_present_once` now also runs on the readback slow path**
    (it was GPU-route only).
-5. **The depth auto-attach checks its own work**: after attaching, it queries
-   `CheckFramebufferStatusOES` while the framebuffer is bound, drains the error
-   queue, and logs once if the FBO ended up incomplete (which would discard
-   every draw, i.e. look exactly like the x-ray bug it exists to fix). The
-   attach message also names both attachments.
+5. **The depth auto-attach checks its own work**: after attaching (the guest
+   has the framebuffer bound at that point), it queries
+   `CheckFramebufferStatusOES`; if the FBO ended up incomplete — which discards
+   every draw and therefore looks exactly like the x-ray bug the workaround
+   exists to fix — it detaches and deletes the depth buffer again and logs once,
+   so the app is back to its pre-workaround behaviour instead of being left
+   with a framebuffer it cannot draw into. The attach message also names both
+   attachments.
 
 ### 2.4 Review pass over the uncompiled rendering work (2026-10-27)
 
@@ -368,7 +377,7 @@ a regression introduced by this fork. Do not re-open that theory.
    One line before it, once per session:
 
        Drawable capabilities at the first presented frame: ALPHA_BITS=…
-       DEPTH_BITS=… STENCIL_BITS=… SAMPLES=… | guest state: depth_test=…
+       DEPTH_BITS=… STENCIL_BITS=… | guest state: depth_test=…
        alpha_test=… blend=… cull_face=… scissor_test=… texture_2d=…
        lighting=… (N of 8 lights enabled) fog=… color_material=…
 

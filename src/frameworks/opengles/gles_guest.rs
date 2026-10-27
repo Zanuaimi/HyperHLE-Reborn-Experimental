@@ -1623,6 +1623,7 @@ fn glDrawTexfOES(
     width: GLfloat,
     height: GLfloat,
 ) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1642,6 +1643,7 @@ fn glDrawTexfOES(
     })
 }
 fn glDrawTexiOES(env: &mut Environment, x: GLint, y: GLint, z: GLint, width: GLint, height: GLint) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1668,6 +1670,7 @@ fn glDrawTexxOES(
     width: GLfixed,
     height: GLfixed,
 ) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1687,29 +1690,34 @@ fn glDrawTexxOES(
     })
 }
 fn glDrawTexfvOES(env: &mut Environment, coords: ConstPtr<GLfloat>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexfvOES(coords) }
     })
 }
 fn glDrawTexivOES(env: &mut Environment, coords: ConstPtr<GLint>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexivOES(coords) }
     })
 }
 fn glDrawTexxvOES(env: &mut Environment, coords: ConstPtr<GLfixed>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexxvOES(coords) }
     })
 }
 fn glDrawTexsOES(env: &mut Environment, x: i16, y: i16, z: i16, width: i16, height: i16) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.DrawTexsOES(x, y, z, width, height)
     })
 }
 fn glDrawTexsvOES(env: &mut Environment, coords: ConstPtr<i16>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexsvOES(coords) }
@@ -3710,19 +3718,23 @@ fn glFramebufferRenderbufferOES(
                          GL_DEPTH_ATTACHMENT_OES 0x8d00)"
                     );
                     // A framebuffer goes incomplete if the new attachment does
-                    // not match the colour buffer's dimensions or format;
-                    // once it is incomplete every draw is discarded and the
-                    // window shows through the layer, which presents as an
-                    // x-ray scene rather than as a black one. That would be
-                    // our workaround's fault, so say so loudly the first time.
+                    // not match the colour buffer's dimensions or format, and
+                    // every draw into an incomplete framebuffer is discarded:
+                    // the window then shows through the layer, which presents
+                    // as an x-ray scene rather than as a black one. That would
+                    // be our workaround's fault, so check it (the guest has
+                    // this framebuffer bound, or we would be asking about a
+                    // different one) and undo the attachment if it went wrong.
                     let mut bound_framebuffer: GLint = 0;
-                    gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut bound_framebuffer);
+                    gles.GetIntegerv(
+                        gles11::FRAMEBUFFER_BINDING_OES,
+                        &mut bound_framebuffer,
+                    );
                     let status = if bound_framebuffer as GLuint == target {
                         gles.CheckFramebufferStatusOES(target)
                     } else {
                         gles11::FRAMEBUFFER_COMPLETE_OES
                     };
-                    while gles.GetError() != 0 {}
                     if status != gles11::FRAMEBUFFER_COMPLETE_OES {
                         // Undo the workaround: an incomplete framebuffer
                         // discards every draw, so leaving our attachment in
@@ -3736,7 +3748,6 @@ fn glFramebufferRenderbufferOES(
                             0,
                         );
                         gles.DeleteRenderbuffersOES(1, &depth_rb);
-                        while gles.GetError() != 0 {}
                         static INCOMPLETE_LOGGED: std::sync::Once =
                             std::sync::Once::new();
                         INCOMPLETE_LOGGED.call_once(|| {
@@ -6872,7 +6883,9 @@ fn glDrawArraysInstanced(
     count: GLsizei,
     instance_count: GLsizei,
 ) {
-    super::draw_stats::record_draw((count.max(0) as u64) * (instance_count.max(0) as u64));
+    super::draw_stats::record_draw(
+        (count.max(0) as u64) * (instance_count.max(0) as u64),
+    );
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.DrawArraysInstanced(mode, first, count, instance_count)
     });
@@ -6886,7 +6899,9 @@ fn glDrawElementsInstanced(
     indices: ConstVoidPtr,
     instance_count: GLsizei,
 ) {
-    super::draw_stats::record_draw((count.max(0) as u64) * (instance_count.max(0) as u64));
+    super::draw_stats::record_draw(
+        (count.max(0) as u64) * (instance_count.max(0) as u64),
+    );
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let mut buf: GLint = 0;
         gles.GetIntegerv(ELEMENT_ARRAY_BUFFER_BINDING, &mut buf);

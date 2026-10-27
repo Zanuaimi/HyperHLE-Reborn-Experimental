@@ -1294,10 +1294,10 @@ pub const CLASSES: ClassExports = objc_classes! {
                 env.current_thread,
             );
             match maybe_gles {
-                Some(mut gles) => {
-                    unsafe { log_drawable_capabilities_once(gles.as_mut()) };
-                    Some(unsafe { read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec) })
-                }
+                Some(mut gles) => unsafe {
+                    log_drawable_capabilities_once(gles.as_mut());
+                    Some(read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec))
+                },
                 None => {
                     log!(
                         "[EAGLContext presentRenderbuffer:{:#x}] lost GL \
@@ -1508,13 +1508,19 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
     let count = PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
-    let workload = draw_stats::describe(draw_stats::take_frame_workload());
     // Front-loaded, then once every 600 frames: the first frames of a session
     // are where "nothing is drawn yet" and "the menu is drawn" differ, and the
     // 600-frame schedule keeps a long session's log small.
     if !matches!(count, 0 | 1 | 5 | 30 | 120) && !count.is_multiple_of(600) {
+        // Drain anyway: three atomic swaps per frame cost nothing, and it
+        // keeps the printed numbers honest ("since the previous present", not
+        // "since the previous printed present") and the counters far from
+        // overflowing in a long session. Building the sentence is what is
+        // skipped.
+        let _ = draw_stats::take_frame_workload();
         return;
     }
+    let workload = draw_stats::describe(draw_stats::take_frame_workload());
     if width == 0 || height == 0 || pixels.len() < 4 {
         log!(
             "present_renderbuffer readback content probe \
@@ -1656,75 +1662,74 @@ fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]
     );
 }
 
-/// Read an `GLint` state value, draining any error the query raises so a
-/// driver that rejects an enum cannot poison the queue for the guest.
-unsafe fn int_state(gles: &mut dyn GLES, name: GLenum) -> GLint {
-    let mut value: GLint = -1;
-    gles.GetIntegerv(name, &mut value);
-    let _ = gles.GetError();
-    value
-}
-
-/// Whether a capability is enabled, draining the error queue as above.
-unsafe fn cap_state(gles: &mut dyn GLES, name: GLenum) -> bool {
-    let enabled = gles.IsEnabled(name) != 0;
-    let _ = gles.GetError();
-    enabled
-}
-
-/// One-shot description of the framebuffer the guest renders into and of the
+/// One-shot description of the drawable the guest renders into and of the
 /// fixed-function state it renders with, printed at the first presented frame.
 ///
 /// "See-through" and "black" scenes are usually explained by one of these
 /// numbers, and no other log line reports any of them:
 ///
-/// - `DEPTH_BITS = 0` while depth testing is on: the app tests depth into a
-///   framebuffer with no depth attachment. The fragment is then never rejected,
-///   so geometry the app expects to occlude shows through — the classic "x-ray"
-///   look. `gles_guest` auto-attaches a depth renderbuffer to colour-
-///   renderbuffer FBOs, so a zero here means the app draws into a framebuffer
-///   that workaround does not cover (framebuffer 0, or a texture-attached
-///   colour buffer).
-/// - `ALPHA_BITS = 0`: the frame has no alpha channel to blend against.
-/// - Lighting on with no light enabled: every lit surface renders black,
-///   because material colours only reach the rasteriser through a light.
-/// - Fog on with a dark fog colour: far geometry fades to black, which reads as
-///   "black shaders" on the objects at the back of the scene.
+/// - `DEPTH_BITS=0` together with `depth_test=true`: the app tests depth in a
+///   framebuffer that has no depth attachment. No fragment can then be
+///   rejected, so geometry the app expects to occlude shows through — the
+///   classic "x-ray" look. `gles_guest` auto-attaches a depth renderbuffer to
+///   colour-renderbuffer FBOs, so a zero here means the app draws into a
+///   framebuffer that workaround does not cover (framebuffer 0, or a
+///   texture-attached colour buffer).
+/// - `ALPHA_BITS=0`: the frame has no alpha channel for the compositor to blend
+///   against.
+/// - `lighting=true` with `0 of 8 lights enabled`: lit surfaces render black,
+///   because a material colour only reaches the rasteriser through a light.
+/// - `fog=true` with a dark fog colour: far geometry fades to black, which
+///   reads as "black shaders" on objects at the back of a scene.
 ///
-/// These are framebuffer/state queries on the current context, so they describe
-/// what the guest actually has rather than what the host driver could provide.
+/// Only ES 1.1 hosts with a real fixed-function pipeline are described: native
+/// OpenGL ES 1.1 and the ES1-on-GL2 backend. The ES1-on-ES2 translator and the
+/// ES 2.0/3.0 backends are skipped, because several of the enums below were
+/// removed from ES 2.0 and from desktop OpenGL's core profile, so querying them
+/// there would put a `GL_INVALID_ENUM` of ours in the app's own error queue —
+/// and the fixed-function state being described does not exist there anyway.
+///
+/// This deliberately does not drain the GL error queue: the app may be polling
+/// it, and on this route the frame has already been read back, so there is
+/// nothing to be gained by hiding its errors from it.
 unsafe fn log_drawable_capabilities_once(gles: &mut dyn GLES) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static REPORTED: AtomicBool = AtomicBool::new(false);
+    if gles.is_es2() {
+        return;
+    }
     // Mark the check done before doing the work: one shot, and this runs on the
     // per-frame present path.
     if REPORTED.swap(true, Ordering::Relaxed) {
         return;
     }
-    let alpha_bits = int_state(gles, 0x0D55 /* GL_ALPHA_BITS */);
-    let depth_bits = int_state(gles, 0x0D56 /* GL_DEPTH_BITS */);
-    let stencil_bits = int_state(gles, 0x0D57 /* GL_STENCIL_BITS */);
-    let samples = int_state(gles, 0x80A9 /* GL_SAMPLES */);
-    let depth_test = cap_state(gles, 0x0B71 /* GL_DEPTH_TEST */);
-    let alpha_test = cap_state(gles, 0x0BC0 /* GL_ALPHA_TEST */);
-    let blend = cap_state(gles, 0x0BE2 /* GL_BLEND */);
-    let cull_face = cap_state(gles, 0x0B44 /* GL_CULL_FACE */);
-    let scissor_test = cap_state(gles, 0x0C11 /* GL_SCISSOR_TEST */);
-    let texture_2d = cap_state(gles, 0x0DE1 /* GL_TEXTURE_2D */);
-    let lighting = cap_state(gles, 0x0B50 /* GL_LIGHTING */);
-    let fog = cap_state(gles, 0x0B60 /* GL_FOG */);
-    // GL_LIGHT0 is 0x4000 and the eight lights are consecutive.
+    // The framebuffer-state enums are spelled out because the generated ES 1.1
+    // bindings do not export them; the capability enums below are shared with
+    // the rest of the renderer.
+    let alpha_bits = get_int(gles, 0x0D55 /* GL_ALPHA_BITS */);
+    let depth_bits = get_int(gles, 0x0D56 /* GL_DEPTH_BITS */);
+    let stencil_bits = get_int(gles, 0x0D57 /* GL_STENCIL_BITS */);
+    let cap = |gles: &mut dyn GLES, name: GLenum| unsafe { gles.IsEnabled(name) != 0 };
+    let depth_test = cap(gles, gles11::DEPTH_TEST);
+    let alpha_test = cap(gles, gles11::ALPHA_TEST);
+    let blend = cap(gles, gles11::BLEND);
+    let cull_face = cap(gles, gles11::CULL_FACE);
+    let scissor_test = cap(gles, gles11::SCISSOR_TEST);
+    let texture_2d = cap(gles, gles11::TEXTURE_2D);
+    let lighting = cap(gles, gles11::LIGHTING);
+    let fog = cap(gles, gles11::FOG);
+    // GL_LIGHT0 is 0x4000 and the eight light enables are consecutive.
     let mut enabled_lights = 0;
     for index in 0..8 {
-        if cap_state(gles, 0x4000 + index) {
+        if cap(gles, 0x4000 + index) {
             enabled_lights += 1;
         }
     }
-    let color_material = cap_state(gles, 0x0B57 /* GL_COLOR_MATERIAL */);
+    let color_material = cap(gles, gles11::COLOR_MATERIAL);
     log!(
         "Drawable capabilities at the first presented frame: \
          ALPHA_BITS={alpha_bits} DEPTH_BITS={depth_bits} \
-         STENCIL_BITS={stencil_bits} SAMPLES={samples} | guest state: \
+         STENCIL_BITS={stencil_bits} | guest state: \
          depth_test={depth_test} alpha_test={alpha_test} blend={blend} \
          cull_face={cull_face} scissor_test={scissor_test} \
          texture_2d={texture_2d} lighting={lighting} \
@@ -1745,10 +1750,10 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
             env.current_thread,
         );
         match maybe_gles {
-            Some(mut gles) => {
+            Some(mut gles) => unsafe {
                 log_drawable_capabilities_once(gles.as_mut());
                 Some(read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec))
-            }
+            },
             None => None,
         }
     };

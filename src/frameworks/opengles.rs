@@ -9,7 +9,7 @@
 //! surface. See [crate::gles] for other uses and a discussion of the broader
 //! topic.
 
-pub mod draw_stats;
+mod draw_stats;
 mod eagl;
 mod gles_guest;
 mod software_vao;

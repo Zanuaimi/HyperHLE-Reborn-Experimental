@@ -15,8 +15,13 @@
 //!    to the screen (wrong state, wrong texture contents, wrong presentation).
 //!
 //! Counting draws and vertices between two presented frames separates them in
-//! one line, and it costs three relaxed atomic adds per draw — no GL calls, no
+//! one line, and it costs three relaxed atomic adds per draw: no GL calls, no
 //! allocations, nothing that can perturb the thing being measured.
+//!
+//! The tally covers what the guest asked for, not what the emulator draws: the
+//! compositor and the presenters call the GLES layer directly and are not
+//! counted. It includes the `glDrawTex*OES` shortcut, which draws a rectangle
+//! without going through `glDrawArrays`/`glDrawElements`.
 //!
 //! The counters are consumed by `probe_readback_content`, which runs on the
 //! RAM-readback present routes where the frame is already in memory, and
@@ -52,6 +57,16 @@ pub fn record_draw(vertices: u64) {
     VERTICES.fetch_add(vertices, Ordering::Relaxed);
 }
 
+/// Count one `glDrawTex*OES` call.
+///
+/// That extension draws a single textured rectangle, which is four vertices
+/// as far as the tally is concerned, and it bypasses the draw entry points
+/// below, so a 2D engine that renders with it alone would otherwise look like
+/// an engine that submitted nothing at all.
+pub fn record_quad_draw() {
+    record_draw(4);
+}
+
 /// Count one texture upload.
 pub fn record_texture_upload() {
     TEXTURE_UPLOADS.fetch_add(1, Ordering::Relaxed);
@@ -72,21 +87,21 @@ pub fn take_frame_workload() -> FrameWorkload {
 /// interesting boundary is "no draws at all", which is the signature of a
 /// scene that was never submitted rather than one that was rendered wrongly.
 pub fn describe(workload: FrameWorkload) -> String {
+    let verdict = if workload.drew_nothing() {
+        "the guest submitted no draws between these presents"
+    } else if workload.vertices == 0 {
+        "every draw was empty"
+    } else {
+        "the guest is submitting geometry"
+    };
     let FrameWorkload {
         draws,
         vertices,
         texture_uploads,
     } = workload;
-    let verdict = if draws == 0 {
-        "the guest submitted no draws between these presents"
-    } else if vertices == 0 {
-        "every draw was empty"
-    } else {
-        "the guest is submitting geometry"
-    };
     format!(
-        "{draws} draw call(s), {vertices} vertices, \
-         {texture_uploads} texture upload(s) since the previous present: {verdict}"
+        "{draws} draws, {vertices} vertices, {texture_uploads} texture uploads \
+         since the previous present: {verdict}"
     )
 }
 
@@ -108,7 +123,7 @@ mod tests {
             vertices: 45_000,
             texture_uploads: 0,
         });
-        assert!(busy.contains("120 draw call(s)"));
+        assert!(busy.contains("120 draws"));
         assert!(busy.contains("45000 vertices"));
         assert!(busy.contains("submitting geometry"));
     }
@@ -119,11 +134,13 @@ mod tests {
         // start at zero; it only checks that taking them empties them.
         record_draw(6);
         record_draw(3);
+        record_quad_draw();
         record_texture_upload();
         let first = take_frame_workload();
-        assert!(first.draws >= 2);
-        assert!(first.vertices >= 9);
+        assert!(first.draws >= 3);
+        assert!(first.vertices >= 13);
         assert!(first.texture_uploads >= 1);
+        assert!(!first.drew_nothing());
         assert_eq!(take_frame_workload(), FrameWorkload::default());
     }
 }
