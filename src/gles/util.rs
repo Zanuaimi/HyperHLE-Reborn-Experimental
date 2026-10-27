@@ -50,7 +50,10 @@ mod pvrtc_payload_size_tests {
 
 #[cfg(test)]
 mod npot_workaround_tests {
-    use super::{base_min_filter, is_npot_upload, tex_parameter_target};
+    use super::{
+        base_min_filter, is_npot_upload, tex_parameter_target, TEXTURE_CUBE_MAP,
+        TEXTURE_CUBE_MAP_NEGATIVE_Z, TEXTURE_CUBE_MAP_POSITIVE_X,
+    };
     use crate::gles::gles11_raw as gles11;
 
     #[test]
@@ -93,12 +96,12 @@ mod npot_workaround_tests {
     #[test]
     fn cube_map_faces_share_the_cube_map_target() {
         assert_eq!(
-            tex_parameter_target(gles11::TEXTURE_CUBE_MAP_POSITIVE_X),
-            gles11::TEXTURE_CUBE_MAP
+            tex_parameter_target(TEXTURE_CUBE_MAP_POSITIVE_X),
+            TEXTURE_CUBE_MAP
         );
         assert_eq!(
-            tex_parameter_target(gles11::TEXTURE_CUBE_MAP_NEGATIVE_Z),
-            gles11::TEXTURE_CUBE_MAP
+            tex_parameter_target(TEXTURE_CUBE_MAP_NEGATIVE_Z),
+            TEXTURE_CUBE_MAP
         );
         assert_eq!(
             tex_parameter_target(gles11::TEXTURE_2D),
