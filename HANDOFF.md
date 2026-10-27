@@ -552,6 +552,12 @@ Next, from the tester's next log **and PNGs**:
   `macos-latest` runner and never got one. That is capacity, not code: the same
   commit range compiled and passed unit tests on the other four platforms. A
   pull request never reaches `check-hyperhle-release`/`publish-*` anyway.
+- PR run `40550814390` (PR #6, `05b8f8a`): build-linux, build-android,
+  build-win, build-ios and test-macos **success**; the other macOS leg,
+  `build-osx (aarch64-apple-darwin)`, **cancelled** after 24 minutes with
+  `runner_name` empty and no steps recorded — the same capacity problem, now on
+  the `osx` leg instead of the `ios` one. The two swap places from run to run,
+  so read `runner_name` before blaming a commit.
 
 ---
 
