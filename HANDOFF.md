@@ -186,6 +186,39 @@ path in `src/paths.rs`. None of them is compiled yet.
    `<user data>/touchHLE_dumps/` beside `touchHLE_log.txt` instead of
    hardcoded `/tmp/a8run/...` paths.
 
+### 2.5 Round-28 diagnostics (2026-10-27, after `v1.1.1`)
+
+The user reported that `v1.1.1` still shows x-ray sprites and black shaders and
+that the log carried no probe output, because the probe was still gated on a
+picker switch that is off by default. Changes:
+
+1. **`src/frameworks/opengles/draw_stats.rs` (new).** Process-global
+   `AtomicU64` counters for draws, vertices and texture uploads.
+   `record_draw(n)` / `record_texture_upload()` are called from
+   `gles_guest.rs::{glDrawArrays, glDrawElements, glDrawArraysInstanced,
+   glDrawElementsInstanced}` and `{glTexImage2D, glTexSubImage2D,
+   glCompressedTexImage2D}`; `take_frame_workload()` swaps them to zero and
+   `describe(FrameWorkload)` turns the numbers into one English clause. Two unit
+   tests; the reset test makes no zero-start assumption because the counters are
+   global.
+2. **`probe_readback_content` is ungated.** Signature is now
+   `fn probe_readback_content(pixels: &[u8], width: u32, height: u32)` — a
+   removed parameter, so any older caller must be updated. The pixels are
+   already in RAM on this route, so the cost is one strided pass per printed
+   frame, and the counters are drained on *every* present so the printed counts
+   mean "since the previous present".
+3. **`log_drawable_capabilities_once`** (new, in `eagl.rs`, called from both
+   presenters before the read) prints `ALPHA_BITS` / `DEPTH_BITS` /
+   `STENCIL_BITS` / `SAMPLES` and the guest's fixed-function state at the first
+   presented frame. Values are `-1` / `false` when a backend rejects the query.
+4. **`log_nonopaque_present_once` now also runs on the readback slow path**
+   (it was GPU-route only).
+5. **The depth auto-attach checks its own work**: after attaching, it queries
+   `CheckFramebufferStatusOES` while the framebuffer is bound, drains the error
+   queue, and logs once if the FBO ended up incomplete (which would discard
+   every draw, i.e. look exactly like the x-ray bug it exists to fix). The
+   attach message also names both attachments.
+
 ### 2.4 Review pass over the uncompiled rendering work (2026-10-27)
 
 A read-through of everything since `babfe011`, looking for the kind of defect
@@ -309,21 +342,40 @@ a regression introduced by this fork. Do not re-open that theory.
 
 ### 3.5 Next experiments
 
-1. **Read the new probe line.** Any build from 2026-10-27 onward prints, on the
-   readback route and with Trace GL errors on:
+1. **Read the probe line — it no longer needs "Trace GL errors".** As of the
+   2026-10-27 round the readback probe is unconditional (`probe_readback_content`
+   lost its `trace_gl_errors` argument) and every probe line ends with the frame
+   workload tally from `src/frameworks/opengles/draw_stats.rs`:
 
-       [--trace-gl-errors] present_renderbuffer readback content probe
-       (frame=N, WxH): BL=(r,g,b,a) BR=… TL=… TR=… CENTER=… |
-       n/total sampled pixels match CENTER, m/total are black | verdict
+       present_renderbuffer readback content probe (frame=N, WxH):
+       BL=… BR=… TL=… TR=… CENTER=… | n/total match CENTER, m/total are black |
+       <verdict> | <workload>
 
-   `verdict` is `all black`, `flat`, `content present`, or `unknown`. Grep:
+   `verdict` is `all black`, `flat`, `content present`, or `unknown`; `workload`
+   is one of "the guest submitted no draws between these presents", "every draw
+   was empty", "N draws / M vertices / K texture uploads". Grep:
 
-       grep -iE "readback content probe|renderbuffer-content probe|eagl presenter|non-opaque layer"
+       grep -iE "readback content probe|Drawable capabilities|non-opaque layer|auto-attached depth|INCOMPLETE"
 
-   - `all black` / `flat` → hypothesis (1): the frame really is empty, look at
-     what the guest is (not) drawing.
-   - `content present` → hypothesis (2): compare a screenshot with the buffer.
-     Buffer right + screen wrong = presentation path; both wrong = upstream.
+   - `all black` / `flat` + `no draws` → hypothesis (1): the frame is empty
+     because the guest drew nothing. Look at what the guest is (not) calling.
+   - `all black` + `N draws` → the guest is drawing and the draws produce
+     nothing: state, feature detection or a stubbed entry point *inside* the
+     draw, not presentation.
+   - `content present` → hypothesis (2): the buffer is right, so the picture is
+     changed on its way to the screen.
+
+   One line before it, once per session:
+
+       Drawable capabilities at the first presented frame: ALPHA_BITS=…
+       DEPTH_BITS=… STENCIL_BITS=… SAMPLES=… | guest state: depth_test=…
+       alpha_test=… blend=… cull_face=… scissor_test=… texture_2d=…
+       lighting=… (N of 8 lights enabled) fog=… color_material=…
+
+   Read it as: `depth_test=true` with `DEPTH_BITS=0` means depth-tested
+   fragments against no depth attachment (x-ray); `lighting=true` with
+   `0 of 8 lights enabled` means lit geometry renders black; `ALPHA_BITS=0`
+   means the frame has no alpha to blend with.
 2. **Watch how the trace attributes errors.** Two new lines exist:
    "Drained GL errors raised by touchHLE's own start-up probes…" (once, right
    after the context is created) and

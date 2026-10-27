@@ -1294,7 +1294,10 @@ pub const CLASSES: ClassExports = objc_classes! {
                 env.current_thread,
             );
             match maybe_gles {
-                Some(mut gles) => Some(unsafe { read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec) }),
+                Some(mut gles) => {
+                    unsafe { log_drawable_capabilities_once(gles.as_mut()) };
+                    Some(unsafe { read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec) })
+                }
                 None => {
                     log!(
                         "[EAGLContext presentRenderbuffer:{:#x}] lost GL \
@@ -1318,7 +1321,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // not, so "the picture is black/x-ray" reports from users on the
         // readback presenter had no pixel-level evidence attached. Same frame
         // schedule as the GPU-route probe, so the two can be compared.
-        probe_readback_content(&pixels_vec, width, height, env.options.trace_gl_errors);
+        probe_readback_content(&pixels_vec, width, height);
         // DIAG (TOUCHHLE_TRACE_PRESENT=1): is the frame we read back actually
         // non-black? This tells apart "renderer produced a black frame"
         // (content/loading) from "we present fine but the pixels never reach
@@ -1337,6 +1340,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 );
             }
         }
+        log_nonopaque_present_once(env, drawable, &pixels_vec);
         present_pixels(env, drawable, pixels_vec, width, height);
 
         // The slow path stores the freshly rendered frame in `presented_pixels`
@@ -1485,16 +1489,26 @@ fn frame_content_verdict(sampled: u32, matching_centre: u32, black: u32) -> &'st
 ///   format, scale/placement) or is correct and the complaint is about the
 ///   scene's content, not its transport.
 ///
-/// Gated on the same switch as `--trace-gl-errors` (the picker's "Trace GL
-/// errors"), and sampled on the same frame schedule as the GPU-route probe so
-/// the two can be compared.
-fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_errors: bool) {
+/// **This runs unconditionally**, unlike the GPU-route probe. The pixels are
+/// already in RAM on this route, so the cost is one strided pass over a buffer
+/// we just copied; and a bug report that arrives with the picker's "Trace GL
+/// errors" switch left off used to carry no pixel evidence at all. The line is
+/// printed on frames 0, 1, 5, 30, 120 and then every 600th frame, which is a
+/// dozen lines in a long session.
+///
+/// The line also carries `draw_stats::FrameWorkload` — how many draw calls,
+/// vertices and texture uploads the guest submitted since the previous
+/// present. That is the other half of the question the pixels answer: "flat
+/// frame" plus "no draws" means the scene was never submitted, while "flat
+/// frame" plus "120 draws, 45k vertices" means the geometry went somewhere
+/// that is not this renderbuffer (wrong FBO, rejected by state).
+///
+fn probe_readback_content(pixels: &[u8], width: u32, height: u32) {
+    use crate::frameworks::opengles::draw_stats;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
-    if !trace_gl_errors {
-        return;
-    }
     let count = PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+    let workload = draw_stats::describe(draw_stats::take_frame_workload());
     // Front-loaded, then once every 600 frames: the first frames of a session
     // are where "nothing is drawn yet" and "the menu is drawn" differ, and the
     // 600-frame schedule keeps a long session's log small.
@@ -1503,8 +1517,8 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_error
     }
     if width == 0 || height == 0 || pixels.len() < 4 {
         log!(
-            "[--trace-gl-errors] present_renderbuffer readback content probe \
-             (frame={count}): empty frame buffer"
+            "present_renderbuffer readback content probe \
+             (frame={count}): empty frame buffer | {workload}"
         );
         return;
     }
@@ -1539,11 +1553,11 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_error
     }
     let verdict = frame_content_verdict(sampled, matching_centre, black);
     log!(
-        "[--trace-gl-errors] present_renderbuffer readback content probe \
+        "present_renderbuffer readback content probe \
          (frame={}, {}x{}): \
          BL=({},{},{},{}) BR=({},{},{},{}) TL=({},{},{},{}) TR=({},{},{},{}) \
          CENTER=({},{},{},{}) | {}/{} sampled pixels match CENTER, \
-         {}/{} are black | {}",
+         {}/{} are black | {} | {}",
         count,
         width,
         height,
@@ -1572,6 +1586,7 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_error
         black,
         sampled,
         verdict,
+        workload,
     );
 }
 
@@ -1641,6 +1656,83 @@ fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]
     );
 }
 
+/// Read an `GLint` state value, draining any error the query raises so a
+/// driver that rejects an enum cannot poison the queue for the guest.
+unsafe fn int_state(gles: &mut dyn GLES, name: GLenum) -> GLint {
+    let mut value: GLint = -1;
+    gles.GetIntegerv(name, &mut value);
+    let _ = gles.GetError();
+    value
+}
+
+/// Whether a capability is enabled, draining the error queue as above.
+unsafe fn cap_state(gles: &mut dyn GLES, name: GLenum) -> bool {
+    let enabled = gles.IsEnabled(name) != 0;
+    let _ = gles.GetError();
+    enabled
+}
+
+/// One-shot description of the framebuffer the guest renders into and of the
+/// fixed-function state it renders with, printed at the first presented frame.
+///
+/// "See-through" and "black" scenes are usually explained by one of these
+/// numbers, and no other log line reports any of them:
+///
+/// - `DEPTH_BITS = 0` while depth testing is on: the app tests depth into a
+///   framebuffer with no depth attachment. The fragment is then never rejected,
+///   so geometry the app expects to occlude shows through — the classic "x-ray"
+///   look. `gles_guest` auto-attaches a depth renderbuffer to colour-
+///   renderbuffer FBOs, so a zero here means the app draws into a framebuffer
+///   that workaround does not cover (framebuffer 0, or a texture-attached
+///   colour buffer).
+/// - `ALPHA_BITS = 0`: the frame has no alpha channel to blend against.
+/// - Lighting on with no light enabled: every lit surface renders black,
+///   because material colours only reach the rasteriser through a light.
+/// - Fog on with a dark fog colour: far geometry fades to black, which reads as
+///   "black shaders" on the objects at the back of the scene.
+///
+/// These are framebuffer/state queries on the current context, so they describe
+/// what the guest actually has rather than what the host driver could provide.
+unsafe fn log_drawable_capabilities_once(gles: &mut dyn GLES) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    // Mark the check done before doing the work: one shot, and this runs on the
+    // per-frame present path.
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let alpha_bits = int_state(gles, 0x0D55 /* GL_ALPHA_BITS */);
+    let depth_bits = int_state(gles, 0x0D56 /* GL_DEPTH_BITS */);
+    let stencil_bits = int_state(gles, 0x0D57 /* GL_STENCIL_BITS */);
+    let samples = int_state(gles, 0x80A9 /* GL_SAMPLES */);
+    let depth_test = cap_state(gles, 0x0B71 /* GL_DEPTH_TEST */);
+    let alpha_test = cap_state(gles, 0x0BC0 /* GL_ALPHA_TEST */);
+    let blend = cap_state(gles, 0x0BE2 /* GL_BLEND */);
+    let cull_face = cap_state(gles, 0x0B44 /* GL_CULL_FACE */);
+    let scissor_test = cap_state(gles, 0x0C11 /* GL_SCISSOR_TEST */);
+    let texture_2d = cap_state(gles, 0x0DE1 /* GL_TEXTURE_2D */);
+    let lighting = cap_state(gles, 0x0B50 /* GL_LIGHTING */);
+    let fog = cap_state(gles, 0x0B60 /* GL_FOG */);
+    // GL_LIGHT0 is 0x4000 and the eight lights are consecutive.
+    let mut enabled_lights = 0;
+    for index in 0..8 {
+        if cap_state(gles, 0x4000 + index) {
+            enabled_lights += 1;
+        }
+    }
+    let color_material = cap_state(gles, 0x0B57 /* GL_COLOR_MATERIAL */);
+    log!(
+        "Drawable capabilities at the first presented frame: \
+         ALPHA_BITS={alpha_bits} DEPTH_BITS={depth_bits} \
+         STENCIL_BITS={stencil_bits} SAMPLES={samples} | guest state: \
+         depth_test={depth_test} alpha_test={alpha_test} blend={blend} \
+         cull_face={cull_face} scissor_test={scissor_test} \
+         texture_2d={texture_2d} lighting={lighting} \
+         ({enabled_lights} of 8 lights enabled) fog={fog} \
+         color_material={color_material} [this log will only be shown once]"
+    );
+}
+
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
     // PERF: recycle the layer's previous pixel buffer instead of allocating
     // (and page-faulting in) a fresh multi-megabyte Vec every frame.
@@ -1653,7 +1745,10 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
             env.current_thread,
         );
         match maybe_gles {
-            Some(mut gles) => Some(read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec)),
+            Some(mut gles) => {
+                log_drawable_capabilities_once(gles.as_mut());
+                Some(read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec))
+            }
             None => None,
         }
     };
@@ -1662,7 +1757,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         return;
     };
     dump_readback_ppm(&pixels, width, height);
-    probe_readback_content(&pixels, width, height, env.options.trace_gl_errors);
+    probe_readback_content(&pixels, width, height);
     log_nonopaque_present_once(env, drawable, &pixels);
     present_pixels(env, drawable, pixels, width, height);
     let force_composition = env.options.force_composition;
@@ -3110,6 +3205,7 @@ unsafe fn present_renderbuffer(
     let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
     let gles = gles_boxed.as_mut();
 
+    unsafe { log_drawable_capabilities_once(gles) };
     invalidate_present_cache_for_context(context_token);
 
     // DIAG (TOUCHHLE_TRACE_PRESENT=1): dump the raw renderbuffer the game drew,
