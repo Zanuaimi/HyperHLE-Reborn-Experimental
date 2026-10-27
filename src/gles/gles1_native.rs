@@ -1069,13 +1069,6 @@ impl GLES for GLES1Native<'_> {
         }
     }
 
-
-
-    /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound
-    /// texture to its base filtering mode, preserving the guest's
-    /// nearest/linear intent. See `TexImage2D` for why.
-
-
     unsafe fn TexSubImage2D(
         &mut self,
         target: GLenum,
@@ -1921,6 +1914,23 @@ impl GLES1Native<'_> {
             pixels,
         )
     }
+
+    /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound
+    /// texture to its base filtering mode, preserving the guest's
+    /// nearest/linear intent.
+    ///
+    /// Companion to the CLAMP_TO_EDGE forcing in `tex_image_2d_inner`: strict
+    /// drivers reject NPOT textures that ask for mipmapping, and a host whose
+    /// default `TEXTURE_MIN_FILTER` is `NEAREST_MIPMAP_LINEAR` (the ES 1.1 and
+    /// ES 2.0 defaults) makes *every* level-0-only texture incomplete, not just
+    /// the ones the guest configured that way. That default is never
+    /// observable in the guest's calls — the guest simply never sets
+    /// `TEXTURE_MIN_FILTER` — so the only place to catch it is right after
+    /// the upload, by querying the state that is actually in effect.
+    ///
+    /// `target` matters for cube maps: a face upload binds
+    /// `TEXTURE_CUBE_MAP`, and setting `TEXTURE_MIN_FILTER` with
+    /// `TEXTURE_2D` while the cube map is bound is a silent no-op.
     unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
         let mut min_filter: GLint = 0;
         gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
