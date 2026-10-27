@@ -172,6 +172,34 @@ path in `src/paths.rs`. None of them is compiled yet.
    `<user data>/touchHLE_dumps/` beside `touchHLE_log.txt` instead of
    hardcoded `/tmp/a8run/...` paths.
 
+### 2.4 Review pass over the uncompiled rendering work (2026-10-27)
+
+A read-through of everything since `babfe011`, looking for the kind of defect
+that only a compiler or a driver would catch. Still uncompiled. Four real bugs
+found and fixed, all in the NPOT texture workarounds:
+
+1. `gles1_native` queried `GL_TEXTURE_MIN_FILTER` with `glGetIntegerv`. That enum
+   is per-texture-object state and is absent from ES 1.1's `glGetIntegerv` table,
+   so ANGLE (the default Android renderer) answers `GL_INVALID_ENUM` and leaves
+   the output at zero — the filter was never degraded, and the failed query put a
+   stray error in the guest's queue. Now `glGetTexParameteriv`, as the other two
+   backends already did.
+2. Every fix-up named `GL_TEXTURE_2D` explicitly, so cube-map face uploads
+   adjusted (or read) the wrong texture object. All go through
+   `util::tex_parameter_target` now.
+3. The wrap-mode fix-up ran only for `glTexImage2D`. PVRTC arrives via
+   `glCompressedTexImage2D`, so the fix missed what iOS games actually upload.
+   It now runs on uncompressed, compressed and `glCopyTexImage2D` paths (the
+   desktop-GL backend keeps skipping the wrap forcing on purpose).
+4. `gles1_on_gl2`'s filter fix-up ignored its `target`.
+
+Two smaller things worth remembering: `GlobalGenerator` (which these bindings
+use) does emit a module per *extension* function, so `gles11::FooOES::is_loaded()`
+is valid — that idiom in `supports_vao_oes` is fine. And `glGetString` in
+`gles_guest` keys its cache on `(is_es2, matrix_palette, name)`, so any backend
+that changes what it advertises must return a stable answer for the session or
+the cache has to be invalidated.
+
 ## 3. OPEN: Minigore x-ray sprites and black shaders
 
 ### 3.1 Symptom and repro
@@ -485,7 +513,7 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
 |---|---|
 | Merged PR | #1, merge commit `bee1ffc`, merged 2026-10-26T09:22Z |
 | Local `trunk` | `6fab5922` (= upstream `v1.2.12` merge base) |
-| Session branch head | `e3ddcd48` (2026-10-27 diagnostics) |
+| Session branch head | `d65f349f` (2026-10-27 review pass) |
 | Rendering-fix commits | `babfe011`, `271d0c42`, `6dc6e2c2`, `262d47e4` — **uncompiled** |
 | EAGL diagnostics commit | `53c412e` (+ `c4068ce`… review fixes) |
 | Workflow commits | `8ab1b9e`, `6208b39`, `1f51777`, `9eb2729`, `c4068ce`, `e950e99` |
