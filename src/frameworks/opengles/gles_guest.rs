@@ -135,8 +135,25 @@ where
     // leftovers from untraced internal code paths (EAGL present, context
     // sync, etc.). Without this, one bad call makes every later traced
     // call report the same code at the wrong line.
+    //
+    // A non-zero value is reported rather than silently dropped: "an error was
+    // already pending when this call started" and "this call raised an error"
+    // are otherwise indistinguishable in a trace, and telling them apart is the
+    // difference between blaming the app for the emulator's own start-up
+    // probes and the other way round.
     if trace {
-        unsafe { gles.GetError() };
+        let pending = unsafe { gles.GetError() };
+        if pending != 0 {
+            log!(
+                "[--trace-gl-errors] {} had glGetError() = {:#x} pending \
+                 before a call dispatched from {}:{}; that error predates this \
+                 call, so do not attribute it to the call that follows.",
+                gles.diagnostic_profile(),
+                pending,
+                caller.file(),
+                caller.line()
+            );
+        }
     }
     let res = {
         let _guest_call_guard = GuestGlesCallGuard::enter();
@@ -562,15 +579,19 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
     //     resulting frames look torn / overlapped on screen.
     //
     // We therefore branch on the *currently-bound context's* API instead of
-    // hard-coding the ES 1.1 strings. The cache is keyed by `(is_es2, name)`
-    // because the two profiles share the same `name` enum values.
-    let is_es2 = with_ctx_and_mem(env, |gles, _mem| gles.is_es2());
+    // hard-coding the ES 1.1 strings. The cache is keyed by
+    // `(is_es2, matrix_palette, name)` because the two profiles share the same
+    // `name` enum values, and because the ES 1.1 extension list depends on
+    // whether the active backend can honour `GL_OES_matrix_palette`.
+    let (is_es2, matrix_palette) = with_ctx_and_mem(env, |gles, _mem| {
+        (gles.is_es2(), gles.supports_matrix_palette())
+    });
 
     if let Some(&str) = env
         .framework_state
         .opengles
         .strings_cache
-        .get(&(is_es2, name))
+        .get(&(is_es2, matrix_palette, name))
     {
         return str;
     }
@@ -595,12 +616,15 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
             gles11::VENDOR => b"Imagination Technologies",
             gles11::RENDERER => b"PowerVR MBXLite with VGPLite",
             gles11::VERSION => b"OpenGL ES-CM 1.1 (76)",
-            // Includes GL_OES_matrix_palette: the real PowerVR SGX in the
-            // iPhone 3GS exposes it, and touchHLE now emulates palette
-            // skinning CPU-side (see gles1_on_gl2's skin_vertices). Games such
-            // as LEGO Ninjago: Rise of the Snakes feature-test this string and
-            // use the palette path for skinned character meshes.
-            gles11::EXTENSIONS => b"GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
+            // GL_OES_matrix_palette is *not* in this base list: the real
+            // PowerVR SGX in the iPhone 3GS exposes it, but whether we can
+            // honour it depends on the active backend (see the
+            // `palette_suffix` splice below). Games such as LEGO
+            // Ninjago: Rise of the Snakes feature-test this string and use the
+            // palette path for skinned character meshes, so advertising an
+            // extension we drop on the floor leaves every skinned mesh
+            // mis-transformed.
+            gles11::EXTENSIONS => b"GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
             _ => b"Unknown",
         }
     } else {
@@ -634,14 +658,20 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
     } else {
         b""
     };
+    let palette_suffix: &[u8] =
+        if !is_es2 && name == gles11::EXTENSIONS && matrix_palette {
+            b"GL_OES_matrix_palette "
+        } else {
+            b""
+        };
     let new_str = env
         .mem
-        .alloc_and_write_cstr(&[npot_prefix, s].concat())
+        .alloc_and_write_cstr(&[npot_prefix, s, palette_suffix].concat())
         .cast_const();
     env.framework_state
         .opengles
         .strings_cache
-        .insert((is_es2, name), new_str);
+        .insert((is_es2, matrix_palette, name), new_str);
     new_str
 }
 
@@ -1533,8 +1563,15 @@ fn glCompressedTexSubImage2D(
                             let b = (px as u32).to_le_bytes();
                             ppm.extend_from_slice(&[b[0], b[1], b[2]]);
                         }
-                        let _ = std::fs::write(format!("tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format), &ppm);
-                        log!("DUMP-TEX wrote tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format);
+                        let name = format!("pvrtc_tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format);
+                        if let Some(path) = crate::paths::diagnostic_dump_path(&name) {
+                            match std::fs::write(&path, &ppm) {
+                                Ok(()) => log!("DUMP-TEX wrote {}", path.display()),
+                                Err(e) => {
+                                    log!("DUMP-TEX failed to write {}: {}", path.display(), e)
+                                }
+                            }
+                        }
                     }
                 }
                 // PVRTC compressed subimages may only replace a complete level.
@@ -2430,7 +2467,11 @@ fn glDrawElements(
                         0x1401, /* GL_UNSIGNED_BYTE */
                         pix.as_mut_ptr() as *mut _,
                     );
-                    dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, "/tmp/a8run/fb_after_larger_draw.ppm");
+                    if let Some(path) =
+                        crate::paths::diagnostic_dump_path("fb_after_larger_draw.ppm")
+                    {
+                        dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, &path);
+                    }
                 }
                 let mut err = gles.GetError();
                 let mut errs = Vec::new();
@@ -3086,10 +3127,10 @@ fn glTexImage2D(
                     let buf: Vec<u8> = mem
                         .bytes_at(guest_pixels.cast::<u8>(), byte_size as u32)
                         .to_vec();
-                    let path = format!(
-                        "/tmp/a8run/tex{}_id{}_{}x{}.ppm", n, tex_id, width, height
-                    );
-                    dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
+                    let name = format!("tex{}_id{}_{}x{}.ppm", n, tex_id, width, height);
+                    if let Some(path) = crate::paths::diagnostic_dump_path(&name) {
+                        dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
+                    }
                 }
             }
         }
@@ -3556,6 +3597,20 @@ fn glRenderbufferStorageOES(
         gles.RenderbufferStorageOES(target, internalformat, width, height)
     })
 }
+
+/// Whether the auto-attached-depth-renderbuffer workaround in
+/// [glFramebufferRenderbufferOES] is switched off.
+///
+/// Setting `TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH` restores strict behaviour, so
+/// a guest that never attached a depth buffer gets the fragment rejection a
+/// strict driver would give it. That is the first thing to try when bisecting
+/// a scene that renders *worse* with the workaround than without it (for
+/// example a guest that deliberately draws see-through geometry into a
+/// colour-only FBO and relies on there being no depth buffer).
+fn auto_depth_attach_disabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH")
+}
+
 fn glFramebufferRenderbufferOES(
     env: &mut Environment,
     target: GLenum,
@@ -3576,12 +3631,20 @@ fn glFramebufferRenderbufferOES(
         // When an iOS app attaches its drawable color renderbuffer to an FBO,
         // it commonly forgets to also attach a depth renderbuffer. On real iOS
         // GPUs / desktop GL the missing depth attachment is treated leniently,
-        // but a strict OpenGL ES 2.0 driver (e.g. Mesa or Mali) will then
-        // discard every drawn fragment when the app enables GL_DEPTH_TEST.
-        // To match the lenient behaviour we auto-create and attach a matching
+        // but a strict driver (Mesa, Mali, and ANGLE on any backend) will then
+        // discard every drawn fragment when the app enables GL_DEPTH_TEST. To
+        // match the lenient behaviour we auto-create and attach a matching
         // depth renderbuffer the first time a color attachment is set up on a
         // user-managed framebuffer.
-        if gles.is_es2()
+        //
+        // This applies to ES 1.1 contexts as well as ES 2.0 ones. It used to be
+        // ES 2.0-only, which meant an ES 1.1 game (the native-GLES1.1 renderer,
+        // which is what iOS titles of the SGX era usually run on) that enables
+        // depth testing with a colour-only FBO had every fragment rejected:
+        // the scene's geometry disappears and the background shows through,
+        // which reads as "x-ray" or black objects while the HUD and anything
+        // drawn without depth testing still look fine.
+        if !auto_depth_attach_disabled()
             && attachment == gles11::COLOR_ATTACHMENT0_OES
             && renderbuffertarget == gles11::RENDERBUFFER_OES
             && renderbuffer != 0
@@ -3629,13 +3692,18 @@ fn glFramebufferRenderbufferOES(
                         gles11::RENDERBUFFER_OES,
                         depth_rb,
                     );
-                    log_dbg!(
-                        "Auto-attached depth renderbuffer ({}x{}) to FBO target={:#x} attach={:#x}",
-                        w,
-                        h,
-                        target,
-                        attachment
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    let message = format!(
+                        "Auto-attached depth renderbuffer ({w}x{h}) to FBO \
+                         target={target:#x} attach={attachment:#x}"
                     );
+                    // Log the first one at normal level: it is the sentinel for
+                    // "the guest relied on a depth buffer it never attached",
+                    // which is exactly the shape of a black/see-through-scene
+                    // bug report. The rest go to the debug log so an engine
+                    // that recreates FBOs every frame can't flood the file.
+                    FIRST.call_once(|| log!("{message}"));
+                    log_dbg!("{message}");
                 }
                 gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, prev_rb as GLuint);
             }
@@ -3725,7 +3793,14 @@ fn glIsRenderbuffer(env: &mut Environment, renderbuffer: GLuint) -> GLboolean {
 }
 /// Dump raw pixel data (RGB) to a PPM file for diagnosis. Supports the
 /// formats Geometry Dash / cocos2d-x use (RGBA8, RGBA4444, RGB565).
-pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32, path: &str) {
+pub fn dump_rgb_ppm(
+    pix: &[u8],
+    width: u32,
+    height: u32,
+    format: u32,
+    type_: u32,
+    path: &std::path::Path,
+) {
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     match (format, type_) {
         (0x1908, 0x1401) => {
@@ -3760,8 +3835,8 @@ pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32
     let mut out = header.into_bytes();
     out.extend_from_slice(&rgb);
     match std::fs::write(path, &out) {
-        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path),
-        Err(e) => log!("Failed to dump pixels to {}: {}", path, e),
+        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path.display()),
+        Err(e) => log!("Failed to dump pixels to {}: {}", path.display(), e),
     }
 }
 

@@ -1,4 +1,4 @@
-# Session handoff — 2026-10-26
+# Session handoff — 2026-10-27
 
 Notes for whoever picks this up next. This file is session context, not project
 documentation: delete or rewrite it once it is stale.
@@ -17,14 +17,18 @@ Two threads are closed, one is open.
 |---|---|
 | EAGL presentation-route logging | **Merged** (PR #1, merge commit `bee1ffc`) |
 | Release-workflow optimisation (macOS x86_64 critical path) | **Merged** (same PR) |
-| Minigore x-ray sprites / black shaders | **Open, root cause not proven** |
+| Rendering fidelity fixes (`src/gles/**`, `src/frameworks/opengles/**`) | **Pushed, not compiled** — commits `babfe011`, `271d0c42`, `6dc6e2c2`, `262d47e4` on `arena/16e7a9d5-hyperhle-reborn-experimental` |
+| Minigore x-ray sprites / black shaders | **Open, root cause not proven**; reproduces on upstream, so it is not a fork regression |
 
-`trunk` is at `0aa2646` ("Update .gitignore", 2026-10-26T10:10Z), one commit
-after the merge. That commit's CI run published **release `v1.0.11`**, so the
-work in §2 is already in a shipped build.
+Local `trunk` is `6fab5922` (= upstream `v1.2.12`'s merge base), and the session
+branch is that plus the four commits above. Upstream published **`v1.2.12`** on
+2026-10-27T07:01:39Z; that is the build the newest diagnostic log came from.
 
-The fork's parent is `KlugKlugTG/HyperHLE-Reborn`; upstream `trunk` was
-`3f7325d` (= tag `v1.2.10`, 2026-10-25) when the comparisons below were made.
+**Nothing in this tree since `babfe011` has been compiled.** There is no Rust
+toolchain in the sandbox the work was done in, so those commits are
+inspection-reviewed only. First job on a machine with a toolchain:
+`dev-scripts/lint.sh` (clippy `--deny warnings`), then
+`cargo test -- --skip test_app`.
 
 The open investigation is worth reading first (§3) because it is the only thing
 that still needs work.
@@ -37,8 +41,8 @@ that still needs work.
 - **There is no `upstream` remote**, only `origin`
   (`Zanuaimi/HyperHLE-Reborn-Experimental`). To compare against the parent repo:
   `git remote add upstream https://github.com/KlugKlugTG/HyperHLE-Reborn.git`.
-- Work on the session branch only (`arena/e77da1e8-hyperhle-reborn-experimental`);
-  do not push elsewhere.
+- Work on the session branch only
+  (`arena/16e7a9d5-hyperhle-reborn-experimental`); do not push elsewhere.
 - The merged history deliberately contains a temp commit and its revert
   (`6d002ed` "roll the bundled ANGLE back … [do not merge]" → `ec989ed`
   "Revert …"). Content on `trunk` is correct (ANGLE binaries are the inherited
@@ -106,8 +110,9 @@ one-shot line, instead of being tracked in two places.
 ### 2.2 Release workflow — `.github/workflows/HyperHLE_release.yml`
 
 Measured baseline: `build-osx (x86_64)` 23.8 min warm / 39.3 min cold, while
-`build-win` was 12.7 and `build-ios` 12.6 — the workflow duration *is* that job
-because `publish-hyperhle-release` needs all builds.
+`build-win` was 12.7 and `build-ios` 12.6 — the workflow duration *was* that job
+because `publish-hyperhle-release` needs all builds. **As of 2026-10-27 that leg
+is opt-in** (see below), so the duration is now `build-win`/`build-ios`.
 
 Applied:
 
@@ -136,6 +141,19 @@ Applied:
   skipped when the command fails.
 - **`.github/workflows/cleanup-caches.yml`**: weekly (Mon 03:17 UTC) and manual
   pruner, 8 GB budget / 21 days, oldest-used first, `actions: write` only.
+- **Opt-in Intel leg** (2026-10-27): `build_macos_x86_64` `workflow_dispatch`
+  input, default `false`. It cannot be a job-level `if` — GitHub evaluates
+  `jobs.<id>.if` *before* expanding the matrix, so `matrix` is not a valid
+  context there ("Unrecognized named-value: matrix") and a matrix entry cannot
+  be dropped by an expression either. A new `plan-macos` job therefore emits the
+  `build-osx` matrix as JSON (`matrix: ${{ fromJSON(needs.plan-macos.outputs.matrix) }}`)
+  and also publishes `build_x86_64`, which the publish job uses to skip the
+  Intel download step. `package-hyperhle-release.sh` no longer requires the Intel
+  DMG, and publishing without it prints a `::warning::`. **Consequence to keep
+  in mind: a release published without ticking the box has no
+  `HyperHLE_macOS_x86_64.zip`.** `test-macos` still uses the Intel runner on
+  purpose — it is the only one that can run the x86_64 TestApp, and tests are
+  not optional.
 
 Deliberately unchanged, with reasons recorded in the plan doc: the `hdiutil`
 retry back-off (it only runs after the step has already failed), the
@@ -146,6 +164,56 @@ Not done: thin LTO, `ld64.lld`, sccache (its GHA backend competes for the same
 
 ---
 
+### 2.3 Diagnostics added on 2026-10-27
+
+Three changes, all in `src/frameworks/opengles/eagl.rs` plus a portable dump
+path in `src/paths.rs`. None of them is compiled yet.
+
+1. `probe_readback_content` — the RAM-readback present route now reports what
+   the presented frame contains (four corners, centre, how much of the frame is
+   flat or black) on the same frame schedule as the GPU-route probe. Gated on
+   the picker's "Trace GL errors" switch. Verdict logic lives in
+   `frame_content_verdict`, which has unit tests; it reports `unknown` for an
+   empty sample set rather than calling it `flat`.
+2. `drain_startup_gl_errors` — drains the host GL error queue once, right after
+   the guest's context is created and before the guest can make its own GL call,
+   so touchHLE's own start-up probes cannot be mistaken for the app's errors,
+   and logs when it finds anything. **This is not proven to explain the `0x500`
+   in the Minigore log** — see §3.2; the trace already clears the queue before
+   each traced dispatch, which points the other way. It is hygiene, plus a way
+   to convert the ambiguity into evidence on the next run.
+3. `paths::diagnostic_dump_path` — all diagnostic PPM dumps now land in
+   `<user data>/touchHLE_dumps/` beside `touchHLE_log.txt` instead of
+   hardcoded `/tmp/a8run/...` paths.
+
+### 2.4 Review pass over the uncompiled rendering work (2026-10-27)
+
+A read-through of everything since `babfe011`, looking for the kind of defect
+that only a compiler or a driver would catch. Still uncompiled. Four real bugs
+found and fixed, all in the NPOT texture workarounds:
+
+1. `gles1_native` queried `GL_TEXTURE_MIN_FILTER` with `glGetIntegerv`. That enum
+   is per-texture-object state and is absent from ES 1.1's `glGetIntegerv` table,
+   so ANGLE (the default Android renderer) answers `GL_INVALID_ENUM` and leaves
+   the output at zero — the filter was never degraded, and the failed query put a
+   stray error in the guest's queue. Now `glGetTexParameteriv`, as the other two
+   backends already did.
+2. Every fix-up named `GL_TEXTURE_2D` explicitly, so cube-map face uploads
+   adjusted (or read) the wrong texture object. All go through
+   `util::tex_parameter_target` now.
+3. The wrap-mode fix-up ran only for `glTexImage2D`. PVRTC arrives via
+   `glCompressedTexImage2D`, so the fix missed what iOS games actually upload.
+   It now runs on uncompressed, compressed and `glCopyTexImage2D` paths (the
+   desktop-GL backend keeps skipping the wrap forcing on purpose).
+4. `gles1_on_gl2`'s filter fix-up ignored its `target`.
+
+Two smaller things worth remembering: `GlobalGenerator` (which these bindings
+use) does emit a module per *extension* function, so `gles11::FooOES::is_loaded()`
+is valid — that idiom in `supports_vao_oes` is fine. And `glGetString` in
+`gles_guest` keys its cache on `(is_es2, matrix_palette, name)`, so any backend
+that changes what it advertises must return a stable answer for the session or
+the cache has to be invalidated.
+
 ## 3. OPEN: Minigore x-ray sprites and black shaders
 
 ### 3.1 Symptom and repro
@@ -154,106 +222,125 @@ Not done: thin LTO, `ld64.lld`, sccache (its GHA backend competes for the same
 see-through ("x-ray") sprites and black shading. Confirmed with:
 
 - Renderer: **ANGLE** (bundled), context created as "Native OpenGL ES 1.1"
-  (`GLES1Native` on top of ANGLE).
+  (`GLES1Native` on top of ANGLE's GLES1 front end).
 - **Force Composition: ON**.
-- Device: Qualcomm Adreno 725, Vulkan 1.1.128, driver 512.615.95, ANGLE 2.1.1
+- Host: Qualcomm Adreno 725, Vulkan 1.1.128, driver 512.615.95, ANGLE 2.1.1
   git hash **`7865acacbf63`**.
 
-The user's own framing: *"before I made modifications, this was not a problem"* —
-i.e. this is a regression against the builds they used before this fork's
-changes.
+It reproduces on the **parent repo's own release `v1.2.12`**
+(`org.hyperhle.reborn.unofficial`, published 2026-10-27T07:01:39Z), so it is not
+a regression introduced by this fork. Do not re-open that theory.
 
-### 3.2 What the log already proved
+### 3.2 What the `v1.2.12` log established
 
-- Force Composition is genuinely active and works structurally:
-  `Force Composition is enabled; bypassing the fullscreen EAGL fast path.` then
-  `EAGL presenter: no fullscreen layer found (composition is forced by
-  --force-composition); … via RAM readback + Core Animation compositing.`
-  So every frame goes readback → RGBA → compositor.
-- It was **on without being in either options file** ("No options found for this
-  app" in both). It comes from the app picker: `PickerSettings::load()` seeds
-  `force_composition` from `options.force_composition`, and the Quick Options
-  switch persists it in **`touchHLE_picker_settings.txt`** in the same `files/`
-  directory (`src/environment/app_picker.rs` around lines 468/477/526). Checking
-  the two options files is not enough to know whether it is on.
-- Host driver does **not** advertise `GL_IMG_texture_compression_pvrtc`
-  (`GLES1Native: … NOT advertised by host driver`), so PVRTC goes through the
-  emulator's software decode. First compressed upload:
-  `glCompressedTexImage2D(1024x1024, internalformat=0x8c00, image_size=524288)` —
-  RGB PVRTC 4bpp.
+- Every frame is presented through the **RAM readback → Core Animation**
+  route: `EAGL presenter: no fullscreen layer found (composition is forced by
+  --force-composition); presenting renderbuffer 0x1 … via RAM readback (slow
+  path)`.
+- Host ES 1.1 driver is ANGLE: `OpenGL ES 1.1 (ANGLE 2.1.1 git hash:
+  7865acacbf63) / Google Inc. (Qualcomm) / ANGLE (Qualcomm, Vulkan 1.1.128
+  (Adreno 725), Driver-512.615.95)`.
+- `GL_IMG_texture_compression_pvrtc NOT advertised by host driver` → PVRTC is
+  software-decoded, as designed. `fix_texture_min_filter: ON`.
+- The steady-state frame loop repeats verbatim, and it is **pure 2D
+  compositing**: `glGetIntegerv(0x8894)`, `glGetIntegerv(0x8895)`,
+  `glViewport(0,0,640,960)`, `glClear(0x4000)`, bind texture 3 (320×480) +
+  `glDrawElements(GL_TRIANGLES, 6, UNSIGNED_SHORT)`, bind texture 5 (320×480) +
+  the same draw, then `glViewport(390,0,1620,1080)`, bind texture 1 (640×960) +
+  `glDrawArrays(GL_TRIANGLES, 0, 6)`. Two triangles per pass. No 3D draw calls,
+  no lighting/fog/matrix-palette traffic, no `glDepthFunc`, no `glBlendFunc`,
+  and `glClear` is called with `0x4000` (colour only) after the first frame.
+- One `GL Error: 0x500`, reported against the very first
+  `glGetIntegerv(0x8894)` (`GL_VERTEX_ARRAY_BINDING`); every later call reports
+  `0x0`. **Two readings are still possible and the v1.2.12 log cannot separate
+  them.** `with_ctx_and_mem` already drains the queue before each traced
+  dispatch, which should mean the call itself raised the error — i.e. the app
+  probed an ES 2.0/OES enum on an ES 1.1 context, which raises
+  `GL_INVALID_ENUM` on a real device too and is not an emulator defect. But
+  `with_ctx_and_mem_no_skip` (3 call sites, buffer mapping) does *not* drain
+  first, so a stale error would be blamed on whichever call came next. The
+  2026-10-27 trace change makes the two cases print differently; the next log
+  settles it.
+- **The `renderbuffer-content probe` line never appeared even though the probe
+  is gated on the `--trace-gl-errors` switch that was on.** It lives inside the
+  GPU-present branch, which this route never enters, so the readback path had no
+  pixel-level diagnostic at all. Fixed on 2026-10-27.
 
 ### 3.3 What was ruled out
 
-- **The fork's own commits do not touch the GL path.** Comparing fork `trunk`
-  against upstream `trunk` (`3f7325d`), the net diff was 14 files, of which the
-  graphics-relevant ones were:
-  - `src/frameworks/opengles/**`, `src/gles/**`, `src/gles.rs` — **identical**
-    (all PVRTC decode, `fix_texture_min_filter`, ES2 presenter, shader handling
-    is upstream code);
-  - `src/window.rs` — 27 lines, `should_attempt_android_angle(gles_native: bool)`
-    → `(renderer_mode: RendererMode)`; `!gles_native` and
-    `renderer_mode == Angle` are the same predicate, plus a unit test;
-  - `src/options.rs` — `gles_native: bool` (default `false` = ANGLE) →
-    `renderer_mode: RendererMode` (default `Angle`); the legacy
-    `--gles-native` / `--no-gles-native` switches map to the same two states;
-  - `src/frameworks/core_animation/ca_eagl_layer.rs` — **3 lines**, a `log_once!`;
-  - the rest is app picker / web view / movie player / `ui_touch` UI work.
-  There is also **no `renderer_mode`/`gles_native` check anywhere** outside
-  `window.rs`, `options.rs` and the picker — the emulator never branches on the
-  chosen renderer.
-- **"PVRTC decode leaves alpha at zero"** is ruled out for RGB formats:
+- **The fork's own commits as the cause** — it reproduces on upstream `v1.2.12`.
+- **A missing depth attachment / depth-test absence as the cause** — the
+  steady-state frame issues no depth state at all: no `glDepthFunc`, no
+  `0x4100` clear, no depth-tested geometry. Whatever the x-ray look is, it is
+  produced by the two-quad 2D path above.
+- **`GL_TEXTURE_MIN_FILTER` left at the mipmapping default** — two independent
+  reasons. `glTexParameteri` logs only the *first* call of the whole session
+  (`First glTexParameteri(…)[this log will only be shown once]`), so the absence
+  of a `0x2801` line proves nothing; and when the guest never sets it,
+  `fix_texture_min_filter` forces `GL_LINEAR` after every level-0 upload anyway
+  (`First fix_texture_min_filter override`, printed once).
+- **"PVRTC decode leaves alpha at zero"** for RGB formats:
   `decode_pvrtc_with_alpha(..., is_opaque = true)` ORs `0xFF00_0000` into every
-  pixel (`src/image.rs`). Both the `TexImage2D` and `TexSubImage2D` paths use it.
+  pixel (`src/image.rs`); both the `TexImage2D` and `TexSubImage2D` paths use it.
 - The Vulkan renderer mode was added and reverted upstream of the merge
   (`f054232`/`e913983` → `bf34051`), net zero.
 
-### 3.4 Leading hypothesis (NOT yet proven)
+### 3.4 Open hypotheses, in order
 
-The bundled ANGLE is **not a dependency — it is four committed binaries** in
-`android/app/jniLibs/arm64-v8a/*.so`. The parent repo bumped them on
-**2026-10-17** (`b786f84`: `927129a81b04` → `7865acacbf63`, i.e. 2026-09
-mainline → 2026-10-16 mainline, **316 upstream ANGLE commits**). The user's
-current build reports `7865acacbf63`. That bump is the only vendored-binary or
-submodule change on upstream in the preceding weeks, and it arrived through merge
-commits, not through the fork's own work.
+1. **The displayed frame is what the guest drew, and the guest drew almost
+   nothing.** If the log was captured during gameplay, two full-screen textured
+   quads per frame is not a 3D scene: the world is not being drawn at all and
+   the visible "x-ray" layer is whatever UI/compositor quads survive. That is a
+   drawing problem (state, feature detection, a stubbed entry point), not a
+   presentation problem. The new readback probe separates this from (2) in one
+   line.
+2. **The readback → compositor path changes the picture.** The direct route
+   hands the frame to the platform swap chain, which ignores alpha; the
+   composition route blends it with Core Animation's **premultiplied** contract
+   (`ONE, ONE_MINUS_SRC_ALPHA`) whenever the layer is not opaque —
+   `CALayer.opaque` defaults to `NO` here, while `UIView.opaque` defaults to
+   `YES` on iOS. `log_nonopaque_present_once` already reports how much of the
+   frame's alpha is below 255, which is the deciding datum.
+3. **ANGLE's GLES1 front end mishandling this app's ES 1.1 state** (the vendored
+   ANGLE was bumped 2026-10-17, `927129a81b04` → `7865acacbf63`, 316 upstream
+   commits, heavily Vulkan texture-path churn). Still untested; the one-variable
+   APK below is the way to test it, but it is now the *third* suspect, not the
+   first.
 
-Those 316 commits are heavily skewed to Vulkan image/texture handling
-(`Vulkan: Don't ghost images if base level has changed`, `Vulkan: Never recreate
-image due to sRGB override`, `Always robust init all levels of immutable
-textures`, `GL: revise size checks for compressed texture workarounds`,
-`GL: apply host-twiddled TexSubImage2D workaround to all formats`, `Vulkan:
-Custom VMA pools for image suballocation`, …). Adreno runs ANGLE over Vulkan, and
-this app feeds that path a software-decoded PVRTC atlas that the guest updates
-with many partial `glCompressedTexSubImage2D` calls. Garbage texels in such an
-atlas would look exactly like x-ray sprites and black shading.
+### 3.5 Next experiments
 
-### 3.5 The experiment that settles it
+1. **Read the new probe line.** Any build from 2026-10-27 onward prints, on the
+   readback route and with Trace GL errors on:
 
-A one-variable APK already exists: **commit `6d002ed`** restores the 2026-09
-ANGLE binaries and changes nothing else. It was built by CI in
-**run `40284989655`**, artifact **`HyperHLE_Android_AArch64`** (~46 MB). That
-artifact is the only easy way to run the old ANGLE now that `trunk` carries the
-new one.
+       [--trace-gl-errors] present_renderbuffer readback content probe
+       (frame=N, WxH): BL=(r,g,b,a) BR=… TL=… TR=… CENTER=… |
+       n/total sampled pixels match CENTER, m/total are black | verdict
 
-Protocol:
+   `verdict` is `all black`, `flat`, `content present`, or `unknown`. Grep:
 
-1. Install that APK and confirm the log's second line shows `6d002ed`.
-2. Confirm `Driver info: … ANGLE 2.1.1 git hash: ` now reads
-   **`927129a81b04`**. If it still says `7865acacbf63`, the rollback did not take
-   and the run proves nothing.
-3. Run Minigore with ANGLE + Force Composition, same scene as the failing log.
+       grep -iE "readback content probe|renderbuffer-content probe|eagl presenter|non-opaque layer"
 
-Interpretation:
-
-- **X-ray/black gone or clearly different** → the bundled ANGLE update is the
-  cause; the emulator and the fork's commits are exonerated. Options then:
-  pin ANGLE by reverting `b786f84`'s binaries (they are 4 files; sizes below),
-  take a newer ANGLE build, or work around the specific upload pattern in the
-  emulator.
-- **Unchanged** → ANGLE is not the variable. Next suspects, in order: the
-  software PVRTC path feeding that atlas (per-format upload logging, sub-upload
-  handling), `fix_texture_min_filter`, fixed-function blend/dither state the GPU
-  presenter perturbs, and the readback/composite path itself.
+   - `all black` / `flat` → hypothesis (1): the frame really is empty, look at
+     what the guest is (not) drawing.
+   - `content present` → hypothesis (2): compare a screenshot with the buffer.
+     Buffer right + screen wrong = presentation path; both wrong = upstream.
+2. **Watch how the trace attributes errors.** Two new lines exist:
+   "Drained GL errors raised by touchHLE's own start-up probes…" (once, right
+   after the context is created) and
+   "[--trace-gl-errors] … had glGetError() = 0xNNN pending before a call
+   dispatched from file:line; that error predates this call". If the `0x500` of
+   the v1.2.12 log comes back as the *second* form, it is stale and mine; if it
+   comes back attached to a call with no pending-prefix line before it, the app
+   raised it itself (see §3.2) and it should be left alone.
+3. **Ask for these greps from a fresh log**: `matrix palette`,
+   `not supported by this backend`, `First fix_texture_min_filter`,
+   `First glTexParameteri`. Together they say whether the app took a code path
+   the renderer cannot serve.
+4. **Only if the above is inconclusive: the ANGLE A/B.** Commit `6d002ed`
+   (never merged) restores the 2026-09 ANGLE binaries `927129a81b04` and changes
+   nothing else; CI run `40284989655` built it (artifact
+   `HyperHLE_Android_AArch64`). Confirm the second log line shows `6d002ed` and
+   that `Driver info:` reads `927129a81b04` before drawing any conclusion.
 
 Binary sizes to tell the two ANGLE builds apart without running them:
 
@@ -264,24 +351,14 @@ Binary sizes to tell the two ANGLE builds apart without running them:
 | `libGLESv2_angle.so` | 6,418,360 | 6,470,584 |
 | `libfeature_support_angle.so` | 338,480 | 338,320 |
 
-To rebuild the experiment from a full clone, either
+To rebuild that experiment from a full clone, either
 `git checkout b786f84^ -- android/app/jniLibs/arm64-v8a` (needs history:
 `git fetch --unshallow`), or `git fetch origin tag v1.1.2` and
-`git checkout v1.1.2 -- android/app/jniLibs/arm64-v8a` — `v1.1.2` (2026-10-15) is
-25 commits *before* the bump. In both cases verify the sizes against the table.
+`git checkout v1.1.2 -- android/app/jniLibs/arm64-v8a` — `v1.1.2` (2026-10-15)
+is 25 commits *before* the bump. Verify the sizes against the table. Do **not**
+merge such a commit; the previous attempt was reverted (`ec989ed`).
 
-Do **not** merge such a commit. The previous attempt was reverted (`ec989ed`)
-before the merge for exactly that reason.
-
-### 3.6 Comparison build the user may test
-
-The parent repo's **latest** release (`v1.2.10`, 2026-10-25) already contains the
-new ANGLE, so it is not a useful comparison. If a release-based comparison is
-wanted, use **`v1.1.2`** (2026-10-15) instead — but note it also lacks everything
-else upstream did in October, so it only corroborates; the `6d002ed` APK is the
-clean test.
-
-### 3.7 Android logging facts that keep coming up
+### 3.6 Android logging facts that keep coming up
 
 - Log path: `/storage/emulated/0/Android/data/<package>/files/touchHLE_log.txt`;
   `<package>` is `org.hyperhle.reborn` or `org.hyperhle.reborn.unofficial` for
@@ -295,6 +372,25 @@ clean test.
   every texture upload's format/size), `TOUCHHLE_DUMP_TEX=1` (writes RGB-only PPMs
   of the first 8 PVRTC sub-updates — cannot show alpha, so it is the wrong tool
   for a transparency question).
+- **Environment variables are unreachable on Android** (there is no shell to set
+  them from), so anything gated on `TOUCHHLE_*` is developer-only. The picker's
+  **"Trace GL errors"** switch (`src/environment/app_picker.rs`, persisted in
+  `touchHLE_picker_settings.txt` as `trace_gl_errors=`) is the only diagnostic a
+  tester can turn on. Instrumentation meant for testers belongs behind that
+  switch, not behind an env var.
+- As of 2026-10-27, PPM dumps from `TOUCHHLE_DUMP_READBACK`,
+  `TOUCHHLE_DUMP_TEX` and the ES 2.0 post-draw capture are written to
+  `<files>/touchHLE_dumps/` instead of `/tmp/a8run/` (which does not exist on
+  Android or iOS, so those dumps had been failing silently on the only platforms
+  that produce bug reports).
+- Two traps that have already caused wrong conclusions:
+  - `glTexParameteri` is logged for its **first call only**, so a missing
+    `pname=` line says nothing about whether the app sets that parameter later.
+  - The `GL Error: {:#x}` trace line now appears both **before** and **after**
+    each traced dispatch (the pre-call one drains the queue). Before
+    2026-10-27 the pre-call drain was silent, so a stale error was
+    indistinguishable from one the call itself raised. Read the
+    "… pending before a call dispatched from" line when present.
 
 ---
 
@@ -361,7 +457,10 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
 
 ## 5. Open items
 
-1. **Minigore** (§3) — highest priority; everything else is polish.
+1. **Minigore** (§3) — highest priority; everything else is polish. The next
+   step costs nothing and does not need a build: reproduce with Trace GL errors
+   on a build that has the 2026-10-27 commits, then read the
+   `Readback content probe` line (§3.5).
 2. **`codegen-units` gain is still unmeasured.** Both PR runs were cache misses.
    The first cache-saving `trunk` run gave `Build` 20.28 min (see §4), which does
    not support the projected 12–13 min. Measure with `workflow_dispatch` +
@@ -377,8 +476,8 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
 5. **F7 at level 4**: `CMAKE_BUILD_PARALLEL_LEVEL` is deliberately conservative
    (2) because cargo can run several build scripts at once; 4 is the documented
    next experiment.
-6. **`build-win` / `build-ios`** become the critical path once macOS drops below
-   ~12.6 min; neither has had a `--timings` run.
+6. **`build-win` / `build-ios`** are the critical path when the Intel leg is off
+   (the default); neither has had a `--timings` run.
 7. The plan doc's §8 checklist tracks the above; keep it current rather than
    adding a second list.
 
@@ -407,6 +506,18 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
   workflow edit before pushing.
 - `dev-scripts/lint.sh` enforces ≤ 80 columns on single-line `//` comments
   (URLs exempt). The repo already has 4 violations in `eagl.rs`; do not add more.
+- **`git diff` of `eagl.rs` is a poor brace counter** — the file is mostly inside
+  `objc_classes! { … }`, so pick anchors by their surrounding text and assert on
+  the match count before replacing. Two `str.replace` anchors have silently
+  matched twice in this session (the two `initWithAPI:` variants).
+- Statements about "what the guest never does", when drawn from the log, must
+  account for the trace's sampling: `glTexParameteri` prints only its first call
+  and the `GL Error:` line prints after each call, not before it.
+- **A syntax-only check is possible without a toolchain**:
+  `pip install --break-system-packages tree-sitter tree-sitter-rust` and parse
+  the changed files for `ERROR`/missing nodes. It catches unbalanced braces and
+  broken string continuations, not type errors; `src/objc/messages.rs` has
+  known false positives (fn-pointer-type macro patterns).
 
 ---
 
@@ -415,7 +526,9 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
 | Thing | Value |
 |---|---|
 | Merged PR | #1, merge commit `bee1ffc`, merged 2026-10-26T09:22Z |
-| `trunk` head | `0aa2646` |
+| Local `trunk` | `6fab5922` (= upstream `v1.2.12` merge base) |
+| Session branch head | see `git log -1` (a hash written here is stale on arrival) |
+| Rendering-fix commits | `babfe011`, `271d0c42`, `6dc6e2c2`, `262d47e4`, `19031d61`, `d65f349f` — **all uncompiled** |
 | EAGL diagnostics commit | `53c412e` (+ `c4068ce`… review fixes) |
 | Workflow commits | `8ab1b9e`, `6208b39`, `1f51777`, `9eb2729`, `c4068ce`, `e950e99` |
 | TEMP ANGLE rollback / revert | `6d002ed` / `ec989ed` (content-neutral) |
@@ -423,4 +536,4 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
 | PR CI runs | `40281051199` (`c4068ce`), `40294335854` (`ec989ed`) — both green |
 | Post-merge trunk runs | `40299058134` (`bee1ffc`) — `build-android` failed (likely flake); `40305274141` (`0aa2646`) — green, published `v1.0.11` |
 | Plan doc | `dev-scripts/ci-performance-macos-x86_64.md` |
-| Parent repo | `KlugKlugTG/HyperHLE-Reborn`, upstream `trunk` was `3f7325d` / `v1.2.10` |
+| Parent repo | `KlugKlugTG/HyperHLE-Reborn`, latest release `v1.2.12` (2026-10-27T07:01Z) |

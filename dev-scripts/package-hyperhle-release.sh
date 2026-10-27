@@ -59,7 +59,9 @@ do
     fi
 done
 
-for path in "$macos_x86_dmg" "$macos_arm_dmg" "$android_apk"; do
+# The macOS Intel build is opt-in (see `plan-macos` in HyperHLE_release.yml),
+# so it is deliberately absent from the list of required artifacts below.
+for path in "$macos_arm_dmg" "$android_apk"; do
     if [ -z "$path" ] || [ ! -e "$path" ]; then
         echo "Missing build artifact (all platform builds must succeed): $path" >&2
         exit 1
@@ -174,8 +176,13 @@ cd "$ROOT/dev-scripts"
 
 prefix="HyperHLE"
 
-./prepare-release.sh --create-zip-macos "$ROOT/$macos_x86_dmg" \
-    -o "$ROOT/release/${prefix}_macOS_x86_64.zip"
+if [ -n "$macos_x86_dmg" ]; then
+    ./prepare-release.sh --create-zip-macos "$ROOT/$macos_x86_dmg" \
+        -o "$ROOT/release/${prefix}_macOS_x86_64.zip"
+else
+    echo "No macOS Intel DMG among the artifacts: this release ships without" \
+        "${prefix}_macOS_x86_64.zip." >&2
+fi
 ./prepare-release.sh --create-zip-macos "$ROOT/$macos_arm_dmg" \
     -o "$ROOT/release/${prefix}_macOS_AArch64.zip"
 ./prepare-release.sh --create-zip-android "$ROOT/$android_apk" \

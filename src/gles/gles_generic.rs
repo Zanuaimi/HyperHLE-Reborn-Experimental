@@ -804,6 +804,32 @@ pub trait GLES {
         // closest sensible behaviour available.
     }
 
+    /// Whether this backend can actually honour `GL_OES_matrix_palette`.
+    ///
+    /// The guest-visible `GL_EXTENSIONS` string advertises the extension (the
+    /// real iPhone 3GS PowerVR SGX does), so an animated 3D game feature-tests
+    /// it and then submits skinned meshes through the palette entry points
+    /// below instead of transforming vertices itself. A backend that accepted
+    /// the entry points but dropped them on the floor would let every skinned
+    /// mesh keep its bind-pose (or collapse it to garbage, since palette-space
+    /// vertex data is only meaningful after the weighted transform) — the
+    /// result is a game whose characters, and anything textured with their
+    /// materials, render as black or "x-ray" silhouettes while the rest of the
+    /// scene looks fine.
+    ///
+    /// Backends that implement palette skinning (the ES1-on-ES2 and
+    /// ES1-on-GL2 translators) can keep the default. Backends that only
+    /// forward to a host driver must report whether that driver advertises
+    /// the extension, so the guest can fall back to its own CPU skinning path
+    /// instead of taking a route that silently produces wrong geometry.
+    ///
+    /// Reference: `GL_OES_matrix_palette` (Khronos), where the weighted
+    /// transform is `eye = sum_i w_i * (palette[index_i] * object)`:
+    /// https://registry.khronos.org/OpenGL/extensions/OES/OES_matrix_palette.txt
+    fn supports_matrix_palette(&self) -> bool {
+        true
+    }
+
     /// `GL_OES_matrix_palette` / `GL_ARB_matrix_palette`.
     /// Backends may override this to keep track of the current palette matrix
     /// index; the default just accepts the call.

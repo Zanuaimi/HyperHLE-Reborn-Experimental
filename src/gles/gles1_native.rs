@@ -9,7 +9,10 @@
 use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles_generic::GLES;
-use super::util::{try_decode_pvrtc, PalettedTextureFormat};
+use super::util::{
+    base_min_filter, fix_texture_min_filter_enabled, is_npot_upload, tex_parameter_target,
+    try_decode_pvrtc, PalettedTextureFormat,
+};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::ffi::{CStr, CString};
@@ -59,6 +62,20 @@ pub struct GLES1NativeContext {
     /// system RAM at the end of a frame.
     discard_ext: bool,
     discard_ext_checked: bool,
+    /// Whether the host ES 1.1 driver advertises `GL_OES_matrix_palette`
+    /// (hardware vertex skinning). Checked together with `pvrtc_native` in
+    /// `make_current`, for the same reason: it needs a current context.
+    ///
+    /// Unlike PVRTC there is no software fallback here: palette skinning is a
+    /// pipeline feature, not a file format. So this flag exists to tell the
+    /// guest the truth, via `GLES::supports_matrix_palette`. When the host
+    /// lacks the extension (ANGLE's ES 1.1 front-end, the desktop GLES1
+    /// emulation layers, most mobile ES 1.1 drivers other than Adreno's),
+    /// the guest-visible extension string omits it and the game keeps using
+    /// its own skinning path, instead of submitting palette-skinned meshes
+    /// whose transforms are dropped and which therefore render black or
+    /// see-through.
+    palette_ext: bool,
 }
 
 /// Texture parameters that only exist in OpenGL ES 2.0+ (or are otherwise
@@ -93,20 +110,6 @@ fn is_es2_only_texture_parameter(pname: GLenum) -> bool {
     )
 }
 
-/// Whether the mipmapped-NPOT-texture workaround (see `TexImage2D`) is
-/// enabled. Defaults to `true` on Android, mirroring
-/// [crate::options::Options::fix_texture_min_filter]; the
-/// `--fix-texture-min-filter` / `--no-fix-texture-min-filter` flags and the
-/// `TOUCHHLE_FIX_TEXTURE_MIN_FILTER` environment variable override it.
-fn fix_texture_min_filter_enabled() -> bool {
-    static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => cfg!(target_os = "android"),
-    })
-}
-
 impl GLESContext for GLES1NativeContext {
     fn description() -> &'static str {
         "Native OpenGL ES 1.1"
@@ -120,6 +123,7 @@ impl GLESContext for GLES1NativeContext {
             pvrtc_native_checked: false,
             discard_ext: false,
             discard_ext_checked: false,
+            palette_ext: false,
         })
     }
 
@@ -133,6 +137,7 @@ impl GLESContext for GLES1NativeContext {
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
                 discard_ext: self.discard_ext,
+                palette_ext: self.palette_ext,
             });
         }
 
@@ -142,10 +147,18 @@ impl GLESContext for GLES1NativeContext {
         gles11::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = unsafe { detect_pvrtc_support() };
-            self.discard_ext =
-                unsafe { host_extension_present("GL_EXT_discard_framebuffer") };
+            // One `GL_EXTENSIONS` query answers every capability question
+            // below, and it has to happen with this context current.
+            let extensions = unsafe { host_extension_list() };
+            let has_extension = |name: &str| {
+                extensions
+                    .as_deref()
+                    .is_some_and(|list| extension_list_contains(list, name))
+            };
+            self.pvrtc_native = has_extension("GL_IMG_texture_compression_pvrtc");
+            self.discard_ext = has_extension("GL_EXT_discard_framebuffer");
             self.discard_ext_checked = true;
+            self.palette_ext = has_extension("GL_OES_matrix_palette");
             self.pvrtc_native_checked = true;
             log!(
                 "GLES1Native: GL_IMG_texture_compression_pvrtc {} (PVRTC textures will \
@@ -161,12 +174,28 @@ impl GLESContext for GLES1NativeContext {
                     "software-decoded to RGBA before upload"
                 },
             );
+            log!(
+                "GLES1Native: GL_OES_matrix_palette {} (guest skinning will use \
+                 {})",
+                if self.palette_ext {
+                    "advertised by host driver"
+                } else {
+                    "NOT advertised by host driver"
+                },
+                if self.palette_ext {
+                    "the GPU palette path"
+                } else {
+                    "the app's own skinning path, because the extension is \
+                     withheld from GL_EXTENSIONS"
+                },
+            );
         }
         Box::new(GLES1Native {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
             discard_ext: self.discard_ext,
+            palette_ext: self.palette_ext,
         })
     }
 
@@ -181,6 +210,7 @@ impl GLESContext for GLES1NativeContext {
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
                 discard_ext: self.discard_ext,
+                palette_ext: self.palette_ext,
             });
         }
 
@@ -188,9 +218,16 @@ impl GLESContext for GLES1NativeContext {
         gles11::load_with(loader_fn);
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = detect_pvrtc_support();
-            self.discard_ext = host_extension_present("GL_EXT_discard_framebuffer");
+            let extensions = host_extension_list();
+            let has_extension = |name: &str| {
+                extensions
+                    .as_deref()
+                    .is_some_and(|list| extension_list_contains(list, name))
+            };
+            self.pvrtc_native = has_extension("GL_IMG_texture_compression_pvrtc");
+            self.discard_ext = has_extension("GL_EXT_discard_framebuffer");
             self.discard_ext_checked = true;
+            self.palette_ext = has_extension("GL_OES_matrix_palette");
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES1Native {
@@ -198,42 +235,55 @@ impl GLESContext for GLES1NativeContext {
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
             discard_ext: self.discard_ext,
+            palette_ext: self.palette_ext,
         })
     }
 }
 
-/// Query `GL_EXTENSIONS` on the currently-bound OpenGL ES 1.1 context and
-/// return whether it advertises `GL_IMG_texture_compression_pvrtc`.
+/// Whether a space-separated `GL_EXTENSIONS` list contains `name`.
 ///
-/// Must be called with a current GL context. Returns `false` on any
-/// driver-reported error (NULL string, non-UTF-8 string, missing token);
-/// software-decoding PVRTC is the safe-default behaviour.
-unsafe fn detect_pvrtc_support() -> bool {
-    let raw = gles11::GetString(gles11::EXTENSIONS);
-    if raw.is_null() {
-        return false;
-    }
-    let Ok(s) = CStr::from_ptr(raw as *const _).to_str() else {
-        return false;
-    };
-    if s.is_empty() {
-        return false;
-    }
-    s.split(' ')
-        .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
+/// GL extension strings are space-separated and conventionally end with a
+/// space, so splitting on `' '` yields a trailing empty token; comparing whole
+/// tokens (rather than substring-searching) keeps `GL_OES_matrix_palette` from
+/// matching a hypothetical longer name, and keeps the empty token from matching
+/// a request for `""`.
+fn extension_list_contains(list: &str, name: &str) -> bool {
+    !name.is_empty() && list.split(' ').any(|ext| ext == name)
 }
 
-/// Whether the host ES 1.1 driver exports `glDiscardFramebufferEXT`
-/// (`GL_EXT_discard_framebuffer`). Must be called with a current GL context.
-unsafe fn host_extension_present(name: &str) -> bool {
+/// Query `GL_EXTENSIONS` on the currently-bound OpenGL ES 1.1 context.
+///
+/// Must be called with a current GL context. Returns `None` if the driver
+/// reports no usable string (NULL, non-UTF-8, or empty), in which case every
+/// capability question has to be answered conservatively.
+unsafe fn host_extension_list() -> Option<String> {
     let raw = gles11::GetString(gles11::EXTENSIONS);
     if raw.is_null() {
-        return false;
+        return None;
     }
-    let Ok(s) = CStr::from_ptr(raw as *const _).to_str() else {
-        return false;
-    };
-    s.split(' ').any(|ext| ext == name)
+    let s = CStr::from_ptr(raw as *const _).to_str().ok()?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_owned())
+}
+
+/// One-shot warning for a guest that submits palette skinning even though the
+/// extension was withheld from its `GL_EXTENSIONS` string (some apps never
+/// feature-test, and a context can outlive a renderer change).
+fn log_matrix_palette_unsupported(profile: &'static str) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        log!(
+            "Call to a GL_OES_matrix_palette entry point on {}: the host ES 1.1 \
+             driver has no palette pipeline, so the call is ignored and skinned \
+             meshes are drawn without their palette transforms (which usually \
+             looks like black or see-through geometry). GL_OES_matrix_palette is \
+             withheld from the guest's GL_EXTENSIONS string so apps that \
+             feature-test it use their own skinning path instead.",
+            profile
+        );
+    });
 }
 
 pub struct GLES1Native<'gl_ctx> {
@@ -257,6 +307,10 @@ pub struct GLES1Native<'gl_ctx> {
     /// Mirror of [`GLES1NativeContext::discard_ext`]; copied at make_current
     /// time so the per-call discard path doesn't have to re-query anything.
     discard_ext: bool,
+    /// Mirror of [`GLES1NativeContext::palette_ext`]; copied at make_current
+    /// time. Gates both the palette entry points below and
+    /// `GLES::supports_matrix_palette`.
+    palette_ext: bool,
 }
 
 impl GLES for GLES1Native<'_> {
@@ -266,6 +320,10 @@ impl GLES for GLES1Native<'_> {
 
     fn discard_ext_supported(&self) -> bool {
         self.discard_ext
+    }
+
+    fn supports_matrix_palette(&self) -> bool {
+        self.palette_ext
     }
 
     unsafe fn DiscardFramebufferEXT(
@@ -696,6 +754,98 @@ impl GLES for GLES1Native<'_> {
         gles11::PointSizePointerOES(type_, stride, pointer)
     }
 
+    // `GL_OES_matrix_palette` (hardware vertex skinning).
+    //
+    // A native ES 1.1 driver that advertises the extension (Qualcomm Adreno,
+    // PowerVR) performs the weighted palette transform itself, so the calls
+    // are pure passthrough there. ANGLE's ES 1.1 front-end and the desktop
+    // GLES1 emulation layers have no palette pipeline at all, so there is
+    // nothing to forward to; see `supports_matrix_palette` for why the guest
+    // must be told so rather than having these calls silently accepted.
+    unsafe fn CurrentPaletteMatrixOES(&mut self, matrixpaletteindex: GLuint) {
+        if self.palette_ext {
+            gles11::CurrentPaletteMatrixOES(matrixpaletteindex);
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
+    }
+
+    unsafe fn LoadPaletteFromModelViewMatrixOES(&mut self) {
+        if self.palette_ext {
+            gles11::LoadPaletteFromModelViewMatrixOES();
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
+    }
+
+    unsafe fn MatrixIndexPointerOES(
+        &mut self,
+        size: GLint,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
+        if self.palette_ext {
+            gles11::MatrixIndexPointerOES(size, type_, stride, pointer);
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
+    }
+
+    unsafe fn WeightPointerOES(
+        &mut self,
+        size: GLint,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
+        if self.palette_ext {
+            gles11::WeightPointerOES(size, type_, stride, pointer);
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
+    }
+
+    // Vertex array objects (`GL_OES_vertex_array_object`).
+    //
+    // touchHLE can always serve VAOs: `gles_guest` keeps a software emulation
+    // that records and re-applies the client-array state on every bind. A host
+    // ES 1.1 driver that exports the entry points (the Adreno ES 1.1 surface
+    // does) can do it natively, which is both cheaper — the guest layer then
+    // binds one object instead of replaying every `*Pointer` call — and more
+    // faithful, because the driver's own attribute state is what it draws
+    // from. Report the capability so `gles_guest` picks the right path; the
+    // check is on symbol availability rather than the extension string, the
+    // same way `gles2_native::supports_vao_oes` does it.
+    fn supports_vao_oes(&self) -> bool {
+        gles11::BindVertexArrayOES::is_loaded()
+            && gles11::GenVertexArraysOES::is_loaded()
+            && gles11::DeleteVertexArraysOES::is_loaded()
+            && gles11::IsVertexArrayOES::is_loaded()
+    }
+    unsafe fn BindVertexArrayOES(&mut self, array: GLuint) {
+        if gles11::BindVertexArrayOES::is_loaded() {
+            gles11::BindVertexArrayOES(array);
+        }
+    }
+    unsafe fn GenVertexArraysOES(&mut self, n: GLsizei, arrays: *mut GLuint) {
+        if gles11::GenVertexArraysOES::is_loaded() {
+            gles11::GenVertexArraysOES(n, arrays);
+        }
+    }
+    unsafe fn DeleteVertexArraysOES(&mut self, n: GLsizei, arrays: *const GLuint) {
+        if gles11::DeleteVertexArraysOES::is_loaded() {
+            gles11::DeleteVertexArraysOES(n, arrays);
+        }
+    }
+    unsafe fn IsVertexArrayOES(&mut self, array: GLuint) -> GLboolean {
+        if gles11::IsVertexArrayOES::is_loaded() {
+            gles11::IsVertexArrayOES(array)
+        } else {
+            gles11::FALSE
+        }
+    }
+
     // Drawing
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
         gles11::DrawArrays(mode, first, count)
@@ -895,27 +1045,10 @@ impl GLES for GLES1Native<'_> {
         if old_alignment != 1 {
             gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
         }
-        // A guest-set mipmapped `TEXTURE_MIN_FILTER` on a non-power-of-two
-        // level-0 texture makes the texture incomplete on strict drivers:
-        // sampled texels come back undefined (pink/black garbage) instead of
-        // falling back to base-level sampling like lenient drivers do.
-        // Degrade the mipmap filter to its base filtering mode (preserving
-        // the guest's nearest/linear intent). Only for non-power-of-two
-        // dimensions; power-of-two textures support mipmaps everywhere.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
-        {
-            self.fix_mipmap_min_filter(target);
-        }
+        // See `degrade_mipmap_min_filter_after_upload`: a level-0 NPOT upload
+        // leaves any mipmapped filter with no mip levels behind it.
+        self.degrade_mipmap_min_filter_after_upload(target, level, width, height);
     }
-
-
-
-    /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound
-    /// texture to its base filtering mode, preserving the guest's
-    /// nearest/linear intent. See `TexImage2D` for why.
-
 
     unsafe fn TexSubImage2D(
         &mut self,
@@ -966,15 +1099,8 @@ impl GLES for GLES1Native<'_> {
         if old_alignment != 1 {
             gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
         }
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
-        {
-            self.fix_mipmap_min_filter(target);
-        }
+        self.degrade_mipmap_min_filter_after_upload(target, level, width, height);
     }
-
-
 
     unsafe fn CompressedTexSubImage2D(
         &mut self,
@@ -1023,8 +1149,13 @@ impl GLES for GLES1Native<'_> {
         height: GLsizei,
         border: GLint,
     ) {
-        gles11::CopyTexImage2D(target, level, internalformat, x, y, width, height, border)
+        // `glCopyTexImage2D` allocates level-0 storage exactly like
+        // `glTexImage2D`, so the same strict-driver rules apply.
+        self.force_clamp_to_edge_for_npot(target, level, width, height);
+        gles11::CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        self.degrade_mipmap_min_filter_after_upload(target, level, width, height);
     }
+
     unsafe fn CopyTexSubImage2D(
         &mut self,
         target: GLenum,
@@ -1726,30 +1857,7 @@ impl GLES1Native<'_> {
         if format == gles11::BGRA_EXT {
             internalformat = gles11::BGRA_EXT as GLint
         }
-        // Strict ES 1.1 drivers (ANGLE's GLES1 front-end, Adreno's native ES
-        // 1.1) reject non-power-of-two uploads unless the texture samples
-        // with CLAMP_TO_EDGE and a non-mipmap filter: the upload fails with
-        // GL_INVALID_ENUM and every draw sampling the texture shows garbage
-        // / black. Guest UI surfaces are typically NPOT (320x480 video
-        // planes, 640x1136 compositor framebuffers), and guests routinely
-        // leave GL_REPEAT as the wrap mode. Force CLAMP_TO_EDGE on the
-        // current binding for NPOT uploads; wrap is per-texture-object
-        // state, so other textures are unaffected.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
-        {
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_S,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_T,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-        }
+        self.force_clamp_to_edge_for_npot(target, level, width, height);
         gles11::TexImage2D(
             target,
             level,
@@ -1762,20 +1870,87 @@ impl GLES1Native<'_> {
             pixels,
         )
     }
+
+    /// Force `GL_CLAMP_TO_EDGE` on both wrap axes of the currently-bound
+    /// texture before a non-power-of-two level-0 upload.
+    ///
+    /// Strict ES 1.1 drivers (ANGLE's GLES1 front-end, Adreno's native ES 1.1)
+    /// reject a non-power-of-two upload unless the texture samples with
+    /// `CLAMP_TO_EDGE` and a non-mipmap filter: the upload fails with
+    /// `GL_INVALID_ENUM` and every draw sampling the texture shows garbage or
+    /// black. Guest UI surfaces are typically NPOT (320x480 video planes,
+    /// 640x1136 compositor framebuffers), and guests routinely leave
+    /// `GL_REPEAT` as the wrap mode. Wrap is per-texture-object state, so
+    /// other textures are unaffected.
+    ///
+    /// Used by both the uncompressed and the compressed upload paths: PVRTC is
+    /// what iPhone OS games actually ship, so a fix that only applied to
+    /// `glTexImage2D` would miss most of them.
+    unsafe fn force_clamp_to_edge_for_npot(
+        &self,
+        target: GLenum,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+            return;
+        }
+        // A cube-map face upload binds `TEXTURE_CUBE_MAP`; setting the
+        // parameters on `TEXTURE_2D` there would touch the wrong object.
+        let p_target = tex_parameter_target(target);
+        gles11::TexParameteri(p_target, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
+        gles11::TexParameteri(p_target, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+    }
+
+    /// The post-upload half of the non-power-of-two workarounds: if a level-0
+    /// NPOT upload just replaced the texture's storage, degrade a mipmapped
+    /// `TEXTURE_MIN_FILTER` that now has no mip levels behind it.
+    ///
+    /// Kept separate from [Self::force_clamp_to_edge_for_npot] because it has
+    /// to run *after* the upload (the filter state is read back from the
+    /// driver), while the clamp fix-up has to run before it.
+    unsafe fn degrade_mipmap_min_filter_after_upload(
+        &mut self,
+        target: GLenum,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+            return;
+        }
+        self.fix_mipmap_min_filter(target);
+    }
+
+    /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound
+    /// texture to its base filtering mode, preserving the guest's
+    /// nearest/linear intent.
+    ///
+    /// Companion to the CLAMP_TO_EDGE forcing in `tex_image_2d_inner`: strict
+    /// drivers reject NPOT textures that ask for mipmapping, and a host whose
+    /// default `TEXTURE_MIN_FILTER` is `NEAREST_MIPMAP_LINEAR` (the ES 1.1 and
+    /// ES 2.0 defaults) makes *every* level-0-only texture incomplete, not just
+    /// the ones the guest configured that way. That default is never
+    /// observable in the guest's calls — the guest simply never sets
+    /// `TEXTURE_MIN_FILTER` — so the only place to catch it is right after
+    /// the upload, by querying the state that is actually in effect.
+    ///
+    /// `target` matters for cube maps: a face upload binds
+    /// `TEXTURE_CUBE_MAP`, and setting `TEXTURE_MIN_FILTER` with
+    /// `TEXTURE_2D` while the cube map is bound is a silent no-op.
     unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
+        let p_target = tex_parameter_target(target);
+        // `glGetTexParameteriv`, not `glGetIntegerv`: `TEXTURE_MIN_FILTER` is
+        // per-texture-object state, and ES 1.1 does not list it among the
+        // values `glGetIntegerv` accepts, so a strict driver answers the
+        // latter with `GL_INVALID_ENUM` and leaves the output untouched -
+        // which would make this whole workaround a silent no-op (and put a
+        // stray error in the guest's queue as a bonus).
         let mut min_filter: GLint = 0;
-        gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
-        // 0x2700 NEAREST_MIPMAP_NEAREST, 0x2701 LINEAR_MIPMAP_NEAREST,
-        // 0x2702 NEAREST_MIPMAP_LINEAR, 0x2703 LINEAR_MIPMAP_LINEAR
-        let replacement: GLint = match min_filter {
-            0x2700 | 0x2702 => gles11::NEAREST as GLint,
-            0x2701 | 0x2703 => gles11::LINEAR as GLint,
-            _ => return,
-        };
-        let p_target = if (0x8515..=0x851A).contains(&target) {
-            0x8513
-        } else {
-            target
+        gles11::GetTexParameteriv(p_target, gles11::TEXTURE_MIN_FILTER, &mut min_filter);
+        let Some(replacement) = base_min_filter(min_filter) else {
+            return;
         };
         gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, replacement as _);
         log_dbg!(
@@ -1784,6 +1959,7 @@ impl GLES1Native<'_> {
              [incomplete-texture workaround for strict drivers]"
         );
     }
+
     unsafe fn compressed_tex_image_2d_inner(
         &mut self,
         target: GLenum,
@@ -1795,6 +1971,10 @@ impl GLES1Native<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
+        // Before any upload: a strict driver rejects NPOT storage that still
+        // has `GL_REPEAT` set, and the compressed path is the one iOS games
+        // actually use.
+        self.force_clamp_to_edge_for_npot(target, level, width, height);
 
         // POSIX-style guard: a NULL data pointer with image_size==0 is
         // technically allowed by the spec for some texture-storage queries,
@@ -2009,5 +2189,24 @@ impl<'gl_ctx> GLES1Native<'gl_ctx> {
                 fn_name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extension_list_contains;
+
+    #[test]
+    fn extension_list_matches_whole_tokens() {
+        let list = "GL_OES_framebuffer_object GL_OES_matrix_palette ";
+        assert!(extension_list_contains(list, "GL_OES_matrix_palette"));
+        assert!(extension_list_contains(list, "GL_OES_framebuffer_object"));
+        // The trailing space in real extension strings produces an empty
+        // token; it must not be mistaken for a successful match.
+        assert!(!extension_list_contains(list, ""));
+        // A prefix must not match.
+        assert!(!extension_list_contains(list, "GL_OES_matrix"));
+        assert!(!extension_list_contains(list, "GL_OES_matrix_palette2"));
+        assert!(!extension_list_contains("", "GL_OES_matrix_palette"));
     }
 }
