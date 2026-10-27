@@ -253,6 +253,10 @@ Usability:
 
 - Quick Options now has a “May fix graphics issues.” switch for `--force-composition`, including an explicit off state that overrides app-specific defaults. Switches are aligned beside their labels, and the scale-hack button text no longer gets clipped. (@j92580498-max)
 
+Other:
+
+- The macOS Intel (x86_64) build is now opt-in in the release workflow. Intel Macs are rare and `macos-15-intel` is both the slowest and the scarcest GitHub-hosted runner, so that leg alone decided how long a full build took. A run now builds it only when the new “Build the macOS Intel (x86_64) DMG too” box is ticked, which means **a release published without ticking it ships no `HyperHLE_macOS_x86_64.zip`**; the publish job says so in a warning. The Apple Silicon build, the tests and every other platform are unaffected, and the tests still run on the Intel runner because that is the only one that can run the x86_64 TestApp.
+
 ## v0.2.3 (2026-01-02)
 
 Compatibility:

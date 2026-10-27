@@ -110,8 +110,9 @@ one-shot line, instead of being tracked in two places.
 ### 2.2 Release workflow — `.github/workflows/HyperHLE_release.yml`
 
 Measured baseline: `build-osx (x86_64)` 23.8 min warm / 39.3 min cold, while
-`build-win` was 12.7 and `build-ios` 12.6 — the workflow duration *is* that job
-because `publish-hyperhle-release` needs all builds.
+`build-win` was 12.7 and `build-ios` 12.6 — the workflow duration *was* that job
+because `publish-hyperhle-release` needs all builds. **As of 2026-10-27 that leg
+is opt-in** (see below), so the duration is now `build-win`/`build-ios`.
 
 Applied:
 
@@ -140,6 +141,19 @@ Applied:
   skipped when the command fails.
 - **`.github/workflows/cleanup-caches.yml`**: weekly (Mon 03:17 UTC) and manual
   pruner, 8 GB budget / 21 days, oldest-used first, `actions: write` only.
+- **Opt-in Intel leg** (2026-10-27): `build_macos_x86_64` `workflow_dispatch`
+  input, default `false`. It cannot be a job-level `if` — GitHub evaluates
+  `jobs.<id>.if` *before* expanding the matrix, so `matrix` is not a valid
+  context there ("Unrecognized named-value: matrix") and a matrix entry cannot
+  be dropped by an expression either. A new `plan-macos` job therefore emits the
+  `build-osx` matrix as JSON (`matrix: ${{ fromJSON(needs.plan-macos.outputs.matrix) }}`)
+  and also publishes `build_x86_64`, which the publish job uses to skip the
+  Intel download step. `package-hyperhle-release.sh` no longer requires the Intel
+  DMG, and publishing without it prints a `::warning::`. **Consequence to keep
+  in mind: a release published without ticking the box has no
+  `HyperHLE_macOS_x86_64.zip`.** `test-macos` still uses the Intel runner on
+  purpose — it is the only one that can run the x86_64 TestApp, and tests are
+  not optional.
 
 Deliberately unchanged, with reasons recorded in the plan doc: the `hdiutil`
 retry back-off (it only runs after the step has already failed), the
@@ -462,8 +476,8 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
 5. **F7 at level 4**: `CMAKE_BUILD_PARALLEL_LEVEL` is deliberately conservative
    (2) because cargo can run several build scripts at once; 4 is the documented
    next experiment.
-6. **`build-win` / `build-ios`** become the critical path once macOS drops below
-   ~12.6 min; neither has had a `--timings` run.
+6. **`build-win` / `build-ios`** are the critical path when the Intel leg is off
+   (the default); neither has had a `--timings` run.
 7. The plan doc's §8 checklist tracks the above; keep it current rather than
    adding a second list.
 

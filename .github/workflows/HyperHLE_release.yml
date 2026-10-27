@@ -3,6 +3,12 @@ name: Build HyperHLE
 on:
   workflow_dispatch:
     inputs:
+      build_macos_x86_64:
+        description: >-
+          Build the macOS Intel (x86_64) DMG too (slowest runner; leave unticked
+          unless an Intel Mac needs this release)
+        type: boolean
+        default: false
       publish_hyperhle_release:
         description: Publish a HyperHLE release (after all builds succeed)
         type: boolean
@@ -29,17 +35,43 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
 
 jobs:
+  # Intel Macs are rare and `macos-15-intel` is both the slowest runner and the
+  # scarcest one, so the x86_64 leg is opt-in (`build_macos_x86_64`). It can't be
+  # filtered inside `build-osx` itself: a job-level `if` is evaluated before the
+  # matrix exists, so `matrix` is not a valid context there, and a matrix entry
+  # cannot be dropped by an expression either. Deciding the matrix up front is
+  # therefore the only way to skip the leg, and doing it in one job also lets
+  # `publish-hyperhle-release` ask whether the Intel DMG exists without
+  # restating the condition.
+  plan-macos:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      build_x86_64: ${{ steps.plan.outputs.build_x86_64 }}
+    steps:
+      - name: Decide which macOS targets to build
+        id: plan
+        env:
+          # Empty on `push`, `pull_request` and `create`, where workflow
+          # dispatch inputs do not exist at all; treated like an unticked box.
+          BUILD_MACOS_X86_64: ${{ inputs.build_macos_x86_64 }}
+        run: |
+          set -eu
+          arm='{"target":"aarch64-apple-darwin","runner":"macos-15","artifact":"HyperHLE_macOS_AArch64"}'
+          intel='{"target":"x86_64-apple-darwin","runner":"macos-15-intel","artifact":"HyperHLE_macOS_x86_64"}'
+          if [ "$BUILD_MACOS_X86_64" = "true" ]; then
+            echo "build_x86_64=true" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[$intel,$arm]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_x86_64=false" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[$arm]}" >> "$GITHUB_OUTPUT"
+          fi
+
   build-osx:
+    needs: [plan-macos]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            artifact: HyperHLE_macOS_x86_64
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            artifact: HyperHLE_macOS_AArch64
+      matrix: ${{ fromJSON(needs.plan-macos.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     env:
       # The `cmake` crate runs `cmake --build` without `--parallel`, and CMake
@@ -684,10 +716,11 @@ jobs:
         run: ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
-    needs: [check-hyperhle-release, build-osx, test-macos, build-linux, build-android, build-win, build-ios]
+    needs: [check-hyperhle-release, plan-macos, build-osx, test-macos, build-linux, build-android, build-win, build-ios]
     if: >-
       needs.check-hyperhle-release.result == 'success' &&
       needs.check-hyperhle-release.outputs.should_release == 'true' &&
+      needs.plan-macos.result == 'success' &&
       needs.build-osx.result == 'success' &&
       needs.test-macos.result == 'success' &&
       needs.build-linux.result == 'success' &&
@@ -704,11 +737,21 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
+      # Only present when the run asked for the Intel leg; the packaging
+      # script leaves the zip out rather than failing.
       - name: Download macOS Intel artifact
+        if: needs.plan-macos.outputs.build_x86_64 == 'true'
         uses: actions/download-artifact@main
         with:
           name: HyperHLE_macOS_x86_64
           path: artifacts/macos-x86_64
+      # Without this the Intel download would simply be missing from the
+      # release, which is easy to publish by accident.
+      - name: Note the skipped macOS Intel build
+        if: needs.plan-macos.outputs.build_x86_64 != 'true'
+        run: |
+          echo "::warning::no macOS Intel (x86_64) DMG in this release; start a run with 'Build the macOS Intel (x86_64) DMG too' ticked if it is needed"
+
       - name: Download macOS Apple Silicon artifact
         uses: actions/download-artifact@main
         with:

@@ -1,9 +1,18 @@
 # CI performance plan: the macOS x86_64 job
 
-The release workflow is gated by `build-osx (x86_64-apple-darwin)`. Every other
-job finishes in 6–13 minutes; this one takes 24–39. Because
-`publish-hyperhle-release` needs *all* build jobs, its duration is the whole
+The release workflow used to be gated by `build-osx (x86_64-apple-darwin)`.
+Every other job finishes in 6–13 minutes; this one takes 24–39. Because
+`publish-hyperhle-release` needs *all* build jobs, its duration was the whole
 workflow's duration.
+
+**Since 2026-10-27 the leg is opt-in** (`build_macos_x86_64`, a
+`workflow_dispatch` input defaulting to `false`, resolved by the `plan-macos`
+job): Intel Macs are rare, and the runner it needs is the scarcest one, so a
+run no longer pays for it unless the DMG is wanted. Everything below still
+describes that leg and still applies whenever it is enabled — the measurements
+are what the per-target environment and the phase 3a setting are justified by —
+but "the critical path" is now `build-osx (aarch64-apple-darwin)` at ~12
+minutes, and the workflow's duration is set by `build-win`/`build-ios`.
 
 Phases 0, 1 and 2 of this plan are implemented in
 `.github/workflows/HyperHLE_release.yml`, and so is phase 3a
@@ -406,6 +415,17 @@ Applied in `.github/workflows/HyperHLE_release.yml` and
   2/4/6/8 s, then reverted to the existing 5/10/15/20 s: it only runs after the
   step has already failed, so there was no gain to measure and one less retry
   margin on the failure it exists for.
+
+- **Opt-in Intel leg** (2026-10-27) — `build_macos_x86_64`, default `false`.
+  A job-level `if` cannot see `matrix` (GitHub evaluates the condition before
+  expanding the matrix) and a matrix entry cannot be dropped by an expression,
+  so the new `plan-macos` job emits the `build-osx` matrix itself and also
+  publishes `build_x86_64`, which `publish-hyperhle-release` uses to skip the
+  Intel download. `dev-scripts/package-hyperhle-release.sh` now treats the
+  Intel DMG as optional instead of aborting with "all platform builds must
+  succeed", and the publish job emits a warning when the release has no Intel
+  download. The Intel-only `test-macos` job is deliberately unchanged: it is
+  the only runner that can run the x86_64 TestApp, and tests are not optional.
 
 Not applied, deliberately: phases 3b and 3c (thin LTO, lld), because they
 change the shipped binary and need a measured before/after.
