@@ -1623,6 +1623,7 @@ fn glDrawTexfOES(
     width: GLfloat,
     height: GLfloat,
 ) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1642,6 +1643,7 @@ fn glDrawTexfOES(
     })
 }
 fn glDrawTexiOES(env: &mut Environment, x: GLint, y: GLint, z: GLint, width: GLint, height: GLint) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1668,6 +1670,7 @@ fn glDrawTexxOES(
     width: GLfixed,
     height: GLfixed,
 ) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1687,29 +1690,34 @@ fn glDrawTexxOES(
     })
 }
 fn glDrawTexfvOES(env: &mut Environment, coords: ConstPtr<GLfloat>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexfvOES(coords) }
     })
 }
 fn glDrawTexivOES(env: &mut Environment, coords: ConstPtr<GLint>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexivOES(coords) }
     })
 }
 fn glDrawTexxvOES(env: &mut Environment, coords: ConstPtr<GLfixed>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexxvOES(coords) }
     })
 }
 fn glDrawTexsOES(env: &mut Environment, x: i16, y: i16, z: i16, width: i16, height: i16) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.DrawTexsOES(x, y, z, width, height)
     })
 }
 fn glDrawTexsvOES(env: &mut Environment, coords: ConstPtr<i16>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         unsafe { gles.DrawTexsvOES(coords) }
@@ -2041,6 +2049,8 @@ fn warn_invalid_draw_mode(what: &str, mode: GLenum) {
 }
 
 fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsizei) {
+    // Frame workload tally for the present-time probe (see `draw_stats`).
+    super::draw_stats::record_draw(count.max(0) as u64);
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -2379,6 +2389,7 @@ fn glDrawElements(
     type_: GLenum,
     indices: ConstVoidPtr,
 ) {
+    super::draw_stats::record_draw(count.max(0) as u64);
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -3052,6 +3063,7 @@ fn glTexImage2D(
     type_: GLenum,
     pixels: ConstVoidPtr,
 ) {
+    super::draw_stats::record_texture_upload();
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -3164,6 +3176,7 @@ fn glTexSubImage2D(
     type_: GLenum,
     pixels: ConstVoidPtr,
 ) {
+    super::draw_stats::record_texture_upload();
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
         let size = image_size_estimate(pixel_count, format, type_);
@@ -3184,6 +3197,7 @@ fn glCompressedTexImage2D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
+    super::draw_stats::record_texture_upload();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -3693,17 +3707,74 @@ fn glFramebufferRenderbufferOES(
                         depth_rb,
                     );
                     static FIRST: std::sync::Once = std::sync::Once::new();
+                    // `attachment` here is the *colour* attachment that
+                    // triggered the workaround (0x8ce0), not the one the depth
+                    // buffer went to; naming both avoids the reading that the
+                    // depth buffer was attached in place of the colour one.
                     let message = format!(
                         "Auto-attached depth renderbuffer ({w}x{h}) to FBO \
-                         target={target:#x} attach={attachment:#x}"
+                         target={target:#x} (triggered by colour attachment \
+                         {attachment:#x}; the depth buffer is at \
+                         GL_DEPTH_ATTACHMENT_OES 0x8d00)"
                     );
+                    // A framebuffer goes incomplete if the new attachment does
+                    // not match the colour buffer's dimensions or format, and
+                    // every draw into an incomplete framebuffer is discarded:
+                    // the window then shows through the layer, which presents
+                    // as an x-ray scene rather than as a black one. That would
+                    // be our workaround's fault, so check it (the guest has
+                    // this framebuffer bound, or we would be asking about a
+                    // different one) and undo the attachment if it went wrong.
+                    let mut bound_framebuffer: GLint = 0;
+                    gles.GetIntegerv(
+                        gles11::FRAMEBUFFER_BINDING_OES,
+                        &mut bound_framebuffer,
+                    );
+                    let status = if bound_framebuffer as GLuint == target {
+                        gles.CheckFramebufferStatusOES(target)
+                    } else {
+                        gles11::FRAMEBUFFER_COMPLETE_OES
+                    };
+                    if status != gles11::FRAMEBUFFER_COMPLETE_OES {
+                        // Undo the workaround: an incomplete framebuffer
+                        // discards every draw, so leaving our attachment in
+                        // place would be worse than the missing depth buffer
+                        // it was meant to compensate for. The app is back to
+                        // the behaviour it had before this workaround existed.
+                        gles.FramebufferRenderbufferOES(
+                            target,
+                            gles11::DEPTH_ATTACHMENT_OES,
+                            gles11::RENDERBUFFER_OES,
+                            0,
+                        );
+                        gles.DeleteRenderbuffersOES(1, &depth_rb);
+                        static INCOMPLETE_LOGGED: std::sync::Once =
+                            std::sync::Once::new();
+                        INCOMPLETE_LOGGED.call_once(|| {
+                            log!(
+                                "The auto-attached depth renderbuffer made FBO \
+                                 {target:#x} INCOMPLETE (status {status:#x}), so \
+                                 it has been detached and deleted again: every \
+                                 draw into an incomplete framebuffer is \
+                                 discarded, which would show the window \
+                                 through the layer instead of the scene. The \
+                                 app now runs without the missing-depth-buffer \
+                                 workaround on this framebuffer, so depth-tested \
+                                 geometry may show through. Please report this \
+                                 log line. [this log will only be shown once]"
+                            );
+                        });
+                    }
                     // Log the first one at normal level: it is the sentinel for
                     // "the guest relied on a depth buffer it never attached",
                     // which is exactly the shape of a black/see-through-scene
                     // bug report. The rest go to the debug log so an engine
                     // that recreates FBOs every frame can't flood the file.
-                    FIRST.call_once(|| log!("{message}"));
-                    log_dbg!("{message}");
+                    // Don't claim success when the attachment was reverted.
+                    if status == gles11::FRAMEBUFFER_COMPLETE_OES {
+                        FIRST.call_once(|| log!("{message}"));
+                    }
+                    log_dbg!("{message} (framebuffer status {status:#x})");
                 }
                 gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, prev_rb as GLuint);
             }
@@ -6812,6 +6883,9 @@ fn glDrawArraysInstanced(
     count: GLsizei,
     instance_count: GLsizei,
 ) {
+    super::draw_stats::record_draw(
+        (count.max(0) as u64) * (instance_count.max(0) as u64),
+    );
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.DrawArraysInstanced(mode, first, count, instance_count)
     });
@@ -6825,6 +6899,9 @@ fn glDrawElementsInstanced(
     indices: ConstVoidPtr,
     instance_count: GLsizei,
 ) {
+    super::draw_stats::record_draw(
+        (count.max(0) as u64) * (instance_count.max(0) as u64),
+    );
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let mut buf: GLint = 0;
         gles.GetIntegerv(ELEMENT_ARRAY_BUFFER_BINDING, &mut buf);

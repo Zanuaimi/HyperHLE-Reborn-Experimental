@@ -186,6 +186,48 @@ path in `src/paths.rs`. None of them is compiled yet.
    `<user data>/touchHLE_dumps/` beside `touchHLE_log.txt` instead of
    hardcoded `/tmp/a8run/...` paths.
 
+### 2.5 Round-28 diagnostics (2026-10-27, after `v1.1.1`)
+
+The user reported that `v1.1.1` still shows x-ray sprites and black shaders and
+that the log carried no probe output, because the probe was still gated on a
+picker switch that is off by default. Changes:
+
+1. **`src/frameworks/opengles/draw_stats.rs` (new).** Process-global
+   `AtomicU64` counters for draws, vertices and texture uploads.
+   `record_draw(n)` / `record_texture_upload()` are called from
+   `gles_guest.rs::{glDrawArrays, glDrawElements, glDrawArraysInstanced,
+   glDrawElementsInstanced}` and `{glTexImage2D, glTexSubImage2D,
+   glCompressedTexImage2D}`; `take_frame_workload()` swaps them to zero and
+   `describe(FrameWorkload)` turns the numbers into one English clause. Two unit
+   tests; the reset test makes no zero-start assumption because the counters are
+   global.
+2. **`probe_readback_content` is ungated.** Signature is now
+   `fn probe_readback_content(pixels: &[u8], width: u32, height: u32)` — a
+   removed parameter, so any older caller must be updated. The pixels are
+   already in RAM on this route, so the cost is one strided pass per printed
+   frame, and the counters are drained on *every* present so the printed counts
+   mean "since the previous present".
+3. **`log_drawable_capabilities_once`** (new, in `eagl.rs`, called from both
+   presenters before the read) prints `ALPHA_BITS` / `DEPTH_BITS` /
+   `STENCIL_BITS` and the guest's fixed-function state at the first presented
+   frame. ES 1.1 with a real fixed-function pipeline only (native ES 1.1 and
+   ES1-on-GL2): it returns immediately when `gles.is_es2()`, because several of
+   those enums are invalid outside ES 1.1 — the ES1-on-ES2 translator would
+   forward them to an ES 2.0 host and the app would see a `GL_INVALID_ENUM` of
+   ours in its own error queue — and the state being described does not exist
+   there anyway. It does not call `glGetError`, for the same reason: the app may
+   be polling it.
+4. **`log_nonopaque_present_once` now also runs on the readback slow path**
+   (it was GPU-route only).
+5. **The depth auto-attach checks its own work**: after attaching (the guest
+   has the framebuffer bound at that point), it queries
+   `CheckFramebufferStatusOES`; if the FBO ended up incomplete — which discards
+   every draw and therefore looks exactly like the x-ray bug the workaround
+   exists to fix — it detaches and deletes the depth buffer again and logs once,
+   so the app is back to its pre-workaround behaviour instead of being left
+   with a framebuffer it cannot draw into. The attach message also names both
+   attachments.
+
 ### 2.4 Review pass over the uncompiled rendering work (2026-10-27)
 
 A read-through of everything since `babfe011`, looking for the kind of defect
@@ -309,21 +351,40 @@ a regression introduced by this fork. Do not re-open that theory.
 
 ### 3.5 Next experiments
 
-1. **Read the new probe line.** Any build from 2026-10-27 onward prints, on the
-   readback route and with Trace GL errors on:
+1. **Read the probe line — it no longer needs "Trace GL errors".** As of the
+   2026-10-27 round the readback probe is unconditional (`probe_readback_content`
+   lost its `trace_gl_errors` argument) and every probe line ends with the frame
+   workload tally from `src/frameworks/opengles/draw_stats.rs`:
 
-       [--trace-gl-errors] present_renderbuffer readback content probe
-       (frame=N, WxH): BL=(r,g,b,a) BR=… TL=… TR=… CENTER=… |
-       n/total sampled pixels match CENTER, m/total are black | verdict
+       present_renderbuffer readback content probe (frame=N, WxH):
+       BL=… BR=… TL=… TR=… CENTER=… | n/total match CENTER, m/total are black |
+       <verdict> | <workload>
 
-   `verdict` is `all black`, `flat`, `content present`, or `unknown`. Grep:
+   `verdict` is `all black`, `flat`, `content present`, or `unknown`; `workload`
+   is one of "the guest submitted no draws between these presents", "every draw
+   was empty", "N draws / M vertices / K texture uploads". Grep:
 
-       grep -iE "readback content probe|renderbuffer-content probe|eagl presenter|non-opaque layer"
+       grep -iE "readback content probe|Drawable capabilities|non-opaque layer|auto-attached depth|INCOMPLETE"
 
-   - `all black` / `flat` → hypothesis (1): the frame really is empty, look at
-     what the guest is (not) drawing.
-   - `content present` → hypothesis (2): compare a screenshot with the buffer.
-     Buffer right + screen wrong = presentation path; both wrong = upstream.
+   - `all black` / `flat` + `no draws` → hypothesis (1): the frame is empty
+     because the guest drew nothing. Look at what the guest is (not) calling.
+   - `all black` + `N draws` → the guest is drawing and the draws produce
+     nothing: state, feature detection or a stubbed entry point *inside* the
+     draw, not presentation.
+   - `content present` → hypothesis (2): the buffer is right, so the picture is
+     changed on its way to the screen.
+
+   One line before it, once per session:
+
+       Drawable capabilities at the first presented frame: ALPHA_BITS=…
+       DEPTH_BITS=… STENCIL_BITS=… | guest state: depth_test=…
+       alpha_test=… blend=… cull_face=… scissor_test=… texture_2d=…
+       lighting=… (N of 8 lights enabled) fog=… color_material=…
+
+   Read it as: `depth_test=true` with `DEPTH_BITS=0` means depth-tested
+   fragments against no depth attachment (x-ray); `lighting=true` with
+   `0 of 8 lights enabled` means lit geometry renders black; `ALPHA_BITS=0`
+   means the frame has no alpha to blend with.
 2. **Watch how the trace attributes errors.** Two new lines exist:
    "Drained GL errors raised by touchHLE's own start-up probes…" (once, right
    after the context is created) and
@@ -391,6 +452,36 @@ merge such a commit; the previous attempt was reverted (`ec989ed`).
     2026-10-27 the pre-call drain was silent, so a stale error was
     indistinguishable from one the call itself raised. Read the
     "… pending before a call dispatched from" line when present.
+
+### 3.7 Getting a build to test (2026-10-27, verified)
+
+- Pushes to a non-trunk branch do **not** trigger `.github/workflows/HyperHLE_release.yml`
+  (`on.push.branches` is `trunk` only). Creating the branch fired a `create`
+  run; later pushes fire nothing.
+- A `create` run builds every leg and uploads artifacts but **never publishes a
+  release**: `check-hyperhle-release` is gated to `push` on trunk or
+  `workflow_dispatch`, so `publish-hyperhle-release` is skipped.
+- `gh workflow run … --ref <branch>` and `gh run rerun --failed` are both
+  refused for this token (403 / "cannot be rerun"), and artifacts cannot be
+  downloaded from the sandbox at all: `api.github.com` hands back a redirect to
+  `productionresultssa11.blob.core.windows.net`, which is not on the sandbox's
+  outbound allowlist.
+- Therefore the only ways to get an installable APK are (a) the user downloads
+  the `HyperHLE_Android_AArch64` artifact from the run page in a browser, or
+  (b) the user starts the workflow from the Actions UI with **Publish a
+  HyperHLE release** ticked, which forces `should_release=true` and publishes
+  `v<next>` from whatever ref was chosen (pick this branch in the dropdown).
+- Round-28 run `40532708135` (this branch, `4afbbd7`): build-linux,
+  build-android, build-win, build-osx and test-macos all **success** — so the
+  round-28 code compiled and its unit tests passed on Linux, Android, Windows
+  and macOS. `build-ios` was **cancelled** (runner capacity, no steps recorded),
+  which is what blocked `check-hyperhle-release` and `publish-hyperhle-release`.
+- PR run `40542600484` (`824fea6`, PR #5): build-linux, build-android,
+  build-win, build-osx and test-macos **success**; `build-ios` **cancelled**
+  again with `runner_name` empty and no steps — it waited 15 minutes for a
+  `macos-latest` runner and never got one. That is capacity, not code: the same
+  commit range compiled and passed unit tests on the other four platforms. A
+  pull request never reaches `check-hyperhle-release`/`publish-*` anyway.
 
 ---
 
