@@ -218,6 +218,13 @@ pub fn base_min_filter(min_filter: GLint) -> Option<GLint> {
     }
 }
 
+// `GL_TEXTURE_CUBE_MAP` and its faces. The generated ES 1.1 bindings module
+// does not export them (the registry entry they come from is not part of the
+// ES 1.1 core set), so spell the values out, as `gles_guest` already does.
+const TEXTURE_CUBE_MAP: GLenum = 0x8513;
+const TEXTURE_CUBE_MAP_POSITIVE_X: GLenum = 0x8515;
+const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
+
 /// The texture target whose object carries the parameters for `target`.
 ///
 /// Cube-map faces are separate targets for state purposes but share one
@@ -225,10 +232,10 @@ pub fn base_min_filter(min_filter: GLint) -> Option<GLint> {
 /// parameters requested for `GL_TEXTURE_CUBE_MAP_POSITIVE_X` and friends have
 /// to be applied to `GL_TEXTURE_CUBE_MAP` itself.
 pub fn tex_parameter_target(target: GLenum) -> GLenum {
-    let is_cube_face = (gles11::TEXTURE_CUBE_MAP_POSITIVE_X..=gles11::TEXTURE_CUBE_MAP_NEGATIVE_Z)
+    let is_cube_face = (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z)
         .contains(&target);
     if is_cube_face {
-        gles11::TEXTURE_CUBE_MAP
+        TEXTURE_CUBE_MAP
     } else {
         target
     }
