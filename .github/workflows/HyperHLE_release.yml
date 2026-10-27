@@ -5,8 +5,9 @@ on:
     inputs:
       build_macos_x86_64:
         description: >-
-          Build the macOS Intel (x86_64) DMG too (slowest runner; leave unticked
-          unless an Intel Mac needs this release)
+          Build the macOS Intel (x86_64) DMG too. Opt-in on purpose: that leg is
+          the slowest and scarcest runner and adds 25-30 minutes to the run.
+          Leave unticked unless an Intel Mac needs this release.
         type: boolean
         default: false
       publish_hyperhle_release:
@@ -52,14 +53,16 @@ jobs:
       - name: Decide which macOS targets to build
         id: plan
         env:
-          # Empty on `push`, `pull_request` and `create`, where workflow
-          # dispatch inputs do not exist at all; treated like an unticked box.
-          BUILD_MACOS_X86_64: ${{ inputs.build_macos_x86_64 }}
+          # `inputs` does not exist on `push`, `pull_request` or `create`, so
+          # the `||` supplies the unticked-box value instead of an empty or
+          # missing variable (the script repeats the fallback because `set -u`
+          # would otherwise turn a missing variable into a failed step).
+          BUILD_MACOS_X86_64: ${{ inputs.build_macos_x86_64 || 'false' }}
         run: |
           set -eu
           arm='{"target":"aarch64-apple-darwin","runner":"macos-15","artifact":"HyperHLE_macOS_AArch64"}'
           intel='{"target":"x86_64-apple-darwin","runner":"macos-15-intel","artifact":"HyperHLE_macOS_x86_64"}'
-          if [ "$BUILD_MACOS_X86_64" = "true" ]; then
+          if [ "${BUILD_MACOS_X86_64:-false}" = "true" ]; then
             echo "build_x86_64=true" >> "$GITHUB_OUTPUT"
             echo "matrix={\"include\":[$intel,$arm]}" >> "$GITHUB_OUTPUT"
           else
