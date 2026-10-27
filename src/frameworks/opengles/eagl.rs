@@ -501,6 +501,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         unsafe {
             gles_ctx.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
         }
+        unsafe { drain_startup_gl_errors(gles_ctx.as_mut()) };
         framebuffer as GLuint
     };
 
@@ -551,6 +552,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         unsafe {
             gles_ctx.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
         }
+        unsafe { drain_startup_gl_errors(gles_ctx.as_mut()) };
         framebuffer as GLuint
     };
 
@@ -1312,6 +1314,11 @@ pub const CLASSES: ClassExports = objc_classes! {
             return false;
         };
         dump_readback_ppm(&pixels_vec, width, height);
+        // The GPU-present route probes its renderbuffer, but this route did
+        // not, so "the picture is black/x-ray" reports from users on the
+        // readback presenter had no pixel-level evidence attached. Same frame
+        // schedule as the GPU-route probe, so the two can be compared.
+        probe_readback_content(&pixels_vec, width, height, env.options.trace_gl_errors);
         // DIAG (TOUCHHLE_TRACE_PRESENT=1): is the frame we read back actually
         // non-black? This tells apart "renderer produced a black frame"
         // (content/loading) from "we present fine but the pixels never reach
@@ -1363,6 +1370,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+/// Drain the GL error queue after touchHLE's own start-up probes, so the
+/// guest does not observe them.
+///
+/// touchHLE's start-up probes (extension, version and capability queries, and
+/// whatever a backend checks while it initialises) run on the same host
+/// context — and therefore the same `glGetError` queue — as the guest app.
+/// Strict drivers raise `GL_INVALID_ENUM` for some of those probes. That is
+/// harmless in itself: the emulated device is an iPhone OS PowerVR driver that
+/// would have accepted them. Left in the queue, though, such an error is the
+/// *first* thing the guest's own `glGetError` call returns, so an app that
+/// error-checks its set-up (common in middleware such as Unity and Cocos2d)
+/// takes a failure path it would never take on a real device, and a
+/// `--trace-gl-errors` log shows an error next to whichever innocent GL call
+/// happened to come next.
+///
+/// Must be called before the guest can make any GL call of its own.
+unsafe fn drain_startup_gl_errors(gles: &mut dyn GLES) {
+    if drain_gl_errors(gles) {
+        log_dbg!("Drained touchHLE's own start-up GL errors");
+    }
+}
+
 /// Dump one renderbuffer readback to a PPM for black-screen diagnosis
 /// (env var gated, as this is a developer-only diagnostic).
 fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
@@ -1386,17 +1415,144 @@ fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
         rgb.extend_from_slice(&[px[0], px[1], px[2]]);
     }
     out.extend_from_slice(&rgb);
-    let path = format!("/tmp/a8run/readback_f{}.ppm", targets[idx]);
+    // Dumps go next to the log file, not to a hardcoded `/tmp` path that does
+    // not exist on Android or iOS.
+    let name = format!("readback_f{}.ppm", targets[idx]);
+    let Some(path) = crate::paths::diagnostic_dump_path(&name) else {
+        return;
+    };
     match std::fs::write(&path, &out) {
         Ok(()) => log!(
             "Dumped renderbuffer readback #{} ({}x{}) to {}",
             n,
             width,
             height,
-            path
+            path.display()
         ),
-        Err(e) => log!("Failed to dump readback to {}: {}", path, e),
+        Err(e) => log!("Failed to dump readback to {}: {}", path.display(), e),
     }
+}
+
+/// Turn the frame-content counts from [probe_readback_content] into one
+/// sentence. Kept separate from the logging so the classification can be
+/// tested, and so both present routes describe a frame the same way.
+fn frame_content_verdict(sampled: u32, matching_centre: u32, black: u32) -> &'static str {
+    if sampled == 0 {
+        // Nothing was sampled: treat it as "we know nothing", not as "flat".
+        "unknown: no pixels sampled"
+    } else if black == sampled {
+        "all black: every sampled pixel is (0,0,0) (nothing drawn, or a failed upload)"
+    } else if matching_centre == sampled {
+        "flat: every sampled pixel equals CENTER (nothing drawn, or only a clear)"
+    } else {
+        "content present: the frame is not a single colour"
+    }
+}
+
+/// Report what the presented frame actually contains, once the frame has been
+/// read back from the renderbuffer.
+///
+/// The GPU-copy present route already probes its renderbuffer (see the
+/// "renderbuffer-content probe" line), but the RAM-readback route — the one
+/// `--force-composition` takes, and the one iOS-era games end up on when their
+/// drawable is not an opaque fullscreen layer — had no pixel-level diagnostic
+/// at all. That is backwards: the readback route is the one whose output can be
+/// wrong for reasons that have nothing to do with the guest's drawing (the
+/// readback itself, the compositor's upload, the blend used to composite it).
+///
+/// Five samples plus a coarse "is this a single flat colour" count separate the
+/// two worlds that "the screen is black / see-through" reports conflate:
+///
+/// - all five samples equal and the flat-colour count covers the whole frame:
+///   the guest drew nothing (or only a clear), so the bug is upstream of
+///   presentation — depth/alpha/cull state, texture uploads, or a missing
+///   draw;
+/// - samples differ: the guest drew something, and the picture reaching the
+///   window is being mangled afterwards (compositor alpha, upload format,
+///   scale/placement) or is correct and the complaint is about the scene's
+///   content (the "x-ray" look), not the transport.
+///
+/// Gated on `--trace-gl-errors`, and sampled on the same frame schedule as the
+/// GPU-route probe so the two can be compared.
+fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_errors: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    if !trace_gl_errors {
+        return;
+    }
+    let count = PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+    let should_log = matches!(count, 0 | 1 | 5 | 30 | 120 | 600) || count.is_multiple_of(600);
+    if !should_log {
+        return;
+    }
+    if width == 0 || height == 0 || pixels.len() < 4 {
+        log!("Readback content probe (frame={count}): empty frame buffer");
+        return;
+    }
+    let pixel_at = |x: u32, y: u32| -> [u8; 4] {
+        let x = x.min(width - 1);
+        let y = y.min(height - 1);
+        let offset = ((y as usize) * (width as usize) + (x as usize)) * 4;
+        let mut px = [0u8; 4];
+        if let Some(slice) = pixels.get(offset..offset + 4) {
+            px.copy_from_slice(slice);
+        }
+        px
+    };
+    let bl = pixel_at(0, 0);
+    let br = pixel_at(width - 1, 0);
+    let tl = pixel_at(0, height - 1);
+    let tr = pixel_at(width - 1, height - 1);
+    let centre = pixel_at(width / 2, height / 2);
+    // How much of the frame matches the centre pixel? A frame that is one flat
+    // colour everywhere is the signature of "nothing was drawn into it".
+    let mut sampled = 0u32;
+    let mut matching_centre = 0u32;
+    let mut black = 0u32;
+    for px in pixels.chunks_exact(4).step_by(61) {
+        sampled += 1;
+        if px[..3] == centre[..3] {
+            matching_centre += 1;
+        }
+        if px[0] == 0 && px[1] == 0 && px[2] == 0 {
+            black += 1;
+        }
+    }
+    let verdict = frame_content_verdict(sampled, matching_centre, black);
+    log!(
+        "Readback content probe (frame={}, {}x{}): \
+         BL=({},{},{},{}) BR=({},{},{},{}) TL=({},{},{},{}) TR=({},{},{},{}) \
+         CENTER=({},{},{},{}) | {}/{} sampled pixels match CENTER, \
+         {}/{} are black | {}",
+        count,
+        width,
+        height,
+        bl[0],
+        bl[1],
+        bl[2],
+        bl[3],
+        br[0],
+        br[1],
+        br[2],
+        br[3],
+        tl[0],
+        tl[1],
+        tl[2],
+        tl[3],
+        tr[0],
+        tr[1],
+        tr[2],
+        tr[3],
+        centre[0],
+        centre[1],
+        centre[2],
+        centre[3],
+        matching_centre,
+        sampled,
+        black,
+        sampled,
+        verdict,
+    );
 }
 
 /// One-shot diagnostic for "the picture looks see-through / x-ray when Force
@@ -1485,6 +1641,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         return;
     };
     dump_readback_ppm(&pixels, width, height);
+    probe_readback_content(&pixels, width, height, env.options.trace_gl_errors);
     log_nonopaque_present_once(env, drawable, &pixels);
     present_pixels(env, drawable, pixels, width, height);
     let force_composition = env.options.force_composition;
@@ -4099,6 +4256,37 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         }
     }
     false
+}
+
+#[cfg(test)]
+mod frame_content_tests {
+    use super::frame_content_verdict;
+
+    #[test]
+    fn a_frame_that_is_entirely_black_is_its_own_verdict() {
+        // Black is the commonest "nothing rendered" report, so it must not be
+        // reported as merely "flat".
+        assert!(frame_content_verdict(10, 0, 10).starts_with("all black"));
+    }
+
+    #[test]
+    fn a_frame_of_one_flat_colour_is_flat_but_not_black() {
+        // Every pixel equals the centre sample, and none of them are black:
+        // the app drew a solid background and nothing else.
+        assert!(frame_content_verdict(10, 10, 0).starts_with("flat"));
+    }
+
+    #[test]
+    fn a_frame_with_varied_pixels_has_content() {
+        assert!(frame_content_verdict(10, 3, 2).starts_with("content present"));
+    }
+
+    #[test]
+    fn an_empty_sample_set_is_unknown_rather_than_flat() {
+        // `matching_centre == sampled` is trivially true when nothing was
+        // sampled; reporting that as "flat" would be a false positive.
+        assert!(frame_content_verdict(0, 0, 0).starts_with("unknown"));
+    }
 }
 
 #[cfg(test)]

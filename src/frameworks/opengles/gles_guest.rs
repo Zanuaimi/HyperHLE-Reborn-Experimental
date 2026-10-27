@@ -1546,8 +1546,15 @@ fn glCompressedTexSubImage2D(
                             let b = (px as u32).to_le_bytes();
                             ppm.extend_from_slice(&[b[0], b[1], b[2]]);
                         }
-                        let _ = std::fs::write(format!("tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format), &ppm);
-                        log!("DUMP-TEX wrote tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format);
+                        let name = format!("pvrtc_tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format);
+                        if let Some(path) = crate::paths::diagnostic_dump_path(&name) {
+                            match std::fs::write(&path, &ppm) {
+                                Ok(()) => log!("DUMP-TEX wrote {}", path.display()),
+                                Err(e) => {
+                                    log!("DUMP-TEX failed to write {}: {}", path.display(), e)
+                                }
+                            }
+                        }
                     }
                 }
                 // PVRTC compressed subimages may only replace a complete level.
@@ -2443,7 +2450,11 @@ fn glDrawElements(
                         0x1401, /* GL_UNSIGNED_BYTE */
                         pix.as_mut_ptr() as *mut _,
                     );
-                    dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, "/tmp/a8run/fb_after_larger_draw.ppm");
+                    if let Some(path) =
+                        crate::paths::diagnostic_dump_path("fb_after_larger_draw.ppm")
+                    {
+                        dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, &path);
+                    }
                 }
                 let mut err = gles.GetError();
                 let mut errs = Vec::new();
@@ -3099,10 +3110,10 @@ fn glTexImage2D(
                     let buf: Vec<u8> = mem
                         .bytes_at(guest_pixels.cast::<u8>(), byte_size as u32)
                         .to_vec();
-                    let path = format!(
-                        "/tmp/a8run/tex{}_id{}_{}x{}.ppm", n, tex_id, width, height
-                    );
-                    dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
+                    let name = format!("tex{}_id{}_{}x{}.ppm", n, tex_id, width, height);
+                    if let Some(path) = crate::paths::diagnostic_dump_path(&name) {
+                        dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
+                    }
                 }
             }
         }
@@ -3765,7 +3776,14 @@ fn glIsRenderbuffer(env: &mut Environment, renderbuffer: GLuint) -> GLboolean {
 }
 /// Dump raw pixel data (RGB) to a PPM file for diagnosis. Supports the
 /// formats Geometry Dash / cocos2d-x use (RGBA8, RGBA4444, RGB565).
-pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32, path: &str) {
+pub fn dump_rgb_ppm(
+    pix: &[u8],
+    width: u32,
+    height: u32,
+    format: u32,
+    type_: u32,
+    path: &std::path::Path,
+) {
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     match (format, type_) {
         (0x1908, 0x1401) => {
@@ -3800,8 +3818,8 @@ pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32
     let mut out = header.into_bytes();
     out.extend_from_slice(&rgb);
     match std::fs::write(path, &out) {
-        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path),
-        Err(e) => log!("Failed to dump pixels to {}: {}", path, e),
+        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path.display()),
+        Err(e) => log!("Failed to dump pixels to {}: {}", path.display(), e),
     }
 }
 

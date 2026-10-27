@@ -134,6 +134,13 @@ pub const SQLITE_DIR: &str = "touchHLE_sqlite";
 /// the Photo Album.
 pub const PHOTO_ALBUM_DIR: &str = "DCIM/100APPLE";
 
+/// Name of the directory where developer-only diagnostic dumps are written:
+/// PPM captures of presented frames, decoded texture atlases, and so on.
+///
+/// These are not guest-visible files and nothing in the emulator reads them
+/// back, so they live next to the log rather than in [SANDBOX_DIR].
+pub const DIAGNOSTIC_DUMP_DIR: &str = "touchHLE_dumps";
+
 /// Get a platform-specific base path needed for accessing touchHLE's
 /// user-modifiable files. This is empty on platforms other than Android.
 pub fn user_data_base_path() -> Cow<'static, Path> {
@@ -175,6 +182,31 @@ pub fn user_data_base_path() -> Cow<'static, Path> {
         }
         Cow::from(Path::new("."))
     }
+}
+
+/// Get the path of a developer-only diagnostic dump file, creating the
+/// directory it lives in if necessary.
+///
+/// Diagnostics used to be written to hardcoded `/tmp/...` paths. That works on
+/// a Linux desktop and nowhere else: Android has no writable `/tmp`, and an
+/// iOS app container is sandboxed, so the dumps silently failed on exactly the
+/// platforms that produce "the screen is black" bug reports. Writing next to
+/// the log file means a dump turns up wherever the user already knows how to
+/// find `touchHLE_log.txt`, and can be attached to a report.
+///
+/// Returns [None] (after logging) if the directory could not be created. These
+/// are called from the middle of a frame, so failure must not be fatal.
+pub fn diagnostic_dump_path(file_name: &str) -> Option<PathBuf> {
+    let dir = user_data_base_path().join(DIAGNOSTIC_DUMP_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log!(
+            "Couldn't create diagnostic dump directory {}: {}",
+            dir.display(),
+            e
+        );
+        return None;
+    }
+    Some(dir.join(file_name))
 }
 
 /// The Android application id, as set by `applicationId` in
