@@ -147,11 +147,18 @@ impl GLESContext for GLES1NativeContext {
         gles11::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = unsafe { detect_pvrtc_support() };
-            self.discard_ext =
-                unsafe { host_extension_present("GL_EXT_discard_framebuffer") };
+            // One `GL_EXTENSIONS` query answers every capability question
+            // below, and it has to happen with this context current.
+            let extensions = unsafe { host_extension_list() };
+            let has_extension = |name: &str| {
+                extensions
+                    .as_deref()
+                    .is_some_and(|list| extension_list_contains(list, name))
+            };
+            self.pvrtc_native = has_extension("GL_IMG_texture_compression_pvrtc");
+            self.discard_ext = has_extension("GL_EXT_discard_framebuffer");
             self.discard_ext_checked = true;
-            self.palette_ext = unsafe { host_extension_present("GL_OES_matrix_palette") };
+            self.palette_ext = has_extension("GL_OES_matrix_palette");
             self.pvrtc_native_checked = true;
             log!(
                 "GLES1Native: GL_IMG_texture_compression_pvrtc {} (PVRTC textures will \
@@ -211,10 +218,16 @@ impl GLESContext for GLES1NativeContext {
         gles11::load_with(loader_fn);
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = detect_pvrtc_support();
-            self.discard_ext = host_extension_present("GL_EXT_discard_framebuffer");
+            let extensions = host_extension_list();
+            let has_extension = |name: &str| {
+                extensions
+                    .as_deref()
+                    .is_some_and(|list| extension_list_contains(list, name))
+            };
+            self.pvrtc_native = has_extension("GL_IMG_texture_compression_pvrtc");
+            self.discard_ext = has_extension("GL_EXT_discard_framebuffer");
             self.discard_ext_checked = true;
-            self.palette_ext = host_extension_present("GL_OES_matrix_palette");
+            self.palette_ext = has_extension("GL_OES_matrix_palette");
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES1Native {
@@ -253,28 +266,6 @@ unsafe fn host_extension_list() -> Option<String> {
         return None;
     }
     Some(s.to_owned())
-}
-
-/// Return whether the host ES 1.1 driver advertises
-/// `GL_IMG_texture_compression_pvrtc`.
-///
-/// Returns `false` on any driver-reported error; software-decoding PVRTC is the
-/// safe-default behaviour.
-unsafe fn detect_pvrtc_support() -> bool {
-    match host_extension_list() {
-        Some(list) => extension_list_contains(&list, "GL_IMG_texture_compression_pvrtc"),
-        None => false,
-    }
-}
-
-/// Whether the host ES 1.1 driver advertises `name` (e.g.
-/// `GL_EXT_discard_framebuffer`, `GL_OES_matrix_palette`). Must be called with
-/// a current GL context.
-unsafe fn host_extension_present(name: &str) -> bool {
-    match host_extension_list() {
-        Some(list) => extension_list_contains(&list, name),
-        None => false,
-    }
 }
 
 /// One-shot warning for a guest that submits palette skinning even though the
