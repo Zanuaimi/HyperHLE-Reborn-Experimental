@@ -29,12 +29,18 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 pub struct State {
     /// Current EAGLContext for each thread
     current_ctxs: std::collections::HashMap<crate::ThreadId, Option<crate::objc::id>>,
-    /// `glGetString()` results cache, keyed by `(is_es2, name)` so that an
-    /// ES 2.0 context does not return the ES 1.1 `OpenGL ES-CM 1.1` version
-    /// string (Bad Piggies / Unity 3.5 checks the version string to decide
-    /// which renderer code path to use — mismatching the API leaves Unity in
-    /// a half-initialised ES 2.0 path that emits torn / overlapping frames).
-    strings_cache: std::collections::HashMap<(bool, GLenum), ConstPtr<u8>>,
+    /// `glGetString()` results cache, keyed by `(is_es2, matrix_palette,
+    /// name)` so that an ES 2.0 context does not return the ES 1.1
+    /// `OpenGL ES-CM 1.1` version string (Bad Piggies / Unity 3.5 checks the
+    /// version string to decide which renderer code path to use — mismatching
+    /// the API leaves Unity in a half-initialised ES 2.0 path that emits torn /
+    /// overlapping frames).
+    ///
+    /// `matrix_palette` is part of the key because the ES 1.1 `GL_EXTENSIONS`
+    /// string advertises `GL_OES_matrix_palette` only when the active backend
+    /// can honour it (see `GLES::supports_matrix_palette`), and the backend can
+    /// change between sessions if the renderer is recreated.
+    strings_cache: std::collections::HashMap<(bool, bool, GLenum), ConstPtr<u8>>,
     /// Guest `GLsync` handles (`glFenceSync` / `glFenceSyncAPPLE`). Host
     /// `GLsync` values are pointers and don't fit in a 32-bit guest value,
     /// so the guest gets an opaque handle into this table instead.

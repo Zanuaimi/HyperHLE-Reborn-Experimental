@@ -59,6 +59,20 @@ pub struct GLES1NativeContext {
     /// system RAM at the end of a frame.
     discard_ext: bool,
     discard_ext_checked: bool,
+    /// Whether the host ES 1.1 driver advertises `GL_OES_matrix_palette`
+    /// (hardware vertex skinning). Checked together with `pvrtc_native` in
+    /// `make_current`, for the same reason: it needs a current context.
+    ///
+    /// Unlike PVRTC there is no software fallback here: palette skinning is a
+    /// pipeline feature, not a file format. So this flag exists to tell the
+    /// guest the truth, via `GLES::supports_matrix_palette`. When the host
+    /// lacks the extension (ANGLE's ES 1.1 front-end, the desktop GLES1
+    /// emulation layers, most mobile ES 1.1 drivers other than Adreno's),
+    /// the guest-visible extension string omits it and the game keeps using
+    /// its own skinning path, instead of submitting palette-skinned meshes
+    /// whose transforms are dropped and which therefore render black or
+    /// see-through.
+    palette_ext: bool,
 }
 
 /// Texture parameters that only exist in OpenGL ES 2.0+ (or are otherwise
@@ -120,6 +134,7 @@ impl GLESContext for GLES1NativeContext {
             pvrtc_native_checked: false,
             discard_ext: false,
             discard_ext_checked: false,
+            palette_ext: false,
         })
     }
 
@@ -133,6 +148,7 @@ impl GLESContext for GLES1NativeContext {
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
                 discard_ext: self.discard_ext,
+                palette_ext: self.palette_ext,
             });
         }
 
@@ -146,6 +162,7 @@ impl GLESContext for GLES1NativeContext {
             self.discard_ext =
                 unsafe { host_extension_present("GL_EXT_discard_framebuffer") };
             self.discard_ext_checked = true;
+            self.palette_ext = unsafe { host_extension_present("GL_OES_matrix_palette") };
             self.pvrtc_native_checked = true;
             log!(
                 "GLES1Native: GL_IMG_texture_compression_pvrtc {} (PVRTC textures will \
@@ -161,12 +178,28 @@ impl GLESContext for GLES1NativeContext {
                     "software-decoded to RGBA before upload"
                 },
             );
+            log!(
+                "GLES1Native: GL_OES_matrix_palette {} (guest skinning will use \
+                 {})",
+                if self.palette_ext {
+                    "advertised by host driver"
+                } else {
+                    "NOT advertised by host driver"
+                },
+                if self.palette_ext {
+                    "the GPU palette path"
+                } else {
+                    "the app's own skinning path, because the extension is \
+                     withheld from GL_EXTENSIONS"
+                },
+            );
         }
         Box::new(GLES1Native {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
             discard_ext: self.discard_ext,
+            palette_ext: self.palette_ext,
         })
     }
 
@@ -181,6 +214,7 @@ impl GLESContext for GLES1NativeContext {
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
                 discard_ext: self.discard_ext,
+                palette_ext: self.palette_ext,
             });
         }
 
@@ -191,6 +225,7 @@ impl GLESContext for GLES1NativeContext {
             self.pvrtc_native = detect_pvrtc_support();
             self.discard_ext = host_extension_present("GL_EXT_discard_framebuffer");
             self.discard_ext_checked = true;
+            self.palette_ext = host_extension_present("GL_OES_matrix_palette");
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES1Native {
@@ -198,42 +233,77 @@ impl GLESContext for GLES1NativeContext {
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
             discard_ext: self.discard_ext,
+            palette_ext: self.palette_ext,
         })
     }
 }
 
-/// Query `GL_EXTENSIONS` on the currently-bound OpenGL ES 1.1 context and
-/// return whether it advertises `GL_IMG_texture_compression_pvrtc`.
+/// Whether a space-separated `GL_EXTENSIONS` list contains `name`.
 ///
-/// Must be called with a current GL context. Returns `false` on any
-/// driver-reported error (NULL string, non-UTF-8 string, missing token);
-/// software-decoding PVRTC is the safe-default behaviour.
-unsafe fn detect_pvrtc_support() -> bool {
-    let raw = gles11::GetString(gles11::EXTENSIONS);
-    if raw.is_null() {
-        return false;
-    }
-    let Ok(s) = CStr::from_ptr(raw as *const _).to_str() else {
-        return false;
-    };
-    if s.is_empty() {
-        return false;
-    }
-    s.split(' ')
-        .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
+/// GL extension strings are space-separated and conventionally end with a
+/// space, so splitting on `' '` yields a trailing empty token; comparing whole
+/// tokens (rather than substring-searching) keeps `GL_OES_matrix_palette` from
+/// matching a hypothetical longer name, and keeps the empty token from matching
+/// a request for `""`.
+fn extension_list_contains(list: &str, name: &str) -> bool {
+    !name.is_empty() && list.split(' ').any(|ext| ext == name)
 }
 
-/// Whether the host ES 1.1 driver exports `glDiscardFramebufferEXT`
-/// (`GL_EXT_discard_framebuffer`). Must be called with a current GL context.
-unsafe fn host_extension_present(name: &str) -> bool {
+/// Query `GL_EXTENSIONS` on the currently-bound OpenGL ES 1.1 context.
+///
+/// Must be called with a current GL context. Returns `None` if the driver
+/// reports no usable string (NULL, non-UTF-8, or empty), in which case every
+/// capability question has to be answered conservatively.
+unsafe fn host_extension_list() -> Option<String> {
     let raw = gles11::GetString(gles11::EXTENSIONS);
     if raw.is_null() {
-        return false;
+        return None;
     }
-    let Ok(s) = CStr::from_ptr(raw as *const _).to_str() else {
-        return false;
-    };
-    s.split(' ').any(|ext| ext == name)
+    let s = CStr::from_ptr(raw as *const _).to_str().ok()?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_owned())
+}
+
+/// Return whether the host ES 1.1 driver advertises
+/// `GL_IMG_texture_compression_pvrtc`.
+///
+/// Returns `false` on any driver-reported error; software-decoding PVRTC is the
+/// safe-default behaviour.
+unsafe fn detect_pvrtc_support() -> bool {
+    match host_extension_list() {
+        Some(list) => extension_list_contains(&list, "GL_IMG_texture_compression_pvrtc"),
+        None => false,
+    }
+}
+
+/// Whether the host ES 1.1 driver advertises `name` (e.g.
+/// `GL_EXT_discard_framebuffer`, `GL_OES_matrix_palette`). Must be called with
+/// a current GL context.
+unsafe fn host_extension_present(name: &str) -> bool {
+    match host_extension_list() {
+        Some(list) => extension_list_contains(&list, name),
+        None => false,
+    }
+}
+
+/// One-shot warning for a guest that submits palette skinning even though the
+/// extension was withheld from its `GL_EXTENSIONS` string (some apps never
+/// feature-test, and a context can outlive a renderer change).
+fn log_matrix_palette_unsupported(profile: &'static str) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        log!(
+            "Call to a GL_OES_matrix_palette entry point on {}: the host ES 1.1 \
+             driver has no palette pipeline, so the call is ignored and skinned \
+             meshes are drawn without their palette transforms (which usually \
+             looks like black or see-through geometry). GL_OES_matrix_palette is \
+             withheld from the guest's GL_EXTENSIONS string so apps that \
+             feature-test it use their own skinning path instead.",
+            profile
+        );
+    });
 }
 
 pub struct GLES1Native<'gl_ctx> {
@@ -257,6 +327,10 @@ pub struct GLES1Native<'gl_ctx> {
     /// Mirror of [`GLES1NativeContext::discard_ext`]; copied at make_current
     /// time so the per-call discard path doesn't have to re-query anything.
     discard_ext: bool,
+    /// Mirror of [`GLES1NativeContext::palette_ext`]; copied at make_current
+    /// time. Gates both the palette entry points below and
+    /// `GLES::supports_matrix_palette`.
+    palette_ext: bool,
 }
 
 impl GLES for GLES1Native<'_> {
@@ -266,6 +340,10 @@ impl GLES for GLES1Native<'_> {
 
     fn discard_ext_supported(&self) -> bool {
         self.discard_ext
+    }
+
+    fn supports_matrix_palette(&self) -> bool {
+        self.palette_ext
     }
 
     unsafe fn DiscardFramebufferEXT(
@@ -694,6 +772,58 @@ impl GLES for GLES1Native<'_> {
         pointer: *const GLvoid,
     ) {
         gles11::PointSizePointerOES(type_, stride, pointer)
+    }
+
+    // `GL_OES_matrix_palette` (hardware vertex skinning).
+    //
+    // A native ES 1.1 driver that advertises the extension (Qualcomm Adreno,
+    // PowerVR) performs the weighted palette transform itself, so the calls
+    // are pure passthrough there. ANGLE's ES 1.1 front-end and the desktop
+    // GLES1 emulation layers have no palette pipeline at all, so there is
+    // nothing to forward to; see `supports_matrix_palette` for why the guest
+    // must be told so rather than having these calls silently accepted.
+    unsafe fn CurrentPaletteMatrixOES(&mut self, matrixpaletteindex: GLuint) {
+        if self.palette_ext {
+            gles11::CurrentPaletteMatrixOES(matrixpaletteindex);
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
+    }
+
+    unsafe fn LoadPaletteFromModelViewMatrixOES(&mut self) {
+        if self.palette_ext {
+            gles11::LoadPaletteFromModelViewMatrixOES();
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
+    }
+
+    unsafe fn MatrixIndexPointerOES(
+        &mut self,
+        size: GLint,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
+        if self.palette_ext {
+            gles11::MatrixIndexPointerOES(size, type_, stride, pointer);
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
+    }
+
+    unsafe fn WeightPointerOES(
+        &mut self,
+        size: GLint,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
+        if self.palette_ext {
+            gles11::WeightPointerOES(size, type_, stride, pointer);
+        } else {
+            log_matrix_palette_unsupported(self.diagnostic_profile());
+        }
     }
 
     // Drawing
@@ -2009,5 +2139,24 @@ impl<'gl_ctx> GLES1Native<'gl_ctx> {
                 fn_name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extension_list_contains;
+
+    #[test]
+    fn extension_list_matches_whole_tokens() {
+        let list = "GL_OES_framebuffer_object GL_OES_matrix_palette ";
+        assert!(extension_list_contains(list, "GL_OES_matrix_palette"));
+        assert!(extension_list_contains(list, "GL_OES_framebuffer_object"));
+        // The trailing space in real extension strings produces an empty
+        // token; it must not be mistaken for a successful match.
+        assert!(!extension_list_contains(list, ""));
+        // A prefix must not match.
+        assert!(!extension_list_contains(list, "GL_OES_matrix"));
+        assert!(!extension_list_contains(list, "GL_OES_matrix_palette2"));
+        assert!(!extension_list_contains("", "GL_OES_matrix_palette"));
     }
 }
