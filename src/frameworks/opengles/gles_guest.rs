@@ -135,8 +135,25 @@ where
     // leftovers from untraced internal code paths (EAGL present, context
     // sync, etc.). Without this, one bad call makes every later traced
     // call report the same code at the wrong line.
+    //
+    // A non-zero value is reported rather than silently dropped: "an error was
+    // already pending when this call started" and "this call raised an error"
+    // are otherwise indistinguishable in a trace, and telling them apart is the
+    // difference between blaming the app for the emulator's own start-up
+    // probes and the other way round.
     if trace {
-        unsafe { gles.GetError() };
+        let pending = unsafe { gles.GetError() };
+        if pending != 0 {
+            log!(
+                "[--trace-gl-errors] {} had glGetError() = {:#x} pending \
+                 before a call dispatched from {}:{}; that error predates this \
+                 call, so do not attribute it to the call that follows.",
+                gles.diagnostic_profile(),
+                pending,
+                caller.file(),
+                caller.line()
+            );
+        }
     }
     let res = {
         let _guest_call_guard = GuestGlesCallGuard::enter();

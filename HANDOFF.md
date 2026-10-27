@@ -163,8 +163,11 @@ path in `src/paths.rs`. None of them is compiled yet.
    empty sample set rather than calling it `flat`.
 2. `drain_startup_gl_errors` — drains the host GL error queue once, right after
    the guest's context is created and before the guest can make its own GL call,
-   so touchHLE's own start-up probes cannot be mistaken for the app's errors.
-   This is what the `GL Error: 0x500` in the Minigore log most likely was.
+   so touchHLE's own start-up probes cannot be mistaken for the app's errors,
+   and logs when it finds anything. **This is not proven to explain the `0x500`
+   in the Minigore log** — see §3.2; the trace already clears the queue before
+   each traced dispatch, which points the other way. It is hygiene, plus a way
+   to convert the ambiguity into evidence on the next run.
 3. `paths::diagnostic_dump_path` — all diagnostic PPM dumps now land in
    `<user data>/touchHLE_dumps/` beside `touchHLE_log.txt` instead of
    hardcoded `/tmp/a8run/...` paths.
@@ -205,10 +208,17 @@ a regression introduced by this fork. Do not re-open that theory.
   `glDrawArrays(GL_TRIANGLES, 0, 6)`. Two triangles per pass. No 3D draw calls,
   no lighting/fog/matrix-palette traffic, no `glDepthFunc`, no `glBlendFunc`,
   and `glClear` is called with `0x4000` (colour only) after the first frame.
-- One `GL Error: 0x500` pair, drained by the very first
+- One `GL Error: 0x500`, reported against the very first
   `glGetIntegerv(0x8894)` (`GL_VERTEX_ARRAY_BINDING`); every later call reports
-  `0x0`. That is a dirty queue inherited at start-up, not a per-frame fault —
-  see the start-up drain added on 2026-10-27 (§3.5).
+  `0x0`. **Two readings are still possible and the v1.2.12 log cannot separate
+  them.** `with_ctx_and_mem` already drains the queue before each traced
+  dispatch, which should mean the call itself raised the error — i.e. the app
+  probed an ES 2.0/OES enum on an ES 1.1 context, which raises
+  `GL_INVALID_ENUM` on a real device too and is not an emulator defect. But
+  `with_ctx_and_mem_no_skip` (3 call sites, buffer mapping) does *not* drain
+  first, so a stale error would be blamed on whichever call came next. The
+  2026-10-27 trace change makes the two cases print differently; the next log
+  settles it.
 - **The `renderbuffer-content probe` line never appeared even though the probe
   is gated on the `--trace-gl-errors` switch that was on.** It lives inside the
   GPU-present branch, which this route never enters, so the readback path had no
@@ -260,8 +270,9 @@ a regression introduced by this fork. Do not re-open that theory.
 1. **Read the new probe line.** Any build from 2026-10-27 onward prints, on the
    readback route and with Trace GL errors on:
 
-       Readback content probe (frame=N, WxH): BL=(r,g,b,a) BR=… TL=… TR=…
-       CENTER=… | n/total sampled pixels match CENTER, m/total are black | verdict
+       [--trace-gl-errors] present_renderbuffer readback content probe
+       (frame=N, WxH): BL=(r,g,b,a) BR=… TL=… TR=… CENTER=… |
+       n/total sampled pixels match CENTER, m/total are black | verdict
 
    `verdict` is `all black`, `flat`, `content present`, or `unknown`. Grep:
 
@@ -271,10 +282,14 @@ a regression introduced by this fork. Do not re-open that theory.
      what the guest is (not) drawing.
    - `content present` → hypothesis (2): compare a screenshot with the buffer.
      Buffer right + screen wrong = presentation path; both wrong = upstream.
-2. **Watch the start-up GL error drain.** With Trace GL errors on, a
-   `GL Error: 0x500` logged immediately after `Driver info:` is now touchHLE's
-   own; if `0x500` still shows up next to a guest call later, it has a different
-   origin and is worth chasing.
+2. **Watch how the trace attributes errors.** Two new lines exist:
+   "Drained GL errors raised by touchHLE's own start-up probes…" (once, right
+   after the context is created) and
+   "[--trace-gl-errors] … had glGetError() = 0xNNN pending before a call
+   dispatched from file:line; that error predates this call". If the `0x500` of
+   the v1.2.12 log comes back as the *second* form, it is stale and mine; if it
+   comes back attached to a call with no pending-prefix line before it, the app
+   raised it itself (see §3.2) and it should be left alone.
 3. **Ask for these greps from a fresh log**: `matrix palette`,
    `not supported by this backend`, `First fix_texture_min_filter`,
    `First glTexParameteri`. Together they say whether the app took a code path
@@ -329,8 +344,11 @@ merge such a commit; the previous attempt was reverted (`ec989ed`).
 - Two traps that have already caused wrong conclusions:
   - `glTexParameteri` is logged for its **first call only**, so a missing
     `pname=` line says nothing about whether the app sets that parameter later.
-  - The `GL Error: {:#x}` trace line is printed **after** each call, so an error
-    shown next to a call may have been queued by an earlier one.
+  - The `GL Error: {:#x}` trace line now appears both **before** and **after**
+    each traced dispatch (the pre-call one drains the queue). Before
+    2026-10-27 the pre-call drain was silent, so a stale error was
+    indistinguishable from one the call itself raised. Read the
+    "… pending before a call dispatched from" line when present.
 
 ---
 

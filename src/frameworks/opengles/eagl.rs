@@ -1388,7 +1388,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 /// Must be called before the guest can make any GL call of its own.
 unsafe fn drain_startup_gl_errors(gles: &mut dyn GLES) {
     if drain_gl_errors(gles) {
-        log_dbg!("Drained touchHLE's own start-up GL errors");
+        // Deliberately not `log_dbg!`: the point of the drain is that the
+        // guest will never report these, so if the queue was dirty at start-up
+        // the log is the only place the fact can survive.
+        log!(
+            "Drained GL errors raised by touchHLE's own start-up probes, \
+             before the guest could observe them."
+        );
     }
 }
 
@@ -1460,20 +1466,28 @@ fn frame_content_verdict(sampled: u32, matching_centre: u32, black: u32) -> &'st
 /// wrong for reasons that have nothing to do with the guest's drawing (the
 /// readback itself, the compositor's upload, the blend used to composite it).
 ///
-/// Five samples plus a coarse "is this a single flat colour" count separate the
-/// two worlds that "the screen is black / see-through" reports conflate:
+/// The corners and the centre are printed as RGBA. The alpha channel matters
+/// here: the direct route hands the frame to the platform swap chain, which
+/// ignores alpha, while the composition route blends it with Core Animation's
+/// premultiplied-alpha contract. A frame whose alpha is low in places is
+/// therefore a candidate for "looks see-through only with Force Composition",
+/// and the numbers say whether that is the case without a rebuild.
 ///
-/// - all five samples equal and the flat-colour count covers the whole frame:
-///   the guest drew nothing (or only a clear), so the bug is upstream of
-///   presentation — depth/alpha/cull state, texture uploads, or a missing
-///   draw;
-/// - samples differ: the guest drew something, and the picture reaching the
-///   window is being mangled afterwards (compositor alpha, upload format,
-///   scale/placement) or is correct and the complaint is about the scene's
-///   content (the "x-ray" look), not the transport.
+/// The scan over every 61st pixel separates the two worlds that "the screen is
+/// black / see-through" reports conflate:
 ///
-/// Gated on `--trace-gl-errors`, and sampled on the same frame schedule as the
-/// GPU-route probe so the two can be compared.
+/// - every sampled pixel is black, or every sampled pixel equals the centre
+///   sample: the frame is a single flat colour, so the guest drew nothing (or
+///   only a clear) and the bug is upstream of presentation — depth/alpha/cull
+///   state, texture uploads, or a missing draw;
+/// - anything else: the guest drew something, and the picture reaching the
+///   window is either being mangled afterwards (compositor alpha, upload
+///   format, scale/placement) or is correct and the complaint is about the
+///   scene's content, not its transport.
+///
+/// Gated on the same switch as `--trace-gl-errors` (the picker's "Trace GL
+/// errors"), and sampled on the same frame schedule as the GPU-route probe so
+/// the two can be compared.
 fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_errors: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1486,7 +1500,10 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_error
         return;
     }
     if width == 0 || height == 0 || pixels.len() < 4 {
-        log!("Readback content probe (frame={count}): empty frame buffer");
+        log!(
+            "[--trace-gl-errors] present_renderbuffer readback content probe \
+             (frame={count}): empty frame buffer"
+        );
         return;
     }
     let pixel_at = |x: u32, y: u32| -> [u8; 4] {
@@ -1520,7 +1537,8 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_error
     }
     let verdict = frame_content_verdict(sampled, matching_centre, black);
     log!(
-        "Readback content probe (frame={}, {}x{}): \
+        "[--trace-gl-errors] present_renderbuffer readback content probe \
+         (frame={}, {}x{}): \
          BL=({},{},{},{}) BR=({},{},{},{}) TL=({},{},{},{}) TR=({},{},{},{}) \
          CENTER=({},{},{},{}) | {}/{} sampled pixels match CENTER, \
          {}/{} are black | {}",
