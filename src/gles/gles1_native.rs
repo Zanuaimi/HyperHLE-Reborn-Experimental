@@ -9,7 +9,10 @@
 use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles_generic::GLES;
-use super::util::{try_decode_pvrtc, PalettedTextureFormat};
+use super::util::{
+    base_min_filter, fix_texture_min_filter_enabled, is_npot_upload, tex_parameter_target,
+    try_decode_pvrtc, PalettedTextureFormat,
+};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::ffi::{CStr, CString};
@@ -105,20 +108,6 @@ fn is_es2_only_texture_parameter(pname: GLenum) -> bool {
         | 0x84FF // GL_TEXTURE_MAX_ANISOTROPY_EXT
         | 0x85BC // GL_TEXTURE_STORAGE_HINT_APPLE
     )
-}
-
-/// Whether the mipmapped-NPOT-texture workaround (see `TexImage2D`) is
-/// enabled. Defaults to `true` on Android, mirroring
-/// [crate::options::Options::fix_texture_min_filter]; the
-/// `--fix-texture-min-filter` / `--no-fix-texture-min-filter` flags and the
-/// `TOUCHHLE_FIX_TEXTURE_MIN_FILTER` environment variable override it.
-fn fix_texture_min_filter_enabled() -> bool {
-    static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => cfg!(target_os = "android"),
-    })
 }
 
 impl GLESContext for GLES1NativeContext {
@@ -826,6 +815,46 @@ impl GLES for GLES1Native<'_> {
         }
     }
 
+    // Vertex array objects (`GL_OES_vertex_array_object`).
+    //
+    // touchHLE can always serve VAOs: `gles_guest` keeps a software emulation
+    // that records and re-applies the client-array state on every bind. A host
+    // ES 1.1 driver that exports the entry points (the Adreno ES 1.1 surface
+    // does) can do it natively, which is both cheaper — the guest layer then
+    // binds one object instead of replaying every `*Pointer` call — and more
+    // faithful, because the driver's own attribute state is what it draws
+    // from. Report the capability so `gles_guest` picks the right path; the
+    // check is on symbol availability rather than the extension string, the
+    // same way `gles2_native::supports_vao_oes` does it.
+    fn supports_vao_oes(&self) -> bool {
+        gles11::BindVertexArrayOES::is_loaded()
+            && gles11::GenVertexArraysOES::is_loaded()
+            && gles11::DeleteVertexArraysOES::is_loaded()
+            && gles11::IsVertexArrayOES::is_loaded()
+    }
+    unsafe fn BindVertexArrayOES(&mut self, array: GLuint) {
+        if gles11::BindVertexArrayOES::is_loaded() {
+            gles11::BindVertexArrayOES(array);
+        }
+    }
+    unsafe fn GenVertexArraysOES(&mut self, n: GLsizei, arrays: *mut GLuint) {
+        if gles11::GenVertexArraysOES::is_loaded() {
+            gles11::GenVertexArraysOES(n, arrays);
+        }
+    }
+    unsafe fn DeleteVertexArraysOES(&mut self, n: GLsizei, arrays: *const GLuint) {
+        if gles11::DeleteVertexArraysOES::is_loaded() {
+            gles11::DeleteVertexArraysOES(n, arrays);
+        }
+    }
+    unsafe fn IsVertexArrayOES(&mut self, array: GLuint) -> GLboolean {
+        if gles11::IsVertexArrayOES::is_loaded() {
+            gles11::IsVertexArrayOES(array)
+        } else {
+            gles11::FALSE
+        }
+    }
+
     // Drawing
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
         gles11::DrawArrays(mode, first, count)
@@ -1034,7 +1063,7 @@ impl GLES for GLES1Native<'_> {
         // dimensions; power-of-two textures support mipmaps everywhere.
         if level == 0
             && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
+            && is_npot_upload(width, height)
         {
             self.fix_mipmap_min_filter(target);
         }
@@ -1098,7 +1127,7 @@ impl GLES for GLES1Native<'_> {
         }
         if level == 0
             && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
+            && is_npot_upload(width, height)
         {
             self.fix_mipmap_min_filter(target);
         }
@@ -1867,7 +1896,7 @@ impl GLES1Native<'_> {
         // state, so other textures are unaffected.
         if level == 0
             && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
+            && is_npot_upload(width, height)
         {
             gles11::TexParameteri(
                 gles11::TEXTURE_2D,
@@ -1895,18 +1924,10 @@ impl GLES1Native<'_> {
     unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
         let mut min_filter: GLint = 0;
         gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
-        // 0x2700 NEAREST_MIPMAP_NEAREST, 0x2701 LINEAR_MIPMAP_NEAREST,
-        // 0x2702 NEAREST_MIPMAP_LINEAR, 0x2703 LINEAR_MIPMAP_LINEAR
-        let replacement: GLint = match min_filter {
-            0x2700 | 0x2702 => gles11::NEAREST as GLint,
-            0x2701 | 0x2703 => gles11::LINEAR as GLint,
-            _ => return,
+        let Some(replacement) = base_min_filter(min_filter) else {
+            return;
         };
-        let p_target = if (0x8515..=0x851A).contains(&target) {
-            0x8513
-        } else {
-            target
-        };
+        let p_target = tex_parameter_target(target);
         gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, replacement as _);
         log_dbg!(
             "GLES1Native: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \

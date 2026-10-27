@@ -48,6 +48,65 @@ mod pvrtc_payload_size_tests {
     }
 }
 
+#[cfg(test)]
+mod npot_workaround_tests {
+    use super::{base_min_filter, is_npot_upload, tex_parameter_target};
+    use crate::gles::gles11_raw as gles11;
+
+    #[test]
+    fn detects_non_power_of_two_uploads() {
+        assert!(!is_npot_upload(64, 64));
+        assert!(!is_npot_upload(1, 1));
+        assert!(!is_npot_upload(1024, 512));
+        assert!(is_npot_upload(320, 480));
+        assert!(is_npot_upload(64, 65));
+        // Storage probes and malformed calls still get the workarounds.
+        assert!(is_npot_upload(0, 0));
+        assert!(is_npot_upload(-4, 16));
+    }
+
+    #[test]
+    fn degrades_only_mipmapped_filters() {
+        use crate::gles::gles11_raw::types::GLint;
+        let near = gles11::NEAREST as GLint;
+        let linear = gles11::LINEAR as GLint;
+        assert_eq!(
+            base_min_filter(gles11::NEAREST_MIPMAP_NEAREST as GLint),
+            Some(near)
+        );
+        assert_eq!(
+            base_min_filter(gles11::NEAREST_MIPMAP_LINEAR as GLint),
+            Some(near)
+        );
+        assert_eq!(
+            base_min_filter(gles11::LINEAR_MIPMAP_NEAREST as GLint),
+            Some(linear)
+        );
+        assert_eq!(
+            base_min_filter(gles11::LINEAR_MIPMAP_LINEAR as GLint),
+            Some(linear)
+        );
+        assert_eq!(base_min_filter(gles11::LINEAR as GLint), None);
+        assert_eq!(base_min_filter(gles11::NEAREST as GLint), None);
+    }
+
+    #[test]
+    fn cube_map_faces_share_the_cube_map_target() {
+        assert_eq!(
+            tex_parameter_target(gles11::TEXTURE_CUBE_MAP_POSITIVE_X),
+            gles11::TEXTURE_CUBE_MAP
+        );
+        assert_eq!(
+            tex_parameter_target(gles11::TEXTURE_CUBE_MAP_NEGATIVE_Z),
+            gles11::TEXTURE_CUBE_MAP
+        );
+        assert_eq!(
+            tex_parameter_target(gles11::TEXTURE_2D),
+            gles11::TEXTURE_2D
+        );
+    }
+}
+
 /// Return `(is_2bit, is_opaque)` for a PVRTC v1 internal format.
 pub fn pvrtc_format_properties(internalformat: GLenum) -> Option<(bool, bool)> {
     match internalformat {
@@ -97,6 +156,82 @@ pub fn float_to_fixed(float: GLfloat) -> GLfixed {
         0
     } else {
         scaled.round() as GLfixed
+    }
+}
+
+/// Whether the non-power-of-two / mipmap texture workarounds are enabled.
+///
+/// Strict OpenGL ES 1.1 and ES 2.0 drivers (ANGLE, Adreno's ES 1.1 surface,
+/// Mesa) reject or mis-sample non-power-of-two textures that use `GL_REPEAT`
+/// or a mipmapped `TEXTURE_MIN_FILTER`, while the iPhone OS drivers most apps
+/// were written against (PowerVR) tolerated both. The workaround is described
+/// at the call sites: `gles1_native`'s `tex_image_2d_inner` /
+/// `fix_mipmap_min_filter`, and `gles1_on_gles2`'s equivalents.
+///
+/// This mirrors [crate::options::Options::fix_texture_min_filter], which
+/// defaults to on for Android. The GL call paths have no `Options` access, so
+/// `--fix-texture-min-filter` / `--no-fix-texture-min-filter` mirror their
+/// choice into `TOUCHHLE_FIX_TEXTURE_MIN_FILTER`, and this function reads that.
+pub fn fix_texture_min_filter_enabled() -> bool {
+    static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => cfg!(target_os = "android"),
+    })
+}
+
+/// Whether an upload of `width` x `height` needs the non-power-of-two texture
+/// workarounds: force `GL_CLAMP_TO_EDGE` on the binding before the pixel store,
+/// and degrade a mipmapped `TEXTURE_MIN_FILTER` afterwards.
+///
+/// Zero and negative dimensions count as "needs the workarounds". A call with
+/// those dimensions is either a texture-storage probe (where the wrap and
+/// filter writes are harmless) or a malformed guest call that the driver will
+/// reject anyway, and treating them as power-of-two would let a later
+/// `glTexSubImage2D` fill in a texture whose filters were never fixed up.
+pub fn is_npot_upload(width: GLsizei, height: GLsizei) -> bool {
+    fn is_pot(value: GLsizei) -> bool {
+        value > 0 && value & (value - 1) == 0
+    }
+    !(is_pot(width) && is_pot(height))
+}
+
+/// Map a mipmapped `TEXTURE_MIN_FILTER` to the base filter with the same
+/// nearest/linear intent, or `None` if `min_filter` is not mipmapped.
+///
+/// Used by the non-power-of-two workaround: a mipmapped filter on a texture
+/// whose levels were never supplied makes the texture incomplete, and strict
+/// drivers then sample undefined texels (pink/black garbage) instead of
+/// falling back to the base level the way lenient iOS-era drivers did.
+pub fn base_min_filter(min_filter: GLint) -> Option<GLint> {
+    // Compare in `GLenum` space: the filter enums are unsigned, but callers
+    // hold them as `GLint` (that is what `glGetTexParameteriv` returns).
+    let filter = min_filter as GLenum;
+    match filter {
+        gles11::NEAREST_MIPMAP_NEAREST | gles11::NEAREST_MIPMAP_LINEAR => {
+            Some(gles11::NEAREST as GLint)
+        }
+        gles11::LINEAR_MIPMAP_NEAREST | gles11::LINEAR_MIPMAP_LINEAR => {
+            Some(gles11::LINEAR as GLint)
+        }
+        _ => None,
+    }
+}
+
+/// The texture target whose object carries the parameters for `target`.
+///
+/// Cube-map faces are separate targets for state purposes but share one
+/// texture object, and ES 1.1 has no way to set per-face parameters, so
+/// parameters requested for `GL_TEXTURE_CUBE_MAP_POSITIVE_X` and friends have
+/// to be applied to `GL_TEXTURE_CUBE_MAP` itself.
+pub fn tex_parameter_target(target: GLenum) -> GLenum {
+    let is_cube_face = (gles11::TEXTURE_CUBE_MAP_POSITIVE_X..=gles11::TEXTURE_CUBE_MAP_NEGATIVE_Z)
+        .contains(&target);
+    if is_cube_face {
+        gles11::TEXTURE_CUBE_MAP
+    } else {
+        target
     }
 }
 

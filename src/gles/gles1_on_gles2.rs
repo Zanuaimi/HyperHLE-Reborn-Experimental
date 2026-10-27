@@ -14,7 +14,10 @@ use super::gles11_raw as es1;
 use super::gles2_raw as gl;
 use super::gles2_raw::types::*;
 use super::gles_generic::{GLchar, GLES};
-use super::util::{fixed_to_float, float_to_fixed, try_decode_pvrtc, PalettedTextureFormat};
+use super::util::{
+    base_min_filter, fix_texture_min_filter_enabled, fixed_to_float, float_to_fixed,
+    is_npot_upload, tex_parameter_target, try_decode_pvrtc, PalettedTextureFormat,
+};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::collections::HashMap;
@@ -2502,6 +2505,7 @@ impl GLES for GLES1OnGLES2<'_> {
         if format == es1::BGRA_EXT {
             internalformat = es1::BGRA_EXT as GLint;
         }
+        self.apply_npot_workarounds(target, level, width, height);
         gl::TexImage2D(
             target,
             level,
@@ -2513,6 +2517,7 @@ impl GLES for GLES1OnGLES2<'_> {
             type_,
             pixels,
         );
+        self.degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn TexSubImage2D(
         &mut self,
@@ -2658,6 +2663,7 @@ impl GLES for GLES1OnGLES2<'_> {
             image_size,
             data,
         );
+        self.degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn TexEnvi(&mut self, target: GLenum, pname: GLenum, param: GLint) {
         if target != es1::TEXTURE_ENV {
@@ -3977,6 +3983,73 @@ impl GLES for GLES1OnGLES2<'_> {
 }
 
 impl GLES1OnGLES2<'_> {
+    /// Force `GL_CLAMP_TO_EDGE` on both wrap axes of the currently-bound
+    /// texture before a non-power-of-two level-0 upload.
+    ///
+    /// Strict ES 2.0 drivers reject (or hold as incomplete) an NPOT texture
+    /// whose wrap mode is `GL_REPEAT`, and guests routinely leave the default
+    /// `GL_REPEAT` set. On the host that means `glTexImage2D` fails with
+    /// `GL_INVALID_ENUM`, and every draw sampling the texture renders garbage
+    /// or black. iOS-era PowerVR drivers were lenient here, which is why this
+    /// was never noticed on a real device. Wrap mode is per-texture-object
+    /// state, so no other texture is affected.
+    ///
+    /// This mirrors `gles1_native`'s `tex_image_2d_inner`. It is only safe
+    /// because the host is an ES driver: desktop GL supports NPOT `GL_REPEAT`
+    /// fully, so `gles1_on_gl2` deliberately does not do this.
+    unsafe fn apply_npot_workarounds(
+        &self,
+        target: GLenum,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+            return;
+        }
+        let p_target = tex_parameter_target(target);
+        gl::TexParameteri(p_target, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as GLint);
+        gl::TexParameteri(p_target, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as GLint);
+    }
+
+    /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound texture
+    /// after a non-power-of-two level-0 upload.
+    ///
+    /// A mipmapped filter with no levels supplied makes the texture
+    /// incomplete, and strict drivers then sample undefined texels instead of
+    /// falling back to the base level the way iOS-era drivers did. This also
+    /// catches the case the guest-level `demipmap_filter_value` cannot: a
+    /// game that never calls `glTexParameteri` for `GL_TEXTURE_MIN_FILTER`
+    /// at all, so the driver default (`GL_NEAREST_MIPMAP_LINEAR`) is still in
+    /// force.
+    unsafe fn degrade_mipmap_min_filter(
+        &self,
+        target: GLenum,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+            return;
+        }
+        // Query with `glGetTexParameteriv` rather than `glGetIntegerv`: the
+        // former is unambiguously valid for texture state in every ES 2.0
+        // implementation, and an invalid enum here would put a stray error in
+        // the guest's queue.
+        let p_target = tex_parameter_target(target);
+        let mut min_filter: GLint = 0;
+        gl::GetTexParameteriv(p_target, gl::TEXTURE_MIN_FILTER, &mut min_filter);
+        let Some(replacement) = base_min_filter(min_filter) else {
+            return;
+        };
+        gl::TexParameteri(p_target, gl::TEXTURE_MIN_FILTER, replacement);
+        log_dbg!(
+            "GLES1OnGLES2: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \
+             non-power-of-two level-0 texture replaced with {replacement:#x} \
+             [incomplete-texture workaround for strict drivers]"
+        );
+    }
+
     fn transform_vec4(matrix: &[GLfloat; 16], value: [GLfloat; 4]) -> [GLfloat; 4] {
         [
             matrix[0] * value[0]
