@@ -2169,13 +2169,27 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
         PRESENT_ES1_TEXTURE.with(|cell| cell.set(None));
         PRESENT_ES1_REJECTED_CAPS.with(|cell| cell.set(None));
+        // The route memo is per-session too: comparing a new session's first
+        // frame against the previous session's route would report a route
+        // "change" that never happened within either session.
+        LAST_PRESENT_ROUTE.store(PRESENT_ROUTE_UNSET, Ordering::Relaxed);
         log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
     }
 }
 
+/// Both tests below call [invalidate_present_cache_for_context], which resets
+/// process-wide presenter state, so they must not run concurrently - the route
+/// memo is global while the context token it is compared against is
+/// thread-local, so one test would otherwise clear it under the other.
+#[cfg(test)]
+static PRESENT_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 #[test]
 fn presenter_cache_is_invalidated_across_recreated_contexts() {
+    let _guard = PRESENT_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let first = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
     let second = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
     assert_ne!(first, second);
@@ -2184,6 +2198,27 @@ fn presenter_cache_is_invalidated_across_recreated_contexts() {
     PRESENT_ES1_TEXTURE.with(|cell| cell.set(Some((42, 1024, 768))));
     invalidate_present_cache_for_context(second);
     PRESENT_ES1_TEXTURE.with(|cell| assert_eq!(cell.get(), None));
+}
+
+#[cfg(test)]
+#[test]
+fn route_memo_survives_a_frame_but_not_a_context_change() {
+    let _guard = PRESENT_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let first = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let second = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let direct = present_route_code(PresentRoute::Direct);
+
+    invalidate_present_cache_for_context(first);
+    LAST_PRESENT_ROUTE.store(direct, Ordering::Relaxed);
+    // Every presented frame re-runs the invalidation with the same token; the
+    // memo has to survive that or a mid-session route change is never reported.
+    invalidate_present_cache_for_context(first);
+    assert_eq!(LAST_PRESENT_ROUTE.load(Ordering::Relaxed), direct);
+    // A recreated context is a new session, so comparisons start from scratch.
+    invalidate_present_cache_for_context(second);
+    assert_eq!(LAST_PRESENT_ROUTE.load(Ordering::Relaxed), PRESENT_ROUTE_UNSET);
 }
 
 /// Drain the GL error queue. Returns whether there was anything in it.
@@ -2303,9 +2338,10 @@ struct PresentBackend {
 /// once instead of being invisible. [PRESENT_ROUTE_UNSET] until the first
 /// presented frame.
 ///
-/// One record is enough for the whole process because the route depends on
+/// One record is enough per session because the route depends on
 /// `--present-mode` and the driver, not on the drawable; the probe result it
-/// can follow is global too.
+/// can follow is global too. It is reset with the other presenter caches when
+/// the EAGL context changes (see [invalidate_present_cache_for_context]).
 static LAST_PRESENT_ROUTE: AtomicU8 = AtomicU8::new(PRESENT_ROUTE_UNSET);
 const PRESENT_ROUTE_UNSET: u8 = u8::MAX;
 
