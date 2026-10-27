@@ -476,6 +476,12 @@ merge such a commit; the previous attempt was reverted (`ec989ed`).
   round-28 code compiled and its unit tests passed on Linux, Android, Windows
   and macOS. `build-ios` was **cancelled** (runner capacity, no steps recorded),
   which is what blocked `check-hyperhle-release` and `publish-hyperhle-release`.
+- PR run `40542600484` (`824fea6`, PR #5): build-linux, build-android,
+  build-win, build-osx and test-macos **success**; `build-ios` **cancelled**
+  again with `runner_name` empty and no steps — it waited 15 minutes for a
+  `macos-latest` runner and never got one. That is capacity, not code: the same
+  commit range compiled and passed unit tests on the other four platforms. A
+  pull request never reaches `check-hyperhle-release`/`publish-*` anyway.
 
 ---
 
