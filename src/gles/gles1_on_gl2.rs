@@ -3849,7 +3849,7 @@ impl GLES for GLES1OnGL2<'_> {
 /// Unlike `gles1_on_gles2` there is no wrap-mode forcing here: desktop OpenGL
 /// supports non-power-of-two textures with `GL_REPEAT` and real NPOT mip
 /// chains, so forcing `GL_CLAMP_TO_EDGE` would only take fidelity away. That
-/// is also why the workaround is off by default off-Android
+/// is also why the workaround defaults to off outside Android
 /// (`fix_texture_min_filter_enabled`).
 unsafe fn degrade_mipmap_min_filter(
     target: GLenum,

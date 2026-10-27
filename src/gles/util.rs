@@ -173,12 +173,11 @@ pub fn float_to_fixed(float: GLfloat) -> GLfixed {
 /// `--fix-texture-min-filter` / `--no-fix-texture-min-filter` mirror their
 /// choice into `TOUCHHLE_FIX_TEXTURE_MIN_FILTER`, and this function reads that.
 pub fn fix_texture_min_filter_enabled() -> bool {
-    static POLICY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
+    match crate::env_var_cached!("TOUCHHLE_FIX_TEXTURE_MIN_FILTER") {
+        Some("0") => false,
+        Some("1") => true,
         _ => cfg!(target_os = "android"),
-    })
+    }
 }
 
 /// Whether an upload of `width` x `height` needs the non-power-of-two texture

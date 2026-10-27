@@ -1495,8 +1495,10 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_error
         return;
     }
     let count = PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
-    let should_log = matches!(count, 0 | 1 | 5 | 30 | 120 | 600) || count.is_multiple_of(600);
-    if !should_log {
+    // Front-loaded, then once every 600 frames: the first frames of a session
+    // are where "nothing is drawn yet" and "the menu is drawn" differ, and the
+    // 600-frame schedule keeps a long session's log small.
+    if !matches!(count, 0 | 1 | 5 | 30 | 120) && !count.is_multiple_of(600) {
         return;
     }
     if width == 0 || height == 0 || pixels.len() < 4 {
@@ -1600,7 +1602,9 @@ fn probe_readback_content(pixels: &[u8], width: u32, height: u32, trace_gl_error
 fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static REPORTED: AtomicBool = AtomicBool::new(false);
-    if REPORTED.load(Ordering::Relaxed) {
+    // Mark the check done *before* looking: an opaque drawable is the common
+    // case, and it must not cost an Objective-C message send per frame.
+    if REPORTED.swap(true, Ordering::Relaxed) {
         return;
     }
     // `-[CALayer isOpaque]` is the flag the compositor branches on (see
@@ -1610,7 +1614,6 @@ fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]
     if opaque {
         return;
     }
-    REPORTED.store(true, Ordering::Relaxed);
     // Sample rather than scan: a 320x480 frame is 153k pixels and this is
     // only a triage hint, not a measurement.
     let mut translucent = 0u32;
