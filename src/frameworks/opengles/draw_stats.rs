@@ -27,11 +27,28 @@
 //! RAM-readback present routes where the frame is already in memory, and
 //! therefore needs no diagnostic switch to be turned on first.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 static VERTICES: AtomicU64 = AtomicU64::new(0);
 static TEXTURE_UPLOADS: AtomicU64 = AtomicU64::new(0);
+/// Bitwise OR of every `glClear` mask the guest passed since the previous
+/// present. Recorded rather than counted: what matters is *which* buffers were
+/// cleared, not how many times.
+static CLEAR_MASKS: AtomicU64 = AtomicU64::new(0);
+
+/// The guest's own `GL_DEPTH_TEST` request, for the drawable-capability line.
+///
+/// The host's depth-test bit is not the guest's: depth testing is forced off
+/// while a framebuffer without a guest-attached depth buffer is bound, and a
+/// diagnostic that reported the host bit would then contradict the app's own
+/// state. Diagnostic only — nothing in the renderer reads this.
+static GUEST_DEPTH_TEST: AtomicBool = AtomicBool::new(false);
+
+/// `GL_COLOR_BUFFER_BIT`, `GL_DEPTH_BUFFER_BIT` and `GL_STENCIL_BUFFER_BIT`.
+const CLEAR_COLOR: u64 = 0x4000;
+const CLEAR_DEPTH: u64 = 0x0100;
+const CLEAR_STENCIL: u64 = 0x0400;
 
 /// What the guest submitted since the previous present.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -42,6 +59,17 @@ pub struct FrameWorkload {
     pub vertices: u64,
     /// `glTexImage2D` / `glTexSubImage2D` / `glCompressedTexImage2D`.
     pub texture_uploads: u64,
+    /// Whether any `glClear` in this frame included `GL_COLOR_BUFFER_BIT`.
+    pub cleared_color: bool,
+    /// Whether any `glClear` in this frame included `GL_DEPTH_BUFFER_BIT`.
+    ///
+    /// This is the datum for the "the depth buffer is never cleared" family of
+    /// bugs: a guest that enables depth testing but only ever clears colour
+    /// relies on the driver starting each frame with a clean depth buffer (or on
+    /// there being no depth buffer at all).
+    pub cleared_depth: bool,
+    /// Whether any `glClear` in this frame included `GL_STENCIL_BUFFER_BIT`.
+    pub cleared_stencil: bool,
 }
 
 impl FrameWorkload {
@@ -72,13 +100,60 @@ pub fn record_texture_upload() {
     TEXTURE_UPLOADS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record the guest's own `GL_DEPTH_TEST` request.
+pub fn record_guest_depth_test(enabled: bool) {
+    GUEST_DEPTH_TEST.store(enabled, Ordering::Relaxed);
+}
+
+/// The last `GL_DEPTH_TEST` request the guest made.
+pub fn guest_depth_test() -> bool {
+    GUEST_DEPTH_TEST.load(Ordering::Relaxed)
+}
+
+/// Record one `glClear` mask.
+pub fn record_clear(mask: u64) {
+    CLEAR_MASKS.fetch_or(mask, Ordering::Relaxed);
+}
+
 /// Take the counters accumulated since the previous call, resetting them.
 pub fn take_frame_workload() -> FrameWorkload {
+    let clears = CLEAR_MASKS.swap(0, Ordering::Relaxed);
+    let (cleared_color, cleared_depth, cleared_stencil) = clear_flags(clears);
     FrameWorkload {
         draws: DRAWS.swap(0, Ordering::Relaxed),
         vertices: VERTICES.swap(0, Ordering::Relaxed),
         texture_uploads: TEXTURE_UPLOADS.swap(0, Ordering::Relaxed),
+        cleared_color,
+        cleared_depth,
+        cleared_stencil,
     }
+}
+
+/// Split an OR of `glClear` masks into (colour, depth, stencil) flags.
+fn clear_flags(mask: u64) -> (bool, bool, bool) {
+    (
+        mask & CLEAR_COLOR != 0,
+        mask & CLEAR_DEPTH != 0,
+        mask & CLEAR_STENCIL != 0,
+    )
+}
+
+/// Which buffers the frame's `glClear` calls covered, as a log-friendly phrase.
+pub fn describe_clears(cleared_color: bool, cleared_depth: bool, cleared_stencil: bool) -> String {
+    if !cleared_color && !cleared_depth && !cleared_stencil {
+        return "the guest issued no glClear".to_string();
+    }
+    let mut bits: Vec<&str> = Vec::new();
+    if cleared_color {
+        bits.push("COLOR");
+    }
+    if cleared_depth {
+        bits.push("DEPTH");
+    }
+    if cleared_stencil {
+        bits.push("STENCIL");
+    }
+    format!("glClear covered {}", bits.join("|"))
 }
 
 /// One-sentence description of a frame's workload, for log lines.
@@ -98,10 +173,14 @@ pub fn describe(workload: FrameWorkload) -> String {
         draws,
         vertices,
         texture_uploads,
+        cleared_color,
+        cleared_depth,
+        cleared_stencil,
     } = workload;
+    let clears = describe_clears(cleared_color, cleared_depth, cleared_stencil);
     format!(
         "{draws} draws, {vertices} vertices, {texture_uploads} texture uploads \
-         since the previous present: {verdict}"
+         since the previous present: {verdict}; {clears}"
     )
 }
 
@@ -116,12 +195,14 @@ mod tests {
             draws: 3,
             vertices: 0,
             texture_uploads: 1,
+            ..Default::default()
         })
         .contains("every draw was empty"));
         let busy = describe(FrameWorkload {
             draws: 120,
             vertices: 45_000,
             texture_uploads: 0,
+            ..Default::default()
         });
         assert!(busy.contains("120 draws"));
         assert!(busy.contains("45000 vertices"));
@@ -136,11 +217,38 @@ mod tests {
         record_draw(3);
         record_quad_draw();
         record_texture_upload();
+        record_clear(CLEAR_COLOR);
         let first = take_frame_workload();
         assert!(first.draws >= 3);
         assert!(first.vertices >= 13);
         assert!(first.texture_uploads >= 1);
+        assert!(first.cleared_color);
+        assert!(!first.cleared_depth);
         assert!(!first.drew_nothing());
         assert_eq!(take_frame_workload(), FrameWorkload::default());
+    }
+
+    #[test]
+    fn describes_which_buffers_were_cleared() {
+        assert_eq!(
+            describe_clears(false, false, false),
+            "the guest issued no glClear"
+        );
+        assert_eq!(describe_clears(true, false, false), "glClear covered COLOR");
+        assert_eq!(
+            describe_clears(true, true, false),
+            "glClear covered COLOR|DEPTH"
+        );
+        assert_eq!(
+            describe_clears(true, true, true),
+            "glClear covered COLOR|DEPTH|STENCIL"
+        );
+        // A colour clear and a separate depth clear in the same frame OR
+        // together, which is what "any glClear covered it" means. Checked on
+        // the mask directly rather than through the process-global counters,
+        // so this test cannot race the others.
+        assert_eq!(clear_flags(CLEAR_COLOR | CLEAR_DEPTH), (true, true, false));
+        assert_eq!(clear_flags(CLEAR_COLOR), (true, false, false));
+        assert_eq!(clear_flags(0), (false, false, false));
     }
 }

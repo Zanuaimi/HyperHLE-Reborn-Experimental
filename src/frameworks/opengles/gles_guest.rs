@@ -369,8 +369,37 @@ fn glGetError(env: &mut Environment) -> GLenum {
         err
     })
 }
+/// Apply the guest's `GL_DEPTH_TEST` request to the host, taking the bound
+/// framebuffer's attachments into account.
+///
+/// Must be called whenever either side of that decision changes: a
+/// `glEnable`/`glDisable` of `GL_DEPTH_TEST`, a framebuffer binding, or a depth
+/// attachment change on the framebuffer that is already bound. See
+/// `State::depthless_framebuffers` for why the guest's request is not
+/// simply forwarded.
+fn sync_depth_test(env: &mut Environment) {
+    let host_enabled = env
+        .framework_state
+        .opengles
+        .host_depth_test(env.current_thread);
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        if host_enabled {
+            gles.Enable(gles11::DEPTH_TEST)
+        } else {
+            gles.Disable(gles11::DEPTH_TEST)
+        }
+    });
+}
+
 fn glEnable(env: &mut Environment, cap: GLenum) {
-    if cap == gles11::FOG {
+    if cap == gles11::DEPTH_TEST {
+        let thread = env.current_thread;
+        env.framework_state
+            .opengles
+            .set_guest_depth_test(thread, true);
+        super::draw_stats::record_guest_depth_test(true);
+        sync_depth_test(env);
+    } else if cap == gles11::FOG {
         with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
             shadow.fog_enabled = true;
             gles.Enable(cap)
@@ -380,10 +409,26 @@ fn glEnable(env: &mut Environment, cap: GLenum) {
     }
 }
 fn glIsEnabled(env: &mut Environment, cap: GLenum) -> GLboolean {
+    if cap == gles11::DEPTH_TEST {
+        // Report the guest's own request: the host bit is forced off while a
+        // framebuffer without a guest-attached depth buffer is bound, and an
+        // app that checks its own state must not see that.
+        return env
+            .framework_state
+            .opengles
+            .guest_depth_test(env.current_thread) as GLboolean;
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsEnabled(cap) })
 }
 fn glDisable(env: &mut Environment, cap: GLenum) {
-    if cap == gles11::FOG {
+    if cap == gles11::DEPTH_TEST {
+        let thread = env.current_thread;
+        env.framework_state
+            .opengles
+            .set_guest_depth_test(thread, false);
+        super::draw_stats::record_guest_depth_test(false);
+        sync_depth_test(env);
+    } else if cap == gles11::FOG {
         with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
             shadow.fog_enabled = false;
             gles.Disable(cap)
@@ -866,9 +911,66 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
     } else {
         (x, y, width, height)
     };
+    // The pre-scale request is what `set_guest_viewport` remembered above.
+    let guest_viewport = env
+        .framework_state
+        .opengles
+        .guest_viewport(thread)
+        .unwrap_or((x, y, width, height));
+    let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+    log_viewport_mapping(guest_viewport, (x, y, width, height), framebuffer);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.Viewport(x, y, width, height)
     })
+}
+
+/// Log the first few *distinct* viewport mappings: what the guest asked for,
+/// what the host was actually given, and which framebuffer was bound.
+///
+/// A log line saying `glViewport(0, 0, 640, 960)` cannot be read on its own:
+/// the scale hack multiplies the guest's request, and whether it does so
+/// depends on which framebuffer is bound (see
+/// `State::scale_hack_applies_to_viewport`). "The guest draws at twice the
+/// size of its renderbuffer" is one of the readings of a zoomed/cropped scene,
+/// and it is wrong when the difference is ours. This line makes the two
+/// numbers, and the reason for the difference, visible at a glance.
+///
+/// Six lines per session, deduplicated, so a render loop that sets the viewport
+/// every frame costs nothing after the first few.
+fn log_viewport_mapping(
+    guest: (GLint, GLint, GLsizei, GLsizei),
+    host: (GLint, GLint, GLsizei, GLsizei),
+    framebuffer: GLuint,
+) {
+    use std::sync::Mutex;
+    /// One (requested viewport, bound framebuffer) pair.
+    type Combination = ((GLint, GLint, GLsizei, GLsizei), GLuint);
+    static SEEN: Mutex<Vec<Combination>> = Mutex::new(Vec::new());
+    const MAX_LINES: usize = 6;
+    let mut seen = match SEEN.lock() {
+        Ok(guard) => guard,
+        // A panic while holding this lock must not disable the diagnostic.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if seen.len() >= MAX_LINES || seen.contains(&(guest, framebuffer)) {
+        return;
+    }
+    seen.push((guest, framebuffer));
+    let index = seen.len();
+    log!(
+        "glViewport mapping #{}: guest (x={}, y={}, w={}, h={}) -> host \
+         (x={}, y={}, w={}, h={}) with framebuffer {} bound",
+        index,
+        guest.0,
+        guest.1,
+        guest.2,
+        guest.3,
+        host.0,
+        host.1,
+        host.2,
+        host.3,
+        framebuffer
+    );
 }
 fn glLineWidth(env: &mut Environment, val: GLfloat) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.LineWidth(val) })
@@ -2501,6 +2603,7 @@ fn glDrawElements(
 }
 
 fn glClear(env: &mut Environment, mask: GLbitfield) {
+    super::draw_stats::record_clear(mask as u64);
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -3582,8 +3685,17 @@ fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLui
         .framework_state
         .opengles
         .scale_hack_applies_to_viewport(thread);
+    // `GL_DEPTH_TEST` is global state whose meaning depends on what is bound:
+    // a framebuffer with no depth attachment of the guest's own must behave as
+    // if depth testing were disabled.
+    let host_depth_test = env.framework_state.opengles.host_depth_test(thread);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.BindFramebufferOES(target, framebuffer);
+        if host_depth_test {
+            gles.Enable(gles11::DEPTH_TEST)
+        } else {
+            gles.Disable(gles11::DEPTH_TEST)
+        }
         if let Some((x, y, width, height)) = viewport {
             if apply_scale_hack {
                 gles.Viewport(x * factor, y * factor, width * factor, height * factor)
@@ -3615,12 +3727,12 @@ fn glRenderbufferStorageOES(
 /// Whether the auto-attached-depth-renderbuffer workaround in
 /// [glFramebufferRenderbufferOES] is switched off.
 ///
-/// Setting `TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH` restores strict behaviour, so
-/// a guest that never attached a depth buffer gets the fragment rejection a
-/// strict driver would give it. That is the first thing to try when bisecting
-/// a scene that renders *worse* with the workaround than without it (for
-/// example a guest that deliberately draws see-through geometry into a
-/// colour-only FBO and relies on there being no depth buffer).
+/// Setting `TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH` restores strict behaviour: no
+/// depth buffer is synthesised, so the guest gets whatever the host driver does
+/// with a framebuffer that has no depth attachment (which, per the OpenGL ES
+/// rule quoted in `State::depthless_framebuffers`, is supposed to be "depth
+/// testing behaves as disabled"). That is the first thing to try when bisecting
+/// a scene that renders *worse* with the workaround than without it.
 fn auto_depth_attach_disabled() -> bool {
     crate::env_flag_cached!("TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH")
 }
@@ -3640,7 +3752,21 @@ fn glFramebufferRenderbufferOES(
             .opengles
             .set_colour_attachment_is_texture(thread, false);
     }
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    if attachment == gles11::DEPTH_ATTACHMENT_OES {
+        // The guest attached (or detached) a depth buffer itself, so this
+        // framebuffer is no longer one of ours to pretend is depth-less.
+        let thread = env.current_thread;
+        let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+        let depthless = renderbuffer == 0;
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, depthless);
+    }
+    // Whether this call made us synthesise a depth buffer for the target. The
+    // framebuffer's new state is recorded after the GL closure because that
+    // closure only has the GLES wrapper, not the framework state.
+    let auto_attached: bool = with_ctx_and_mem(env, |gles, _mem| unsafe {
+        let mut auto_attached = false;
         gles.FramebufferRenderbufferOES(target, attachment, renderbuffertarget, renderbuffer);
         // When an iOS app attaches its drawable color renderbuffer to an FBO,
         // it commonly forgets to also attach a depth renderbuffer. On real iOS
@@ -3658,6 +3784,16 @@ fn glFramebufferRenderbufferOES(
         // the scene's geometry disappears and the background shows through,
         // which reads as "x-ray" or black objects while the HUD and anything
         // drawn without depth testing still look fine.
+        //
+        // The attachment alone is not enough. An app that never attached a
+        // depth buffer has no reason to clear one, so the buffer still holds
+        // whatever it was allocated with, and a guest drawing in painter order
+        // then has its later fragments rejected by GL_LESS against those stale
+        // values — the same "x-ray"/black look, from the opposite direction.
+        // OpenGL ES says a framebuffer with no depth attachment behaves as if
+        // depth testing were disabled, so `sync_depth_test` keeps the host's
+        // depth test off while this framebuffer is bound (see
+        // `State::depthless_framebuffers`).
         if !auto_depth_attach_disabled()
             && attachment == gles11::COLOR_ATTACHMENT0_OES
             && renderbuffertarget == gles11::RENDERBUFFER_OES
@@ -3725,12 +3861,17 @@ fn glFramebufferRenderbufferOES(
                     // be our workaround's fault, so check it (the guest has
                     // this framebuffer bound, or we would be asking about a
                     // different one) and undo the attachment if it went wrong.
+                    // `target` is the target *enum* (`GL_FRAMEBUFFER_OES`), not
+                    // a framebuffer name: the FBO this call modified is
+                    // whichever one the guest has bound. Comparing the binding
+                    // against the enum never matched, so this check never ran
+                    // and the revert below was dead code.
                     let mut bound_framebuffer: GLint = 0;
                     gles.GetIntegerv(
                         gles11::FRAMEBUFFER_BINDING_OES,
                         &mut bound_framebuffer,
                     );
-                    let status = if bound_framebuffer as GLuint == target {
+                    let status = if bound_framebuffer != 0 {
                         gles.CheckFramebufferStatusOES(target)
                     } else {
                         gles11::FRAMEBUFFER_COMPLETE_OES
@@ -3772,6 +3913,7 @@ fn glFramebufferRenderbufferOES(
                     // that recreates FBOs every frame can't flood the file.
                     // Don't claim success when the attachment was reverted.
                     if status == gles11::FRAMEBUFFER_COMPLETE_OES {
+                        auto_attached = true;
                         FIRST.call_once(|| log!("{message}"));
                     }
                     log_dbg!("{message} (framebuffer status {status:#x})");
@@ -3780,7 +3922,25 @@ fn glFramebufferRenderbufferOES(
             }
             while gles.GetError() != 0 {}
         }
-    })
+        auto_attached
+    });
+    if auto_attached {
+        // The guest never gave this framebuffer a depth buffer, so depth
+        // testing must behave as disabled while it is bound — see
+        // `State::depthless_framebuffers`. `target` is the target enum, so the
+        // framebuffer to record is the one the guest had bound (the call
+        // modifies that one).
+        let thread = env.current_thread;
+        let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, true);
+        sync_depth_test(env);
+    } else if attachment == gles11::DEPTH_ATTACHMENT_OES {
+        // A depth attachment change can turn the override on or off for the
+        // framebuffer that is bound right now.
+        sync_depth_test(env);
+    }
 }
 fn glFramebufferTexture2DOES(
     env: &mut Environment,
@@ -3796,9 +3956,22 @@ fn glFramebufferTexture2DOES(
             .opengles
             .set_colour_attachment_is_texture(thread, texture != 0);
     }
+    let depth_attachment = attachment == gles11::DEPTH_ATTACHMENT_OES;
+    if depth_attachment {
+        // Same bookkeeping as the renderbuffer path: attaching a depth texture
+        // means the guest is depth-testing against a buffer of its own.
+        let thread = env.current_thread;
+        let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, texture == 0);
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.FramebufferTexture2DOES(target, attachment, textarget, texture, level)
-    })
+    });
+    if depth_attachment {
+        sync_depth_test(env);
+    }
 }
 fn glGetFramebufferAttachmentParameterivOES(
     env: &mut Environment,
@@ -3833,11 +4006,21 @@ fn glCheckFramebufferStatusOES(env: &mut Environment, target: GLenum) -> GLenum 
     })
 }
 fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    let deleted: Vec<GLuint> = with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let framebuffers = mem.ptr_at(framebuffers, n_usize);
-        unsafe { gles.DeleteFramebuffersOES(n, framebuffers) }
-    })
+        let deleted =
+            unsafe { std::slice::from_raw_parts(framebuffers, n_usize as usize) }.to_vec();
+        unsafe { gles.DeleteFramebuffersOES(n, framebuffers) };
+        deleted
+    });
+    // Framebuffer names can be handed out again, so the per-framebuffer
+    // bookkeeping has to go with them.
+    for framebuffer in deleted {
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, false);
+    }
 }
 fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: ConstPtr<GLuint>) {
     with_ctx_and_mem(env, |gles, mem| {

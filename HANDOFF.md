@@ -314,7 +314,11 @@ a regression introduced by this fork. Do not re-open that theory.
 - **A missing depth attachment / depth-test absence as the cause** — the
   steady-state frame issues no depth state at all: no `glDepthFunc`, no
   `0x4100` clear, no depth-tested geometry. Whatever the x-ray look is, it is
-  produced by the two-quad 2D path above.
+  produced by the two-quad 2D path above. **Reopened 2026-10-27 (evening), in
+  the opposite direction**: the frame issues no depth state *because the app
+  expects there to be no depth buffer*, and the depth buffer touchHLE attaches
+  for it is the problem — see §3.5b. What is still ruled out is a *missing*
+  attachment (`DEPTH_BITS=16`).
 - **`GL_TEXTURE_MIN_FILTER` left at the mipmapping default** — two independent
   reasons. `glTexParameteri` logs only the *first* call of the whole session
   (`First glTexParameteri(…)[this log will only be shown once]`), so the absence
@@ -419,6 +423,68 @@ To rebuild that experiment from a full clone, either
 is 25 commits *before* the bump. Verify the sizes against the table. Do **not**
 merge such a commit; the previous attempt was reverted (`ec989ed`).
 
+### 3.5b Round 2026-10-27 (evening): what the merged build's log proved, and the depth fix
+
+The log from the merged `1c34c05` build (run `40545327144`, Adreno 725,
+ANGLE 2.1.1 → Vulkan, native ES 1.1, Force Composition on) fired **all three**
+of the 2026-10-27 diagnostics, and they agree with each other:
+
+- `Drawable capabilities at the first presented frame: ALPHA_BITS=8
+  DEPTH_BITS=16 STENCIL_BITS=0 | depth_test=true alpha_test=false blend=false
+  cull_face=false scissor_test=false texture_2d=true lighting=false (0 of 8
+  lights enabled) fog=false color_material=false`
+- `present_renderbuffer readback content probe (frame=0, 320x480): … CENTER=(130,132,135,255) |
+  0/2519 sampled pixels match CENTER, 51/2519 are black | content present: the frame is not a
+  single colour | 7 draws, 426 vertices, 7 texture uploads since the previous present`
+- No `INCOMPLETE` line, and `Auto-attached depth renderbuffer (320x480)` fired.
+
+So: the guest submits geometry, the frame is neither empty nor flat, and the
+depth attachment is complete. "Nothing is being drawn", "the drawable has no
+depth", and (from the frame-0 snapshot, weakly) "the lights are off" are all
+falsified — the last one only weakly, because frame 0 is a loading screen, which
+is why the capability line is now also printed at frame 120.
+
+The remaining suspect, and the one this round acts on, is the **synthetic depth
+buffer**. OpenGL ES says a framebuffer with no depth attachment behaves as if
+depth testing were disabled (Khronos OpenGL Wiki, "Depth Test"). Minigore never
+attaches depth and never clears depth (`glClear(0x4000)` = colour only, every
+frame), so on a device it is drawing painter-ordered 2D with no depth test at
+all. touchHLE attaches a depth renderbuffer anyway — and a renderbuffer starts
+with *undefined* contents, which nobody ever overwrites. A `GL_LESS` test against
+that turns "everything passes" into "some fragments are rejected": geometry that
+should be visible disappears (the background shows through it) and later draws at
+the same depth are dropped. Both of the reported symptoms, from one cause.
+
+Shipped this round:
+
+1. `GL_DEPTH_TEST` is forced off on the host while a framebuffer whose depth
+   attachment touchHLE synthesised is bound (`State::depthless_framebuffers`,
+   `sync_depth_test` in `gles_guest`). `glIsEnabled(GL_DEPTH_TEST)` and the
+   capability line report the guest's own request, not the forced-off host bit.
+   `TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH=1` still removes the attachment entirely.
+2. The INCOMPLETE revert in the same workaround was dead code: it compared the
+   bound framebuffer's *name* against `GL_FRAMEBUFFER_OES` (the target enum), so
+   `CheckFramebufferStatusOES` was never called. It now actually runs.
+3. The presented frame is dumped as a PNG (`touchHLE_dumps/presented_frame_f*.png`,
+   frames 0/60/300/600/1200/2400) whenever the picker's "Trace GL errors" switch
+   is on, flipped the right way up and with the alpha channel intact.
+4. The probe line now ends with `glClear covered COLOR` / `COLOR|DEPTH` / "the
+   guest issued no glClear", the capability line gained `depth_func` and
+   `depth_writemask` and a second checkpoint at frame 120, and the first six
+   distinct `glViewport` calls print as `guest (…) -> host (…)` with the bound
+   framebuffer.
+
+Next, from the tester's next log **and PNGs**:
+
+- `glClear covered COLOR` only + `depth_test=false (guest asked true)` means the
+  override is active, which is the intended state; if the picture is still wrong
+  the cause is elsewhere and the PNG says where.
+- `depth_test=true` on such a framebuffer means the override is not reaching the
+  draw — a missed state-change site, not a wrong theory.
+- `glViewport mapping` lines settle the 320x480-drawable-vs-640x960-viewport
+  puzzle: same numbers on both sides of the arrow means the app draws at twice
+  its renderbuffer's size and the emulator is not rescaling anything.
+
 ### 3.6 Android logging facts that keep coming up
 
 - Log path: `/storage/emulated/0/Android/data/<package>/files/touchHLE_log.txt`;
@@ -439,11 +505,15 @@ merge such a commit; the previous attempt was reverted (`ec989ed`).
   `touchHLE_picker_settings.txt` as `trace_gl_errors=`) is the only diagnostic a
   tester can turn on. Instrumentation meant for testers belongs behind that
   switch, not behind an env var.
-- As of 2026-10-27, PPM dumps from `TOUCHHLE_DUMP_READBACK`,
-  `TOUCHHLE_DUMP_TEX` and the ES 2.0 post-draw capture are written to
-  `<files>/touchHLE_dumps/` instead of `/tmp/a8run/` (which does not exist on
-  Android or iOS, so those dumps had been failing silently on the only platforms
-  that produce bug reports).
+- As of 2026-10-27, dumps from `TOUCHHLE_DUMP_TEX` and the ES 2.0 post-draw
+  capture are written to `<files>/touchHLE_dumps/` instead of `/tmp/a8run/`
+  (which does not exist on Android or iOS, so those dumps had been failing
+  silently on the only platforms that produce bug reports). The presented-frame
+  dump is now a **PNG** (`presented_frame_f0.png`, `…f60.png`, `…f300.png`,
+  `…f600.png`, `…f1200.png`, `…f2400.png`), right way up and with alpha, and it
+  is gated on the picker's **Trace GL errors** switch (`TOUCHHLE_DUMP_READBACK`
+  still works for developers) — ask for those files by name, they are the
+  fastest way to tell a rendering bug from a presentation one.
 - Two traps that have already caused wrong conclusions:
   - `glTexParameteri` is logged for its **first call only**, so a missing
     `pname=` line says nothing about whether the app sets that parameter later.

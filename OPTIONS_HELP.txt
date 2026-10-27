@@ -468,6 +468,14 @@ Other options:
         and adds a glGetError() round-trip per call, so it should not be
         left on for normal use.
 
+        It also saves a handful of presented frames as PNG files in
+        touchHLE_dumps/ beside the log (frames 0, 60, 300, 600, 1200 and
+        2400), on the RAM readback present path. That is the frame the
+        emulator produced, before the compositor draws it, so it can be
+        compared with a screenshot: a file that looks right while the screen
+        does not is a presentation bug, and a file that already looks wrong
+        is a rendering one.
+
     --fix-texture-min-filter
         Workaround for apps that rely on the default ES 1.1
         GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable

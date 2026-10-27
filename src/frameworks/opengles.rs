@@ -68,6 +68,26 @@ pub struct State {
     /// cannot be decided when `glViewport` is called — we remember the request
     /// and re-apply it with the right scaling whenever the binding changes.
     guest_viewports: std::collections::HashMap<crate::ThreadId, (GLint, GLint, GLsizei, GLsizei)>,
+    /// Whether the guest has `GL_DEPTH_TEST` enabled, per thread.
+    ///
+    /// The host's own `GL_DEPTH_TEST` bit is not always the guest's, because
+    /// `depthless_framebuffers` below can force it off; this is the guest's
+    /// request, which is what `glIsEnabled(GL_DEPTH_TEST)` must report.
+    guest_depth_test: std::collections::HashMap<crate::ThreadId, bool>,
+    /// Framebuffers whose only depth attachment is the one touchHLE
+    /// synthesised for them.
+    ///
+    /// OpenGL ES says a framebuffer with no depth attachment behaves as if
+    /// depth testing were disabled (Khronos OpenGL Wiki, "Depth Test":
+    /// "When rendering to a framebuffer that has no depth buffer, depth testing
+    /// always behaves as though the test is disabled"). So for these
+    /// framebuffers `GL_DEPTH_TEST` is forced off on the host while they are
+    /// bound. The synthesised buffer exists only to stop strict drivers from
+    /// rejecting every fragment; letting it reject fragments of its own — from
+    /// contents that start out undefined and that a guest which never attached
+    /// depth has no reason to clear — turns "no depth buffer" into "depth
+    /// buffer full of junk", which is the x-ray/black-scene shape.
+    depthless_framebuffers: std::collections::HashSet<GLuint>,
 }
 impl State {
     fn current_ctx_for_thread(&mut self, thread: crate::ThreadId) -> &mut Option<crate::objc::id> {
@@ -116,6 +136,55 @@ impl State {
         thread: crate::ThreadId,
     ) -> Option<(GLint, GLint, GLsizei, GLsizei)> {
         self.guest_viewports.get(&thread).copied()
+    }
+
+    /// Record the guest's own `GL_DEPTH_TEST` request for a thread.
+    pub fn set_guest_depth_test(&mut self, thread: crate::ThreadId, enabled: bool) {
+        self.guest_depth_test.insert(thread, enabled);
+    }
+
+    /// The guest's own `GL_DEPTH_TEST` request for a thread.
+    ///
+    /// Depth testing is disabled in the initial GL state.
+    pub fn guest_depth_test(&self, thread: crate::ThreadId) -> bool {
+        self.guest_depth_test.get(&thread).copied().unwrap_or(false)
+    }
+
+    /// Record whether a framebuffer's depth attachment is touchHLE's, i.e.
+    /// whether the guest itself never attached one.
+    pub fn set_framebuffer_depthless(&mut self, framebuffer: GLuint, depthless: bool) {
+        // Framebuffer 0 is the window/drawable itself; it has a depth buffer of
+        // its own and this bookkeeping does not apply to it.
+        if framebuffer == 0 {
+            return;
+        }
+        if depthless {
+            self.depthless_framebuffers.insert(framebuffer);
+        } else {
+            self.depthless_framebuffers.remove(&framebuffer);
+        }
+    }
+
+    /// The framebuffer the guest has bound on this thread (0 is the window).
+    pub fn bound_framebuffer(&self, thread: crate::ThreadId) -> GLuint {
+        self.bound_framebuffers
+            .get(&thread)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Whether the framebuffer bound by `thread` has no depth attachment of the
+    /// guest's own, so depth testing must behave as disabled.
+    pub fn bound_framebuffer_is_depthless(&self, thread: crate::ThreadId) -> bool {
+        let framebuffer = self.bound_framebuffer(thread);
+        framebuffer != 0 && self.depthless_framebuffers.contains(&framebuffer)
+    }
+
+    /// Whether `GL_DEPTH_TEST` should be enabled on the host right now: the
+    /// guest wants it, and the bound framebuffer actually has a depth buffer
+    /// the guest attached.
+    pub fn host_depth_test(&self, thread: crate::ThreadId) -> bool {
+        self.guest_depth_test(thread) && !self.bound_framebuffer_is_depthless(thread)
     }
 
     pub fn scale_hack_applies_to_viewport(&self, thread: crate::ThreadId) -> bool {
@@ -173,4 +242,56 @@ fn get_thread_context<'objc>(
     let gles_ctx: &mut (dyn crate::gles::GLESContext + 'static) =
         host_obj.gles_ctx.as_deref_mut()?;
     Some(gles_ctx as &mut dyn crate::gles::GLESContext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+
+    /// A framebuffer whose depth attachment touchHLE synthesised must behave as
+    /// if depth testing were disabled, while the guest's own request is left
+    /// alone so `glIsEnabled(GL_DEPTH_TEST)` can report it.
+    ///
+    /// OpenGL ES: "When rendering to a framebuffer that has no depth buffer,
+    /// depth testing always behaves as though the test is disabled."
+    /// (Khronos OpenGL Wiki, Depth Test.)
+    #[test]
+    fn depth_test_is_disabled_for_framebuffers_with_a_synthesised_depth_buffer() {
+        let thread = 1;
+        let mut state = State::default();
+        state.set_guest_depth_test(thread, true);
+        // Nothing bound, or the window drawable: the guest's request stands.
+        assert!(state.host_depth_test(thread));
+        state.set_bound_framebuffer(thread, 7);
+        assert!(state.host_depth_test(thread));
+        // The guest never attached a depth buffer to framebuffer 7.
+        state.set_framebuffer_depthless(7, true);
+        assert!(state.bound_framebuffer_is_depthless(thread));
+        assert!(!state.host_depth_test(thread));
+        assert!(state.guest_depth_test(thread));
+        // Another framebuffer's depth-ness is not this one's.
+        state.set_framebuffer_depthless(8, true);
+        assert!(!state.host_depth_test(thread));
+        // Binding a framebuffer that has a depth buffer of its own restores it.
+        state.set_bound_framebuffer(thread, 9);
+        assert!(state.host_depth_test(thread));
+        // As does the guest attaching its own depth buffer to framebuffer 7.
+        state.set_bound_framebuffer(thread, 7);
+        assert!(!state.host_depth_test(thread));
+        state.set_framebuffer_depthless(7, false);
+        assert!(state.host_depth_test(thread));
+    }
+
+    /// The window drawable always has a depth buffer, so it is never treated as
+    /// depth-less however the guest's own framebuffers are recorded.
+    #[test]
+    fn window_framebuffer_is_never_treated_as_depthless() {
+        let thread = 1;
+        let mut state = State::default();
+        state.set_guest_depth_test(thread, true);
+        state.set_framebuffer_depthless(0, true);
+        state.set_bound_framebuffer(thread, 0);
+        assert!(!state.bound_framebuffer_is_depthless(thread));
+        assert!(state.host_depth_test(thread));
+    }
 }
