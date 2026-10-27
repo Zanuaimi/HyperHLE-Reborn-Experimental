@@ -1399,6 +1399,68 @@ fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
     }
 }
 
+/// One-shot diagnostic for "the picture looks see-through / x-ray when Force
+/// Composition is on, but not when the frame goes straight to the screen".
+///
+/// The direct route hands the frame to the platform's swap chain, which has no
+/// alpha channel; the composition route blends the frame into the window using
+/// CoreAnimation's premultiplied-alpha contract, so the alpha channel that the
+/// app's GL pipeline happened to leave behind suddenly matters. A layer that
+/// was never marked opaque therefore composites differently from the direct
+/// route: `CALayer.opaque` defaults to `NO`, and an app that hands
+/// `renderbufferStorage:fromDrawable:` a bare `CALayer` instead of its view's
+/// backing layer never picks up UIKit's implicit `opaque = YES`.
+///
+/// Framebuffer alpha is also not meaningful in general: with
+/// `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` the alpha channel
+/// accumulates as `src + dst(1-src)` *of the source alpha*, so a scene whose
+/// materials use texture alpha ends up with alpha well under 255 in exactly
+/// the places that then look transparent.
+///
+/// Reading that back costs nothing here (the frame is already in RAM), so
+/// report it once per session rather than making the next bug report start
+/// with a rebuild.
+fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.load(Ordering::Relaxed) {
+        return;
+    }
+    // `-[CALayer isOpaque]` is the flag the compositor branches on (see
+    // ca_layer / composition); an opaque layer's frame has its alpha forced to
+    // 255 before upload, so alpha can't leak into the window.
+    let opaque: bool = msg![env; drawable isOpaque];
+    if opaque {
+        return;
+    }
+    REPORTED.store(true, Ordering::Relaxed);
+    // Sample rather than scan: a 320x480 frame is 153k pixels and this is
+    // only a triage hint, not a measurement.
+    let mut translucent = 0u32;
+    let mut fully_transparent = 0u32;
+    let mut sampled = 0u32;
+    for px in pixels.chunks_exact(4).step_by(97) {
+        sampled += 1;
+        match px[3] {
+            0 => {
+                fully_transparent += 1;
+                translucent += 1;
+            }
+            255 => {}
+            _ => translucent += 1,
+        }
+    }
+    log!(
+        "Presented frame to a non-opaque layer: sampling {sampled} pixels gives \
+         {translucent} with alpha < 255 and {fully_transparent} with alpha = 0. \
+         The composition path blends the frame with GL_ONE/ONE_MINUS_SRC_ALPHA, \
+         so a frame with meaningful alpha composites differently from the \
+         direct present path, which ignores it. If the picture is see-through \
+         or black only with Force Composition, this is why: check whether the \
+         app's drawable really is a bare CALayer that never got opaque = YES."
+    );
+}
+
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
     // PERF: recycle the layer's previous pixel buffer instead of allocating
     // (and page-faulting in) a fresh multi-megabyte Vec every frame.
@@ -1420,6 +1482,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         return;
     };
     dump_readback_ppm(&pixels, width, height);
+    log_nonopaque_present_once(env, drawable, &pixels);
     present_pixels(env, drawable, pixels, width, height);
     let force_composition = env.options.force_composition;
     env.options.force_composition = true;
