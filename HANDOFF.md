@@ -513,8 +513,8 @@ limit** — hence F2 in the plan doc (eviction turns the `Build` step from 13 in
 |---|---|
 | Merged PR | #1, merge commit `bee1ffc`, merged 2026-10-26T09:22Z |
 | Local `trunk` | `6fab5922` (= upstream `v1.2.12` merge base) |
-| Session branch head | `d65f349f` (2026-10-27 review pass) |
-| Rendering-fix commits | `babfe011`, `271d0c42`, `6dc6e2c2`, `262d47e4` — **uncompiled** |
+| Session branch head | see `git log -1` (a hash written here is stale on arrival) |
+| Rendering-fix commits | `babfe011`, `271d0c42`, `6dc6e2c2`, `262d47e4`, `19031d61`, `d65f349f` — **all uncompiled** |
 | EAGL diagnostics commit | `53c412e` (+ `c4068ce`… review fixes) |
 | Workflow commits | `8ab1b9e`, `6208b39`, `1f51777`, `9eb2729`, `c4068ce`, `e950e99` |
 | TEMP ANGLE rollback / revert | `6d002ed` / `ec989ed` (content-neutral) |
