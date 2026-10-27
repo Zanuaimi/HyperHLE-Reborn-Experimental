@@ -274,30 +274,58 @@ impl Image {
         rgba: &[u8],
         stride: i32,
     ) -> i32 {
-        unsafe extern "C" fn write_cb(
-            context: *mut std::ffi::c_void,
-            data: *mut std::ffi::c_void,
-            size: std::ffi::c_int,
-        ) {
-            if context.is_null() || data.is_null() || size <= 0 {
-                return;
-            }
-            let out: &mut Vec<u8> = &mut *(context as *mut Vec<u8>);
-            let bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
-            out.extend_from_slice(bytes);
+        let Some(png) = encode_png_rgba(w, h, rgba, stride) else {
+            return 0;
+        };
+        if ctx_ptr.is_null() {
+            return 0;
         }
+        let out: &mut Vec<u8> = unsafe { &mut *(ctx_ptr as *mut Vec<u8>) };
+        out.extend_from_slice(&png);
+        png.len() as i32
+    }
+}
 
-        unsafe {
-            stbi_write_png_to_func(
-                Some(write_cb),
-                ctx_ptr,
-                w,
-                h,
-                4,
-                rgba.as_ptr().cast(),
-                stride,
-            )
+/// PNG-encode an RGBA8888 buffer with stb_image_write.
+///
+/// `stride` is the number of bytes per row (normally `width * 4`). Returns
+/// `None` if the encoder fails, which in practice only happens when it runs out
+/// of memory.
+///
+/// This is free-standing rather than a method on `Image` so that diagnostics
+/// that already hold a raw pixel buffer — such as the presented-frame dump in
+/// `frameworks::opengles::eagl` — can write a viewable file without building a
+/// whole `Image` around data they do not own.
+pub fn encode_png_rgba(w: i32, h: i32, rgba: &[u8], stride: i32) -> Option<Vec<u8>> {
+    unsafe extern "C" fn write_cb(
+        context: *mut std::ffi::c_void,
+        data: *mut std::ffi::c_void,
+        size: c_int,
+    ) {
+        if context.is_null() || data.is_null() || size <= 0 {
+            return;
         }
+        let out: &mut Vec<u8> = &mut *(context as *mut Vec<u8>);
+        let bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
+        out.extend_from_slice(bytes);
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    let ok = unsafe {
+        stbi_write_png_to_func(
+            Some(write_cb),
+            &mut out as *mut Vec<u8> as *mut std::ffi::c_void,
+            w,
+            h,
+            4,
+            rgba.as_ptr().cast(),
+            stride,
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some(out)
     }
 }
 

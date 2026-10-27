@@ -1316,7 +1316,13 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
             return false;
         };
-        dump_readback_ppm(&pixels_vec, width, height);
+        dump_readback_png(
+            &pixels_vec,
+            width,
+            height,
+            env.options.trace_gl_errors
+                || crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK"),
+        );
         // The GPU-present route probes its renderbuffer, but this route did
         // not, so "the picture is black/x-ray" reports from users on the
         // readback presenter had no pixel-level evidence attached. Same frame
@@ -1402,44 +1408,71 @@ unsafe fn drain_startup_gl_errors(gles: &mut dyn GLES) {
     }
 }
 
-/// Dump one renderbuffer readback to a PPM for black-screen diagnosis
-/// (env var gated, as this is a developer-only diagnostic).
-fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
+/// Save one presented frame as a PNG, so a report of "the picture is wrong"
+/// can come with the picture.
+///
+/// The previous version of this wrote a PPM, which no phone can display: the
+/// point of comparing the frame the emulator produced with what the screen
+/// shows is lost if the tester has to convert a file first. PNG costs nothing
+/// extra, because `stb_image_write` is already linked for the screenshot API,
+/// and it keeps the alpha channel, which is exactly what the "see-through only
+/// with Force Composition" reports turn on.
+///
+/// `glReadPixels` returns rows bottom-up, so they are flipped here: the file is
+/// then in the same orientation as the screen, and the two can be compared
+/// pixel for pixel.
+///
+/// Gated on `--trace-gl-errors` (the picker's "Trace GL errors" switch, the one
+/// diagnostic a tester can actually turn on an Android device) or on the
+/// `TOUCHHLE_DUMP_READBACK` developer environment variable. Only a handful of
+/// frames are written: frame 0 can legitimately be a loading screen, so later
+/// frames are sampled too.
+fn dump_readback_png(pixels: &[u8], width: u32, height: u32, enabled: bool) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
-    if !crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK") {
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if !enabled {
         return;
     }
-    let n = CALLS.fetch_add(1, Ordering::Relaxed);
-    // Dump at several points in the session: the first frame can legitimately
-    // be black (loading screen), so also sample later frames.
     let targets = [0u32, 60, 300, 600, 1200, 2400];
     let Some(idx) = targets.iter().position(|&t| t == n) else {
         return;
     };
-    let header = format!("P6\n{} {}\n255\n", width, height);
-    let mut out = header.into_bytes();
-    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for px in pixels.chunks_exact(4) {
-        // read_renderbuffer gives RGBA8; PPM wants RGB.
-        rgb.extend_from_slice(&[px[0], px[1], px[2]]);
+    let Some(row_bytes) = (width as usize).checked_mul(4) else {
+        return;
+    };
+    let Some(image_bytes) = row_bytes.checked_mul(height as usize) else {
+        return;
+    };
+    if row_bytes == 0 || pixels.len() < image_bytes {
+        return;
     }
-    out.extend_from_slice(&rgb);
+    let mut flipped = Vec::with_capacity(image_bytes);
+    for row in pixels[..image_bytes].chunks_exact(row_bytes).rev() {
+        flipped.extend_from_slice(row);
+    }
+    let Some(png) =
+        crate::image::encode_png_rgba(width as i32, height as i32, &flipped, row_bytes as i32)
+    else {
+        log!("Failed to encode the presented-frame PNG (encoder ran out of memory?)");
+        return;
+    };
     // Dumps go next to the log file, not to a hardcoded `/tmp` path that does
     // not exist on Android or iOS.
-    let name = format!("readback_f{}.ppm", targets[idx]);
+    let name = format!("presented_frame_f{}.png", targets[idx]);
     let Some(path) = crate::paths::diagnostic_dump_path(&name) else {
         return;
     };
-    match std::fs::write(&path, &out) {
+    match std::fs::write(&path, &png) {
         Ok(()) => log!(
-            "Dumped renderbuffer readback #{} ({}x{}) to {}",
+            "Dumped presented frame #{} ({}x{}) to {} - this is the frame the \
+             emulator produced, before the compositor draws it",
             n,
             width,
             height,
             path.display()
         ),
-        Err(e) => log!("Failed to dump readback to {}: {}", path.display(), e),
+        Err(e) => log!("Failed to dump the presented frame to {}: {}", path.display(), e),
     }
 }
 
@@ -1662,8 +1695,15 @@ fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]
     );
 }
 
-/// One-shot description of the drawable the guest renders into and of the
-/// fixed-function state it renders with, printed at the first presented frame.
+/// Description of the drawable the guest renders into and of the fixed-function
+/// state it renders with, printed twice: at the first presented frame and at
+/// frame 120.
+///
+/// Two checkpoints because the first presented frame of a game is usually a
+/// splash or loading screen, and the state it shows is not the state the scene
+/// is drawn with. A report of "black models" reads differently depending on
+/// whether `lighting` was on *while the models were drawn*, and frame 0 cannot
+/// answer that.
 ///
 /// "See-through" and "black" scenes are usually explained by one of these
 /// numbers, and no other log line reports any of them:
@@ -1693,16 +1733,21 @@ fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]
 /// it, and on this route the frame has already been read back, so there is
 /// nothing to be gained by hiding its errors from it.
 unsafe fn log_drawable_capabilities_once(gles: &mut dyn GLES) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static REPORTED: AtomicBool = AtomicBool::new(false);
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
     if gles.is_es2() {
         return;
     }
-    // Mark the check done before doing the work: one shot, and this runs on the
-    // per-frame present path.
-    if REPORTED.swap(true, Ordering::Relaxed) {
-        return;
-    }
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    // Two checkpoints, not one: the first presented frame of a game is often a
+    // splash or loading screen, and its state says nothing about the scene the
+    // tester is complaining about. Frame 120 is normally past the loading
+    // screen and into the game.
+    let when = match call {
+        0 => "at the first presented frame",
+        120 => "at frame 120",
+        _ => return,
+    };
     // The framebuffer-state enums are spelled out because the generated ES 1.1
     // bindings do not export them; the capability enums below are shared with
     // the rest of the renderer.
@@ -1726,15 +1771,29 @@ unsafe fn log_drawable_capabilities_once(gles: &mut dyn GLES) {
         }
     }
     let color_material = cap(gles, gles11::COLOR_MATERIAL);
+    // `GL_DEPTH_FUNC` (0x0B74) and `GL_DEPTH_WRITEMASK` (0x0B72) are valid
+    // ES 1.1 queries, so asking for them cannot raise an error of ours. They
+    // matter for the "geometry disappears" case: `depth_func=0x201` is
+    // `GL_LESS`, which rejects a second draw at the same depth, and that is
+    // what a painter-ordered 2D scene looks like when it is depth-tested
+    // against a buffer it never asked for.
+    // The host bit, not the guest's: they differ while a framebuffer without a
+    // guest-attached depth buffer is bound, which is exactly the case worth
+    // seeing in the log. Both are printed.
+    let guest_depth_test = crate::frameworks::opengles::draw_stats::guest_depth_test();
+    let depth_func = get_int(gles, 0x0B74 /* GL_DEPTH_FUNC */);
+    let depth_writemask = get_int(gles, 0x0B72 /* GL_DEPTH_WRITEMASK */);
     log!(
-        "Drawable capabilities at the first presented frame: \
+        "Drawable capabilities {when}: \
          ALPHA_BITS={alpha_bits} DEPTH_BITS={depth_bits} \
          STENCIL_BITS={stencil_bits} | guest state: \
-         depth_test={depth_test} alpha_test={alpha_test} blend={blend} \
-         cull_face={cull_face} scissor_test={scissor_test} \
+         depth_test={depth_test} (guest asked \
+         {guest_depth_test}) depth_func={depth_func:#x} \
+         depth_writemask={depth_writemask} alpha_test={alpha_test} \
+         blend={blend} cull_face={cull_face} scissor_test={scissor_test} \
          texture_2d={texture_2d} lighting={lighting} \
          ({enabled_lights} of 8 lights enabled) fog={fog} \
-         color_material={color_material} [this log will only be shown once]"
+         color_material={color_material}"
     );
 }
 
@@ -1761,7 +1820,12 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         log!("Native ES1 readback skipped because the GL context disappeared.");
         return;
     };
-    dump_readback_ppm(&pixels, width, height);
+    dump_readback_png(
+        &pixels,
+        width,
+        height,
+        env.options.trace_gl_errors || crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK"),
+    );
     probe_readback_content(&pixels, width, height);
     log_nonopaque_present_once(env, drawable, &pixels);
     present_pixels(env, drawable, pixels, width, height);
