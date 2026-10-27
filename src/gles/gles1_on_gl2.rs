@@ -29,8 +29,8 @@ const IMPLEMENTATION_COLOR_READ_TYPE_OES: GLenum = 0x8B98;
 use super::gles_generic::GLES;
 use super::util::{
     base_min_filter, fix_texture_min_filter_enabled, fixed_to_float, float_to_fixed,
-    is_npot_upload, matrix_fixed_to_float, try_decode_pvrtc, PalettedTextureFormat, ParamTable,
-    ParamType,
+    is_npot_upload, matrix_fixed_to_float, tex_parameter_target, try_decode_pvrtc,
+    PalettedTextureFormat, ParamTable, ParamType,
 };
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
@@ -2569,7 +2569,7 @@ impl GLES for GLES1OnGL2<'_> {
             type_,
             pixels,
         );
-        degrade_mipmap_min_filter(level, width, height);
+        degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn TexSubImage2D(
         &mut self,
@@ -2699,7 +2699,7 @@ impl GLES for GLES1OnGL2<'_> {
                 internalformat
             );
         }
-        degrade_mipmap_min_filter(level, width, height);
+        degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn CompressedTexSubImage2D(
         &mut self,
@@ -2782,7 +2782,12 @@ impl GLES for GLES1OnGL2<'_> {
                 || internalformat as GLenum == gl21::LUMINANCE_ALPHA
         );
         assert!(border == 0);
-        gl21::CopyTexImage2D(target, level, internalformat, x, y, width, height, border)
+        gl21::CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        // `glCopyTexImage2D` allocates level-0 storage like `glTexImage2D`, so
+        // an NPOT copy has the same "mipmapped filter with no mip levels"
+        // problem. Desktop GL supports NPOT mip chains, so only the filter
+        // fix-up applies here — the wrap mode is left alone.
+        degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn CopyTexSubImage2D(
         &mut self,
@@ -3846,16 +3851,24 @@ impl GLES for GLES1OnGL2<'_> {
 /// chains, so forcing `GL_CLAMP_TO_EDGE` would only take fidelity away. That
 /// is also why the workaround is off by default off-Android
 /// (`fix_texture_min_filter_enabled`).
-unsafe fn degrade_mipmap_min_filter(level: GLint, width: GLsizei, height: GLsizei) {
+unsafe fn degrade_mipmap_min_filter(
+    target: GLenum,
+    level: GLint,
+    width: GLsizei,
+    height: GLsizei,
+) {
     if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
         return;
     }
+    // A cube-map face upload binds `GL_TEXTURE_CUBE_MAP`, so asking for
+    // `TEXTURE_2D` state here would read and write the wrong texture object.
+    let p_target = tex_parameter_target(target);
     let mut min_filter: GLint = 0;
-    gl21::GetTexParameteriv(gl21::TEXTURE_2D, gl21::TEXTURE_MIN_FILTER, &mut min_filter);
+    gl21::GetTexParameteriv(p_target, gl21::TEXTURE_MIN_FILTER, &mut min_filter);
     let Some(replacement) = base_min_filter(min_filter) else {
         return;
     };
-    gl21::TexParameteri(gl21::TEXTURE_2D, gl21::TEXTURE_MIN_FILTER, replacement);
+    gl21::TexParameteri(p_target, gl21::TEXTURE_MIN_FILTER, replacement);
     log_dbg!(
         "GLES1OnGL2: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \
          non-power-of-two level-0 texture replaced with {replacement:#x} \

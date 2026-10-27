@@ -2596,7 +2596,11 @@ impl GLES for GLES1OnGLES2<'_> {
         height: GLsizei,
         border: GLint,
     ) {
+        // `glCopyTexImage2D` allocates level-0 storage exactly like
+        // `glTexImage2D`, so the NPOT workarounds apply to it too.
+        self.apply_npot_workarounds(target, level, width, height);
         gl::CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        self.degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn CopyTexSubImage2D(
         &mut self,
@@ -2622,6 +2626,11 @@ impl GLES for GLES1OnGLES2<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
+        // PVRTC is what iPhone OS games mostly ship, so the NPOT wrap fix-up
+        // has to happen here and not only in `TexImage2D`. The software-decode
+        // paths below upload through `TexImage2D` as well, so this is
+        // redundant for them and harmless.
+        self.apply_npot_workarounds(target, level, width, height);
         if !data.is_null() && image_size > 0 {
             let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize);
             if try_decode_pvrtc(

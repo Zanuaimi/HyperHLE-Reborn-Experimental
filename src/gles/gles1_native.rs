@@ -1054,19 +1054,9 @@ impl GLES for GLES1Native<'_> {
         if old_alignment != 1 {
             gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
         }
-        // A guest-set mipmapped `TEXTURE_MIN_FILTER` on a non-power-of-two
-        // level-0 texture makes the texture incomplete on strict drivers:
-        // sampled texels come back undefined (pink/black garbage) instead of
-        // falling back to base-level sampling like lenient drivers do.
-        // Degrade the mipmap filter to its base filtering mode (preserving
-        // the guest's nearest/linear intent). Only for non-power-of-two
-        // dimensions; power-of-two textures support mipmaps everywhere.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && is_npot_upload(width, height)
-        {
-            self.fix_mipmap_min_filter(target);
-        }
+        // See `degrade_mipmap_min_filter_after_upload`: a level-0 NPOT upload
+        // leaves any mipmapped filter with no mip levels behind it.
+        self.degrade_mipmap_min_filter_after_upload(target, level, width, height);
     }
 
     unsafe fn TexSubImage2D(
@@ -1118,15 +1108,8 @@ impl GLES for GLES1Native<'_> {
         if old_alignment != 1 {
             gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
         }
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && is_npot_upload(width, height)
-        {
-            self.fix_mipmap_min_filter(target);
-        }
+        self.degrade_mipmap_min_filter_after_upload(target, level, width, height);
     }
-
-
 
     unsafe fn CompressedTexSubImage2D(
         &mut self,
@@ -1175,8 +1158,13 @@ impl GLES for GLES1Native<'_> {
         height: GLsizei,
         border: GLint,
     ) {
-        gles11::CopyTexImage2D(target, level, internalformat, x, y, width, height, border)
+        // `glCopyTexImage2D` allocates level-0 storage exactly like
+        // `glTexImage2D`, so the same strict-driver rules apply.
+        self.force_clamp_to_edge_for_npot(target, level, width, height);
+        gles11::CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        self.degrade_mipmap_min_filter_after_upload(target, level, width, height);
     }
+
     unsafe fn CopyTexSubImage2D(
         &mut self,
         target: GLenum,
@@ -1878,30 +1866,7 @@ impl GLES1Native<'_> {
         if format == gles11::BGRA_EXT {
             internalformat = gles11::BGRA_EXT as GLint
         }
-        // Strict ES 1.1 drivers (ANGLE's GLES1 front-end, Adreno's native ES
-        // 1.1) reject non-power-of-two uploads unless the texture samples
-        // with CLAMP_TO_EDGE and a non-mipmap filter: the upload fails with
-        // GL_INVALID_ENUM and every draw sampling the texture shows garbage
-        // / black. Guest UI surfaces are typically NPOT (320x480 video
-        // planes, 640x1136 compositor framebuffers), and guests routinely
-        // leave GL_REPEAT as the wrap mode. Force CLAMP_TO_EDGE on the
-        // current binding for NPOT uploads; wrap is per-texture-object
-        // state, so other textures are unaffected.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && is_npot_upload(width, height)
-        {
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_S,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_T,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-        }
+        self.force_clamp_to_edge_for_npot(target, level, width, height);
         gles11::TexImage2D(
             target,
             level,
@@ -1913,6 +1878,58 @@ impl GLES1Native<'_> {
             type_,
             pixels,
         )
+    }
+
+    /// Force `GL_CLAMP_TO_EDGE` on both wrap axes of the currently-bound
+    /// texture before a non-power-of-two level-0 upload.
+    ///
+    /// Strict ES 1.1 drivers (ANGLE's GLES1 front-end, Adreno's native ES 1.1)
+    /// reject a non-power-of-two upload unless the texture samples with
+    /// `CLAMP_TO_EDGE` and a non-mipmap filter: the upload fails with
+    /// `GL_INVALID_ENUM` and every draw sampling the texture shows garbage or
+    /// black. Guest UI surfaces are typically NPOT (320x480 video planes,
+    /// 640x1136 compositor framebuffers), and guests routinely leave
+    /// `GL_REPEAT` as the wrap mode. Wrap is per-texture-object state, so
+    /// other textures are unaffected.
+    ///
+    /// Used by both the uncompressed and the compressed upload paths: PVRTC is
+    /// what iPhone OS games actually ship, so a fix that only applied to
+    /// `glTexImage2D` would miss most of them.
+    unsafe fn force_clamp_to_edge_for_npot(
+        &self,
+        target: GLenum,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+            return;
+        }
+        // A cube-map face upload binds `TEXTURE_CUBE_MAP`; setting the
+        // parameters on `TEXTURE_2D` there would touch the wrong object.
+        let p_target = tex_parameter_target(target);
+        gles11::TexParameteri(p_target, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
+        gles11::TexParameteri(p_target, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+    }
+
+    /// The post-upload half of the non-power-of-two workarounds: if a level-0
+    /// NPOT upload just replaced the texture's storage, degrade a mipmapped
+    /// `TEXTURE_MIN_FILTER` that now has no mip levels behind it.
+    ///
+    /// Kept separate from [Self::force_clamp_to_edge_for_npot] because it has
+    /// to run *after* the upload (the filter state is read back from the
+    /// driver), while the clamp fix-up has to run before it.
+    unsafe fn degrade_mipmap_min_filter_after_upload(
+        &mut self,
+        target: GLenum,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+            return;
+        }
+        self.fix_mipmap_min_filter(target);
     }
 
     /// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound
@@ -1932,12 +1949,18 @@ impl GLES1Native<'_> {
     /// `TEXTURE_CUBE_MAP`, and setting `TEXTURE_MIN_FILTER` with
     /// `TEXTURE_2D` while the cube map is bound is a silent no-op.
     unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
+        let p_target = tex_parameter_target(target);
+        // `glGetTexParameteriv`, not `glGetIntegerv`: `TEXTURE_MIN_FILTER` is
+        // per-texture-object state, and ES 1.1 does not list it among the
+        // values `glGetIntegerv` accepts, so a strict driver answers the
+        // latter with `GL_INVALID_ENUM` and leaves the output untouched -
+        // which would make this whole workaround a silent no-op (and put a
+        // stray error in the guest's queue as a bonus).
         let mut min_filter: GLint = 0;
-        gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
+        gles11::GetTexParameteriv(p_target, gles11::TEXTURE_MIN_FILTER, &mut min_filter);
         let Some(replacement) = base_min_filter(min_filter) else {
             return;
         };
-        let p_target = tex_parameter_target(target);
         gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, replacement as _);
         log_dbg!(
             "GLES1Native: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \
@@ -1945,6 +1968,7 @@ impl GLES1Native<'_> {
              [incomplete-texture workaround for strict drivers]"
         );
     }
+
     unsafe fn compressed_tex_image_2d_inner(
         &mut self,
         target: GLenum,
@@ -1956,6 +1980,10 @@ impl GLES1Native<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
+        // Before any upload: a strict driver rejects NPOT storage that still
+        // has `GL_REPEAT` set, and the compressed path is the one iOS games
+        // actually use.
+        self.force_clamp_to_edge_for_npot(target, level, width, height);
 
         // POSIX-style guard: a NULL data pointer with image_size==0 is
         // technically allowed by the spec for some texture-storage queries,
