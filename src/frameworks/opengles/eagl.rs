@@ -1420,6 +1420,9 @@ fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
 /// Reading that back costs nothing here (the frame is already in RAM), so
 /// report it once per session rather than making the next bug report start
 /// with a rebuild.
+///
+/// See the note on `CALayer.opaque` in composition.rs:
+/// https://developer.apple.com/documentation/quartzcore/calayer/1410763-isopaque
 fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static REPORTED: AtomicBool = AtomicBool::new(false);

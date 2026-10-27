@@ -822,6 +822,10 @@ pub trait GLES {
     /// forward to a host driver must report whether that driver advertises
     /// the extension, so the guest can fall back to its own CPU skinning path
     /// instead of taking a route that silently produces wrong geometry.
+    ///
+    /// Reference: `GL_OES_matrix_palette` (Khronos), where the weighted
+    /// transform is `eye = sum_i w_i * (palette[index_i] * object)`:
+    /// https://registry.khronos.org/OpenGL/extensions/OES/OES_matrix_palette.txt
     fn supports_matrix_palette(&self) -> bool {
         true
     }
