@@ -740,7 +740,7 @@ jobs:
       # Only present when the run asked for the Intel leg; the packaging
       # script leaves the zip out rather than failing.
       - name: Download macOS Intel artifact
-        if: needs.plan-macos.outputs.build_x86_64 == 'true'
+        if: ${{ needs.plan-macos.outputs.build_x86_64 == 'true' }}
         uses: actions/download-artifact@main
         with:
           name: HyperHLE_macOS_x86_64
@@ -748,7 +748,7 @@ jobs:
       # Without this the Intel download would simply be missing from the
       # release, which is easy to publish by accident.
       - name: Note the skipped macOS Intel build
-        if: needs.plan-macos.outputs.build_x86_64 != 'true'
+        if: ${{ needs.plan-macos.outputs.build_x86_64 != 'true' }}
         run: |
           echo "::warning::no macOS Intel (x86_64) DMG in this release; start a run with 'Build the macOS Intel (x86_64) DMG too' ticked if it is needed"
 
