@@ -444,6 +444,30 @@ merge such a commit; the previous attempt was reverted (`ec989ed`).
     indistinguishable from one the call itself raised. Read the
     "… pending before a call dispatched from" line when present.
 
+### 3.7 Getting a build to test (2026-10-27, verified)
+
+- Pushes to a non-trunk branch do **not** trigger `.github/workflows/HyperHLE_release.yml`
+  (`on.push.branches` is `trunk` only). Creating the branch fired a `create`
+  run; later pushes fire nothing.
+- A `create` run builds every leg and uploads artifacts but **never publishes a
+  release**: `check-hyperhle-release` is gated to `push` on trunk or
+  `workflow_dispatch`, so `publish-hyperhle-release` is skipped.
+- `gh workflow run … --ref <branch>` and `gh run rerun --failed` are both
+  refused for this token (403 / "cannot be rerun"), and artifacts cannot be
+  downloaded from the sandbox at all: `api.github.com` hands back a redirect to
+  `productionresultssa11.blob.core.windows.net`, which is not on the sandbox's
+  outbound allowlist.
+- Therefore the only ways to get an installable APK are (a) the user downloads
+  the `HyperHLE_Android_AArch64` artifact from the run page in a browser, or
+  (b) the user starts the workflow from the Actions UI with **Publish a
+  HyperHLE release** ticked, which forces `should_release=true` and publishes
+  `v<next>` from whatever ref was chosen (pick this branch in the dropdown).
+- Round-28 run `40532708135` (this branch, `4afbbd7`): build-linux,
+  build-android, build-win, build-osx and test-macos all **success** — so the
+  round-28 code compiled and its unit tests passed on Linux, Android, Windows
+  and macOS. `build-ios` was **cancelled** (runner capacity, no steps recorded),
+  which is what blocked `check-hyperhle-release` and `publish-hyperhle-release`.
+
 ---
 
 ## 4. Measurements (facts, not projections)
