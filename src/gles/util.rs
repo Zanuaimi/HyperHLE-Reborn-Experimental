@@ -51,8 +51,8 @@ mod pvrtc_payload_size_tests {
 #[cfg(test)]
 mod npot_workaround_tests {
     use super::{
-        base_min_filter, is_npot_upload, tex_parameter_target, TEXTURE_CUBE_MAP,
-        TEXTURE_CUBE_MAP_NEGATIVE_Z, TEXTURE_CUBE_MAP_POSITIVE_X,
+        base_min_filter, is_npot_upload, npot_upload_workaround_enabled, tex_parameter_target,
+        TEXTURE_CUBE_MAP, TEXTURE_CUBE_MAP_NEGATIVE_Z, TEXTURE_CUBE_MAP_POSITIVE_X,
     };
     use crate::gles::gles11_raw as gles11;
 
@@ -66,6 +66,14 @@ mod npot_workaround_tests {
         // Storage probes and malformed calls still get the workarounds.
         assert!(is_npot_upload(0, 0));
         assert!(is_npot_upload(-4, 16));
+    }
+
+    #[test]
+    fn enables_workaround_only_for_level_zero_npot_uploads_when_option_is_enabled() {
+        assert!(npot_upload_workaround_enabled(0, 320, 480, true));
+        assert!(!npot_upload_workaround_enabled(1, 320, 480, true));
+        assert!(!npot_upload_workaround_enabled(0, 64, 64, true));
+        assert!(!npot_upload_workaround_enabled(0, 320, 480, false));
     }
 
     #[test]
@@ -181,6 +189,20 @@ pub fn fix_texture_min_filter_enabled() -> bool {
         Some("1") => true,
         _ => cfg!(target_os = "android"),
     }
+}
+
+/// Whether the NPOT upload workaround applies to this level-0 upload.
+///
+/// Callers use this before changing texture wrap parameters and after uploads
+/// to repair minification filters. Keep the shared eligibility check in one
+/// place so the pre- and post-upload paths remain in sync.
+pub fn npot_upload_workaround_enabled(
+    level: GLint,
+    width: GLsizei,
+    height: GLsizei,
+    workaround_enabled: bool,
+) -> bool {
+    level == 0 && workaround_enabled && is_npot_upload(width, height)
 }
 
 /// Whether an upload of `width` x `height` needs the non-power-of-two texture

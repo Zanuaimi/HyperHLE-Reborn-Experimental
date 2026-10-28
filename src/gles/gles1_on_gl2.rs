@@ -29,7 +29,7 @@ const IMPLEMENTATION_COLOR_READ_TYPE_OES: GLenum = 0x8B98;
 use super::gles_generic::GLES;
 use super::util::{
     base_min_filter, fix_texture_min_filter_enabled, fixed_to_float, float_to_fixed,
-    is_npot_upload, matrix_fixed_to_float, tex_parameter_target, try_decode_pvrtc,
+    matrix_fixed_to_float, npot_upload_workaround_enabled, tex_parameter_target, try_decode_pvrtc,
     PalettedTextureFormat, ParamTable, ParamType,
 };
 use super::GLESContext;
@@ -3857,7 +3857,7 @@ unsafe fn degrade_mipmap_min_filter(
     width: GLsizei,
     height: GLsizei,
 ) {
-    if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+    if !npot_upload_workaround_enabled(level, width, height, fix_texture_min_filter_enabled()) {
         return;
     }
     // A cube-map face upload binds `GL_TEXTURE_CUBE_MAP`, so asking for

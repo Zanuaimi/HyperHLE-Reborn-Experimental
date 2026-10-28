@@ -10,8 +10,8 @@ use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles_generic::GLES;
 use super::util::{
-    base_min_filter, fix_texture_min_filter_enabled, is_npot_upload, tex_parameter_target,
-    try_decode_pvrtc, PalettedTextureFormat,
+    base_min_filter, fix_texture_min_filter_enabled, npot_upload_workaround_enabled,
+    tex_parameter_target, try_decode_pvrtc, PalettedTextureFormat,
 };
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
@@ -1893,7 +1893,7 @@ impl GLES1Native<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+        if !npot_upload_workaround_enabled(level, width, height, fix_texture_min_filter_enabled()) {
             return;
         }
         // A cube-map face upload binds `TEXTURE_CUBE_MAP`; setting the
@@ -1917,7 +1917,7 @@ impl GLES1Native<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+        if !npot_upload_workaround_enabled(level, width, height, fix_texture_min_filter_enabled()) {
             return;
         }
         self.fix_mipmap_min_filter(target);
@@ -2157,8 +2157,6 @@ impl GLES1Native<'_> {
         );
     }
 }
-
-
 impl<'gl_ctx> GLES1Native<'gl_ctx> {
     /// Helper used by every `OpenGL ES 2.0` shader-pipeline override above
     /// to flag a synthetic `GL_INVALID_OPERATION` and emit a one-shot

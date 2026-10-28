@@ -16,7 +16,7 @@ use super::gles2_raw::types::*;
 use super::gles_generic::{GLchar, GLES};
 use super::util::{
     base_min_filter, fix_texture_min_filter_enabled, fixed_to_float, float_to_fixed,
-    is_npot_upload, tex_parameter_target, try_decode_pvrtc, PalettedTextureFormat,
+    npot_upload_workaround_enabled, tex_parameter_target, try_decode_pvrtc, PalettedTextureFormat,
 };
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
@@ -4013,7 +4013,7 @@ impl GLES1OnGLES2<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+        if !npot_upload_workaround_enabled(level, width, height, fix_texture_min_filter_enabled()) {
             return;
         }
         let p_target = tex_parameter_target(target);
@@ -4038,7 +4038,7 @@ impl GLES1OnGLES2<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        if level != 0 || !fix_texture_min_filter_enabled() || !is_npot_upload(width, height) {
+        if !npot_upload_workaround_enabled(level, width, height, fix_texture_min_filter_enabled()) {
             return;
         }
         // Query with `glGetTexParameteriv` rather than `glGetIntegerv`: the
