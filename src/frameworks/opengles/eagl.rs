@@ -158,6 +158,7 @@ fn effective_eagl_api(
 /// context (the presenter) always restores what it found, so the mirror stays
 /// valid across presents.
 pub(super) struct GLShadowState {
+    pub(super) resource_group_token: usize,
     /// `GL_ARRAY_BUFFER_BINDING`.
     pub(super) array_buffer: GLuint,
     /// `GL_ELEMENT_ARRAY_BUFFER_BINDING`. `None` means "unknown, ask the
@@ -195,6 +196,7 @@ pub(super) struct GLShadowState {
 impl Default for GLShadowState {
     fn default() -> Self {
         GLShadowState {
+            resource_group_token: 0,
             array_buffer: 0,
             element_array_buffer: Some(0),
             fog_enabled: false,
@@ -351,6 +353,7 @@ pub(super) struct EAGLContextHostObject {
     pub(super) gles_ctx: Option<Box<dyn GLESContext>>,
     /// Guest object addresses can be reused when a game session restarts.
     present_token: usize,
+    resource_group_token: usize,
     /// See [GLShadowState].
     pub(super) shadow: GLShadowState,
     /// Which EAGL rendering API was requested. This influences how
@@ -371,7 +374,6 @@ pub(super) struct EAGLContextHostObject {
 }
 impl HostObject for EAGLContextHostObject {}
 
-static NEXT_PRESENT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 /// Log the effective state of the `fix_texture_min_filter` option once,
 /// the first time an EAGL context is created. This makes it easy to
@@ -414,7 +416,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)alloc {
     let host_object = Box::new(EAGLContextHostObject {
         gles_ctx: None,
-        present_token: NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        present_token: crate::gles::perf_overlay::allocate_context_token(),
+        resource_group_token: 0,
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         drawable_framebuffer: 0,
@@ -465,6 +468,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         return msg![env; this initWithAPI:api];
     }
 
+    let resource_group_token = {
+        let group_context = env.objc.borrow::<EAGLContextHostObject>(group);
+        if group_context.resource_group_token != 0 {
+            group_context.resource_group_token
+        } else {
+            group_context.present_token
+        }
+    };
+
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let prev_context = env.objc.borrow_mut::<EAGLContextHostObject>(group).gles_ctx.as_mut().unwrap();
 
@@ -505,10 +517,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         framebuffer as GLuint
     };
 
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    host_object.gles_ctx = Some(gles_ins);
-    host_object.api = effective_api;
-    host_object.drawable_framebuffer = drawable_framebuffer;
+    {
+        let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        host_object.gles_ctx = Some(gles_ins);
+        host_object.api = effective_api;
+        host_object.drawable_framebuffer = drawable_framebuffer;
+        host_object.resource_group_token = resource_group_token;
+        host_object.shadow.resource_group_token = resource_group_token;
+    }
+    crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
     env.window.as_mut().unwrap().set_share_with_current_context(false);
 
@@ -527,6 +544,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         return nil;
     }
+
+    let resource_group_token = env.objc.borrow::<EAGLContextHostObject>(this).present_token;
 
     let effective_api = effective_eagl_api(
         api,
@@ -556,10 +575,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         framebuffer as GLuint
     };
 
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    host_object.gles_ctx = Some(gles_ins);
-    host_object.api = effective_api;
-    host_object.drawable_framebuffer = drawable_framebuffer;
+    {
+        let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        host_object.gles_ctx = Some(gles_ins);
+        host_object.api = effective_api;
+        host_object.drawable_framebuffer = drawable_framebuffer;
+        host_object.resource_group_token = resource_group_token;
+        host_object.shadow.resource_group_token = resource_group_token;
+    }
+    crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
     this
 }
@@ -575,16 +599,31 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    for &(guest_buf, _host_buf, _size) in host_obj.mapped_buffers.values() {
-        env.mem.free(guest_buf);
+    let (resource_group_token, drawables, mapped_guest_buffers) = {
+        let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        let mapped_guest_buffers = host_obj
+            .mapped_buffers
+            .values()
+            .map(|&(guest_buf, _, _)| guest_buf)
+            .collect::<Vec<_>>();
+        let resource_group_token = host_obj.resource_group_token;
+        host_obj.resource_group_token = 0;
+        host_obj.shadow.resource_group_token = 0;
+        let drawables = if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
+            let bindings = std::mem::take(&mut host_obj.renderbuffer_drawable_bindings);
+            bindings.take().into_values().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        (resource_group_token, drawables, mapped_guest_buffers)
+    };
+    for guest_buffer in mapped_guest_buffers {
+        env.mem.free(guest_buffer);
     }
-    if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
-        let bindings = std::mem::take(&mut host_obj.renderbuffer_drawable_bindings);
-        for (_renderbuffer, drawable) in bindings.take() {
-            release(env, drawable);
-        }
+    for drawable in drawables {
+        release(env, drawable);
     }
+    crate::gles::perf_overlay::unregister_gl_resource_context(resource_group_token);
     env.objc.dealloc_object(this, &mut env.mem);
 }
 
@@ -1001,8 +1040,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     // delayed, so this needs to be checked before returning.
     let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options, env.guest_clock.speed().multiplier());
 
-    // The iOS host always counts frames so it can show its own FPS overlay.
-    if env.options.print_fps || cfg!(target_os = "ios") {
+    if env.options.print_fps
+        || cfg!(target_os = "ios")
+        || crate::gles::present::onscreen_fps_enabled()
+    {
+        if crate::gles::perf_overlay::enabled() {
+            crate::gles::perf_overlay::record_guest_flip();
+        }
         env
             .objc
             .borrow_mut::<EAGLContextHostObject>(this)
@@ -2410,6 +2454,7 @@ unsafe fn present_renderbuffer_es2(
     // Cheat Engine-style trainer overlay (floating button + panel), drawn
     // with a dedicated ES 2.0 shader so it also works on native ES 2.0
     // drivers (Android), where the fixed-function GLES 1.x path is unusable.
+    crate::gles::perf_overlay::draw_es2(gles, viewport, context_token);
     crate::trainer_ui::draw_es2(gles, viewport, context_token);
 
     // Optional: virtual cursor.
@@ -2598,8 +2643,8 @@ fn presenter_cache_is_invalidated_across_recreated_contexts() {
     let _guard = PRESENT_CACHE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let first = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let second = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let first = crate::gles::perf_overlay::allocate_context_token();
+    let second = crate::gles::perf_overlay::allocate_context_token();
     assert_ne!(first, second);
 
     invalidate_present_cache_for_context(first);
@@ -2614,8 +2659,8 @@ fn route_memo_survives_a_frame_but_not_a_context_change() {
     let _guard = PRESENT_CACHE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let first = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let second = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let first = crate::gles::perf_overlay::allocate_context_token();
+    let second = crate::gles::perf_overlay::allocate_context_token();
     let direct = present_route_code(PresentRoute::Direct);
 
     invalidate_present_cache_for_context(first);
@@ -4127,7 +4172,13 @@ unsafe fn present_renderbuffer(
     }
 
     // Draw the quad
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    present_frame(
+        gles,
+        viewport,
+        rotation_matrix,
+        virtual_cursor_visible_at,
+        context_token,
+    );
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
