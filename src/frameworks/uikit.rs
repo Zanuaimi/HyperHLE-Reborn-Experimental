@@ -1038,11 +1038,6 @@ pub struct State {
 /// Returns the next time this function must be called, if any, e.g. the next
 /// time an accelerometer input is due.
 pub fn handle_events(env: &mut Environment) -> Option<Instant> {
-    handle_events_with_result(env).0
-}
-
-/// The run loop must distinguish input delivery from timer deadlines.
-pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instant>, bool) {
     use crate::window::Event;
     use crate::window::TextInputEvent;
 
@@ -1051,16 +1046,14 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
     // launching enters the main run loop, which calls this unconditionally —
     // so guard explicitly instead of unwrapping the absent window and panicking.
     if env.window.is_none() {
-        return (None, false);
+        return None;
     }
 
-    let mut handled = false;
     loop {
         let Some(event) = env.window_mut().pop_event() else {
             break;
         };
 
-        handled = true;
         match event {
             Event::Quit => {
                 echo!("User requested quit, exiting.");
@@ -1183,14 +1176,14 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
         }
     }
 
-    let (webview_deadline, webview_handled) = ui_view::ui_web_view::handle_native_load_events(env);
+    let (webview_deadline, _) = ui_view::ui_web_view::handle_native_load_events(env);
     let accelerometer_deadline = ui_accelerometer::handle_accelerometer(env);
     let next_deadline = match (accelerometer_deadline, webview_deadline) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
         (None, None) => None,
     };
-    (next_deadline, handled || webview_handled)
+    next_deadline
 }
 
 #[cfg(test)]
