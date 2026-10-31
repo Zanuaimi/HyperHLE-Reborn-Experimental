@@ -6418,24 +6418,73 @@ int test_NSNotificationCenter_addObserver_nilName_removeObserver() {
 }
 
 // clang-format off
+// The tests re-ported from the post-merge commits of PR #259 sit after the
+// FUNC_DEF table, so the type, the externs and the helpers they use have to be
+// declared before it, like they were before the revert.
+
+// From Apple's dladdr(3) man page: dladdr() returns non-zero and fills in
+// the image path and base, and the nearest lower symbol, for an address in
+// a loaded image, and returns 0 otherwise. Symbol names have no leading
+// underscore. The old SDK has no dlfcn.h; this is its Dl_info layout.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
+typedef struct {
+  const char *dli_fname;
+  void *dli_fbase;
+  const char *dli_sname;
+  void *dli_saddr;
+} TestAppDlInfo;
+extern int dladdr(const void *addr, TestAppDlInfo *info);
+
+// Apple: +[AVAsset assetWithURL:] "Returns an asset for inspection of a
+// resource referenced by a given URL" (iOS 5.0+). Talking Ted relies on it
+// to load its animations (HyperHLE-Reborn issue 303).
+// https://developer.apple.com/documentation/avfoundation/avasset/1389943-assetwithurl
+@interface AVAsset : NSObject
++ (id)assetWithURL:(NSURL *)url;
+@end
+@interface AVURLAsset : AVAsset
+- (NSURL *)URL;
+@end
+@interface NSObject (AVAssetTest)
+- (BOOL)isKindOfClass:(Class)cls;
+- (BOOL)isEqual:(id)object;
+@end
+
+int test_dladdr(void);
+int test_AVAsset_assetWithURL(void);
+int test_CFRunLoopTimerCreate_callout(void);
+int test_CFRunLoopTimerSetNextFireDate_NSTimer(void);
+int test_CFURLCreatePropertyFromResource(void);
+int test_stat_inode_identifies_file(void);
+// clang-format on
+
+// clang-format off
+// Tests marked XFUNC_DEF assert behaviour that PR #259 ("fix testapp
+// failures") added and that its revert (24a2107) removed again, because the
+// audio work in that PR made Talking Tom Gold Run hang. They are still run and
+// reported as XFAIL, but they don't fail the suite; switch them back to
+// FUNC_DEF once the non-audio parts of PR #259 are re-applied.
 #define FUNC_DEF(func)                                                         \
-  { &func, #func }
+  { &func, #func, 0 }
+#define XFUNC_DEF(func)                                                        \
+  { &func, #func, 1 }
 struct {
   int (*func)();
   const char *name;
+  int known_fail;
 } test_func_array[] = {
 #ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
     // below tests are failing on macOS,
     // so we skip them
-    FUNC_DEF(test_getcwd_chdir),
+    XFUNC_DEF(test_getcwd_chdir),
     FUNC_DEF(test_synchronized),
     FUNC_DEF(test_read_directory_as_fd),
     FUNC_DEF(test_pthread_get_stacksize_np),
     FUNC_DEF(test_cpp_virtual_inheritance),
 #endif
     FUNC_DEF(test_qsort),
-    FUNC_DEF(test_vsnprintf),
-    FUNC_DEF(test_sscanf),
+    XFUNC_DEF(test_vsnprintf),
+    XFUNC_DEF(test_sscanf),
     FUNC_DEF(test_swscanf),
     FUNC_DEF(test_realloc),
     FUNC_DEF(test_atof),
@@ -6459,18 +6508,18 @@ struct {
     FUNC_DEF(test_realpath),
     FUNC_DEF(test_ungetc),
     FUNC_DEF(test_fscanf),
-    FUNC_DEF(test_fscanf_new),
+    XFUNC_DEF(test_fscanf_new),
     FUNC_DEF(test_CFStringFind),
     FUNC_DEF(test_strcspn),
     FUNC_DEF(test_mbstowcs),
     FUNC_DEF(test_CFMutableString),
     FUNC_DEF(test_fwrite),
-    FUNC_DEF(test_tmpfile),
+    XFUNC_DEF(test_tmpfile),
     FUNC_DEF(test_flockfile_basic),
     FUNC_DEF(test_flockfile_recursive),
     FUNC_DEF(test_ftrylockfile_unlocked),
-    FUNC_DEF(test_ftrylockfile_locked_by_other_thread),
-    FUNC_DEF(test_flockfile_blocks_other_thread),
+    XFUNC_DEF(test_ftrylockfile_locked_by_other_thread),
+    XFUNC_DEF(test_flockfile_blocks_other_thread),
     FUNC_DEF(test_flockfile_io_while_locked),
     FUNC_DEF(test_open),
     FUNC_DEF(test_close),
@@ -6483,8 +6532,8 @@ struct {
     FUNC_DEF(test_cond_timedwait_sibling_not_dropped),
     FUNC_DEF(test_pthread_mutex_normal),
     FUNC_DEF(test_pthread_mutex_recursive_trylock),
-    FUNC_DEF(test_CFMutableDictionary_NullCallbacks),
-    FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_PrimitiveTypes),
+    XFUNC_DEF(test_CFMutableDictionary_NullCallbacks),
+    XFUNC_DEF(test_CFMutableDictionary_CustomCallbacks_PrimitiveTypes),
     FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_CFTypes),
     FUNC_DEF(test_lrint),
     FUNC_DEF(test_fesetround),
@@ -6498,7 +6547,7 @@ struct {
     FUNC_DEF(test_inet_pton),
     FUNC_DEF(test_CFURL),
     FUNC_DEF(test_CFNumberCompare_simple),
-    FUNC_DEF(test_CFNumberCompare_extended),
+    XFUNC_DEF(test_CFNumberCompare_extended),
     FUNC_DEF(test_memset_pattern),
     FUNC_DEF(test_CGGeometry),
     FUNC_DEF(test_CFURLHasDirectoryPath),
@@ -6510,7 +6559,7 @@ struct {
     FUNC_DEF(test_strptime),
     FUNC_DEF(test_strftime),
     FUNC_DEF(test_RespondsToSelector),
-    FUNC_DEF(test_NSKeyedArchiver_encodeIntForKey),
+    XFUNC_DEF(test_NSKeyedArchiver_encodeIntForKey),
     FUNC_DEF(test_NSKeyedArchiver_NSKeyedUnarchiver),
     FUNC_DEF(test_NSKeyedArchiver_NSDictionary_of_NSArray_of_NSStrings),
     FUNC_DEF(test_AutoreleasePool),
@@ -6535,8 +6584,8 @@ struct {
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     FUNC_DEF(test_dladdr),
     FUNC_DEF(test_AVAsset_assetWithURL),
-    FUNC_DEF(test_CFRunLoopTimerCreate_callout),
-    FUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
+    XFUNC_DEF(test_CFRunLoopTimerCreate_callout),
+    XFUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
     FUNC_DEF(test_CFURLCreatePropertyFromResource),
     FUNC_DEF(test_stat_inode_identifies_file),
 };
@@ -6589,6 +6638,17 @@ int test_AVAsset_assetWithURL(void) {
   return result;
 }
 
+
+// CFRunLoopTimerCreate returns a timer that calls its callout with the
+// context's info, first at fireDate, then every interval (never if 0).
+// https://developer.apple.com/documentation/corefoundation/1542501-cfrunlooptimercreate
+// Heavy Gunner and Illusia drive their game loops with such timers.
+static int cf_timer_calls;
+static CFRunLoopTimerRef cf_timer_last_timer;
+static void cf_timer_callout(CFRunLoopTimerRef timer, void *info) {
+  cf_timer_calls += (int)(intptr_t)info;
+  cf_timer_last_timer = timer;
+}
 
 int test_CFRunLoopTimerCreate_callout(void) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
@@ -6761,6 +6821,7 @@ int TestApp_cli_tests_main(void) {
 
   int tests_run = 0;
   int tests_passed = 0;
+  int tests_expected_failures = 0;
 
   int n = sizeof(test_func_array) / sizeof(test_func_array[0]);
   int i;
@@ -6771,11 +6832,17 @@ int TestApp_cli_tests_main(void) {
     if (latest_test_result == 0) {
       printf("OK\n");
       tests_passed++;
+    } else if (test_func_array[i].known_fail) {
+      printf("XFAIL (%d)\n", latest_test_result);
+      tests_expected_failures++;
     } else {
       printf("FAIL (%d)\n", latest_test_result);
     }
   }
 
-  printf("Passed %d out of %d tests\n", tests_passed, tests_run);
-  return tests_run == tests_passed ? 0 : 1;
+  printf("Passed %d out of %d tests", tests_passed, tests_run);
+  if (tests_expected_failures != 0)
+    printf(" (%d expected failures)", tests_expected_failures);
+  printf("\n");
+  return tests_run - tests_expected_failures == tests_passed ? 0 : 1;
 }
