@@ -16,6 +16,10 @@
 //!   <https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/AdvancedAnimationTricks/AdvancedAnimationTricks.html>
 //! - Algorithm for choosing interpolation values
 //!   <https://developer.apple.com/documentation/quartzcore/cabasicanimation?language=objc>
+//! - Keyframe values, key times, and calculation modes
+//!   <https://developer.apple.com/documentation/quartzcore/cakeyframeanimation/values>
+//!   <https://developer.apple.com/documentation/quartzcore/cakeyframeanimation/keytimes>
+//!   <https://developer.apple.com/documentation/quartzcore/caanimationcalculationmode>
 use std::ops::{Add, Mul, Sub};
 
 use crate::frameworks::core_animation::ca_animation::{
@@ -23,6 +27,7 @@ use crate::frameworks::core_animation::ca_animation::{
     kCAFillModeBoth, kCAFillModeForwards, CAMediaTimingFillMode,
 };
 use crate::frameworks::core_animation::ca_layer::remove_anonymous_animation;
+use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
 use crate::frameworks::core_animation::{ca_layer::CALayerHostObject, CACurrentMediaTime};
 use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
@@ -152,7 +157,8 @@ fn apply_keyframe_timing_function(
         return amount;
     }
 
-    let function: id = msg![env; timing_functions objectAtIndex:segment.from_index];
+    let function_index = segment.from_index;
+    let function: id = msg![env; timing_functions objectAtIndex:function_index];
     let function_class = msg![env; function class];
     let Some(timing_function_class) = env
         .objc
@@ -183,6 +189,7 @@ impl State {
     ) -> CALayerHostObject {
         // Clone given layer
         let original = env.objc.borrow::<CALayerHostObject>(layer);
+        let model_transform = original.transform_3d;
         let mut presentation = original.clone();
 
         // Loop over all animations and set the presentation layer's values
@@ -265,6 +272,9 @@ impl State {
                 .min(effective_repeat_count);
 
             let mut progress = current_repeat.fract();
+            if current_repeat >= effective_repeat_count {
+                progress = 1.0;
+            }
 
             let autoreverses: bool = msg![env; animation autoreverses];
             if autoreverses {
@@ -338,7 +348,7 @@ impl State {
                 let calculation_mode = if calculation_mode == nil {
                     kCAAnimationLinear.to_owned()
                 } else {
-                    to_rust_string(env, calculation_mode)
+                    to_rust_string(env, calculation_mode).into_owned()
                 };
                 let calculation_mode = calculation_mode.as_str();
                 if calculation_mode != kCAAnimationDiscrete
@@ -362,10 +372,13 @@ impl State {
                 };
                 let segment_timing_functions: id = msg![env; animation timingFunctions];
                 if segment.from_index == segment.to_index {
-                    keyframe_from = Some(msg![env; values objectAtIndex:segment.from_index]);
+                    let index = segment.from_index;
+                    keyframe_from = Some(msg![env; values objectAtIndex:index]);
                 } else {
-                    keyframe_from = Some(msg![env; values objectAtIndex:segment.from_index]);
-                    keyframe_to = Some(msg![env; values objectAtIndex:segment.to_index]);
+                    let from_index = segment.from_index;
+                    let to_index = segment.to_index;
+                    keyframe_from = Some(msg![env; values objectAtIndex:from_index]);
+                    keyframe_to = Some(msg![env; values objectAtIndex:to_index]);
                 }
                 let amount = if discrete_mode {
                     0.0
@@ -414,10 +427,10 @@ impl State {
                         .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
                     let by_value = id_as_option(by_value)
                         .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
-                    let keyframe_from_value = keyframe_from
-                        .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
-                    let keyframe_to_value = keyframe_to
-                        .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
+                    let keyframe_from_value =
+                        keyframe_from.map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
+                    let keyframe_to_value =
+                        keyframe_to.map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
                     if let Some(from) = keyframe_from_value {
                         presentation.background_color = Some(interpolate_keyframe(
                             from,
@@ -514,8 +527,7 @@ impl State {
                         id_as_option(from_value).map(|obj| msg![env; obj CGPointValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj CGPointValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj CGPointValue]);
-                    let keyframe_from_value =
-                        keyframe_from.map(|obj| msg![env; obj CGPointValue]);
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj CGPointValue]);
                     let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj CGPointValue]);
                     presentation.position = interpolate_values(
                         presentation.position,
@@ -526,6 +538,72 @@ impl State {
                         keyframe_to_value,
                         interpolation_amount,
                     );
+                }
+                "transform" => {
+                    let from_value =
+                        id_as_option(from_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let to_value =
+                        id_as_option(to_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let by_value =
+                        id_as_option(by_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let keyframe_from_value =
+                        keyframe_from.map(|obj| msg![env; obj CATransform3DValue]);
+                    let keyframe_to_value =
+                        keyframe_to.map(|obj| msg![env; obj CATransform3DValue]);
+                    presentation.transform_3d = interpolate_transform(
+                        presentation.transform_3d,
+                        from_value,
+                        to_value,
+                        by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    );
+                }
+                "transform.rotation" | "transform.rotation.z" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    let base_rotation = implicit_rotation_start(model_transform);
+                    let rotation = interpolate_values(
+                        base_rotation,
+                        from_value,
+                        to_value,
+                        by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    );
+                    presentation.transform_3d = replace_z_rotation(model_transform, rotation);
+                }
+                "transform.scale" | "transform.scale.x" | "transform.scale.y" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    let model_scale = match &*key_path {
+                        "transform.scale.x" => implicit_scale_start(model_transform, Some(true)),
+                        "transform.scale.y" => implicit_scale_start(model_transform, Some(false)),
+                        _ => implicit_scale_start(model_transform, None),
+                    };
+                    let scale = interpolate_values(
+                        model_scale,
+                        from_value,
+                        to_value,
+                        by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    );
+                    let (sx, sy) = match &*key_path {
+                        "transform.scale.x" => (Some(scale), None),
+                        "transform.scale.y" => (None, Some(scale)),
+                        _ => (Some(scale), Some(scale)),
+                    };
+                    presentation.transform_3d = scale_transform(model_transform, sx, sy);
                 }
                 _ => {
                     log_dbg!(
@@ -592,9 +670,150 @@ impl State {
     }
 }
 
+fn interpolate_transform(
+    current: CATransform3D,
+    basic_from: Option<CATransform3D>,
+    basic_to: Option<CATransform3D>,
+    basic_by: Option<CATransform3D>,
+    keyframe_from: Option<CATransform3D>,
+    keyframe_to: Option<CATransform3D>,
+    amount: f32,
+) -> CATransform3D {
+    let from = keyframe_from.or(basic_from).unwrap_or(current);
+    let to = keyframe_to.or(basic_to).unwrap_or_else(|| {
+        if let Some(by) = basic_by {
+            from.concat(by)
+        } else {
+            from
+        }
+    });
+    let from_components = CATransform3D::from(from);
+    let to_components = CATransform3D::from(to);
+    let from_values = [
+        from_components.m11,
+        from_components.m12,
+        from_components.m13,
+        from_components.m14,
+        from_components.m21,
+        from_components.m22,
+        from_components.m23,
+        from_components.m24,
+        from_components.m31,
+        from_components.m32,
+        from_components.m33,
+        from_components.m34,
+        from_components.m41,
+        from_components.m42,
+        from_components.m43,
+        from_components.m44,
+    ];
+    let to_values = [
+        to_components.m11,
+        to_components.m12,
+        to_components.m13,
+        to_components.m14,
+        to_components.m21,
+        to_components.m22,
+        to_components.m23,
+        to_components.m24,
+        to_components.m31,
+        to_components.m32,
+        to_components.m33,
+        to_components.m34,
+        to_components.m41,
+        to_components.m42,
+        to_components.m43,
+        to_components.m44,
+    ];
+    let mut result = [0.0; 16];
+    for index in 0..16 {
+        result[index] = from_values[index] + (to_values[index] - from_values[index]) * amount;
+    }
+    CATransform3D {
+        m11: result[0],
+        m12: result[1],
+        m13: result[2],
+        m14: result[3],
+        m21: result[4],
+        m22: result[5],
+        m23: result[6],
+        m24: result[7],
+        m31: result[8],
+        m32: result[9],
+        m33: result[10],
+        m34: result[11],
+        m41: result[12],
+        m42: result[13],
+        m43: result[14],
+        m44: result[15],
+    }
+}
+
+// CATransform3D is row-major with row-vector composition. Scale the basis
+// vectors while keeping translation, perspective, and an unanimated axis.
+fn scale_transform(
+    mut model: CATransform3D,
+    requested_x: Option<f32>,
+    requested_y: Option<f32>,
+) -> CATransform3D {
+    let (m11, m12, m13) = (model.m11, model.m12, model.m13);
+    let (m21, m22, m23) = (model.m21, model.m22, model.m23);
+    let base_scale_x = (m11 * m11 + m12 * m12 + m13 * m13).sqrt();
+    let base_scale_y = (m21 * m21 + m22 * m22 + m23 * m23).sqrt();
+    let sx = requested_x.unwrap_or(base_scale_x);
+    let sy = requested_y.unwrap_or(base_scale_y);
+    let factor_x = if base_scale_x <= f32::EPSILON {
+        sx
+    } else {
+        sx / base_scale_x
+    };
+    let factor_y = if base_scale_y <= f32::EPSILON {
+        sy
+    } else {
+        sy / base_scale_y
+    };
+    model.scale(factor_x, factor_y, 1.0)
+}
+
+fn implicit_rotation_start(model: CATransform3D) -> f32 {
+    (model.m12 - model.m21).atan2(model.m11 + model.m22)
+}
+
+fn implicit_scale_start(model: CATransform3D, axis: Option<bool>) -> f32 {
+    let (m11, m12, m13) = (model.m11, model.m12, model.m13);
+    let (m21, m22, m23) = (model.m21, model.m22, model.m23);
+    let scale_x = (m11 * m11 + m12 * m12 + m13 * m13).sqrt();
+    let scale_y = (m21 * m21 + m22 * m22 + m23 * m23).sqrt();
+    match axis {
+        Some(true) => scale_x,
+        Some(false) => scale_y,
+        None => (scale_x + scale_y) * 0.5,
+    }
+}
+
+fn replace_z_rotation(model: CATransform3D, angle: f32) -> CATransform3D {
+    // Polar-decompose the 2D basis to separate its nearest rotation from
+    // scale/shear, then replace only that rotation. This avoids treating a
+    // scaled/skewed m11/m12 pair as a pure rotation.
+    let model_angle = (model.m12 - model.m21).atan2(model.m11 + model.m22);
+    let delta = angle - model_angle;
+    let (cosine, sine) = (delta.cos(), delta.sin());
+    let mut result = model;
+    let (m11, m12, m21, m22) = (model.m11, model.m12, model.m21, model.m22);
+    result.m11 = m11 * cosine - m12 * sine;
+    result.m12 = m11 * sine + m12 * cosine;
+    result.m21 = m21 * cosine - m22 * sine;
+    result.m22 = m21 * sine + m22 * cosine;
+    result
+}
+
 #[cfg(test)]
 mod keyframe_tests {
-    use super::{interpolate_keyframe, select_keyframe_segment};
+    use super::{
+        implicit_rotation_start, implicit_scale_start, interpolate_keyframe, interpolate_transform,
+        replace_z_rotation, scale_transform, select_keyframe_segment,
+    };
+    use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 
     #[test]
     fn selects_evenly_spaced_linear_segment() {
@@ -669,6 +888,219 @@ mod keyframe_tests {
     }
 
     #[test]
+    fn interpolates_core_animation_value_types() {
+        use crate::frameworks::core_graphics::cg_geometry::{CGPoint, CGRect, CGSize};
+
+        let point = interpolate_keyframe(
+            CGPoint { x: 0.0, y: 10.0 },
+            CGPoint { x: 20.0, y: 30.0 },
+            0.25,
+        );
+        assert_eq!(point, CGPoint { x: 5.0, y: 15.0 });
+
+        let rect = interpolate_keyframe(
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 10.0 },
+                size: CGSize {
+                    width: 20.0,
+                    height: 30.0,
+                },
+            },
+            CGRect {
+                origin: CGPoint { x: 40.0, y: 50.0 },
+                size: CGSize {
+                    width: 60.0,
+                    height: 70.0,
+                },
+            },
+            0.5,
+        );
+        assert_eq!(
+            rect,
+            CGRect {
+                origin: CGPoint { x: 20.0, y: 30.0 },
+                size: CGSize {
+                    width: 40.0,
+                    height: 50.0
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn interpolates_rgba_colors() {
+        let from = CGColorHostObject {
+            color_space_name: "kCGColorSpaceGenericRGB",
+            r: 0.0,
+            g: 0.2,
+            b: 0.4,
+            a: 0.2,
+        };
+        let to = CGColorHostObject {
+            color_space_name: "kCGColorSpaceGenericRGB",
+            r: 1.0,
+            g: 0.8,
+            b: 0.6,
+            a: 1.0,
+        };
+
+        let midpoint = interpolate_keyframe(from, to, 0.5);
+
+        assert_eq!(midpoint.r, 0.5);
+        assert_eq!(midpoint.g, 0.5);
+        assert_eq!(midpoint.b, 0.5);
+        assert_eq!(midpoint.a, 0.6);
+    }
+
+    #[test]
+    fn interpolates_transform_matrix_and_rotation_scale_values() {
+        use crate::frameworks::core_animation::ca_transform3d::{
+            CATransform3D, CATransform3DIdentity,
+        };
+
+        let scaled = CATransform3D::make_scale(3.0, 3.0, 3.0).translate(10.0, 20.0, 30.0);
+        let transform = interpolate_transform(
+            CATransform3DIdentity,
+            None,
+            None,
+            None,
+            Some(CATransform3DIdentity),
+            Some(scaled),
+            0.5,
+        );
+        let (m11, m22, m41, m42, m43) = (
+            transform.m11,
+            transform.m22,
+            transform.m41,
+            transform.m42,
+            transform.m43,
+        );
+        assert_eq!((m11, m22, m41, m42, m43), (2.0, 2.0, 15.0, 30.0, 45.0));
+
+        let rotation = interpolate_keyframe(0.0_f32, std::f32::consts::PI, 0.5);
+        assert_eq!(rotation, std::f32::consts::FRAC_PI_2);
+        let halfway = CATransform3D::from(CATransform3D::make_rotation(rotation, 0.0, 0.0, 1.0));
+        assert!(halfway.m12.abs() > 0.999);
+        assert!(halfway.m21.abs() > 0.999);
+
+        let current = CATransform3D::make_rotation(0.5, 0.0, 0.0, 1.0);
+        let current = CATransform3D::from(current);
+        let current_angle = current.m12.atan2(current.m11);
+        let updated = CATransform3D::from(replace_z_rotation(current, 1.0));
+        assert!((updated.m12.atan2(updated.m11) - 1.0).abs() < 0.0001);
+
+        let current = CATransform3D::make_scale(2.0, 3.0, 1.0);
+        let updated = CATransform3D::from(scale_transform(current, Some(1.5), Some(1.5)));
+        assert!((updated.m11 - 1.5).abs() < 0.0001);
+        assert!((updated.m22 - 1.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn transform_scale_is_rebuilt_from_model_transform_each_frame() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let mut model = CATransform3D::from(CATransform3D::make_scale(2.0, 3.0, 1.0));
+        model.m12 = 0.5;
+        model.m41 = 40.0;
+        model.m44 = 2.0;
+        let scale_at_progress = |progress: f32| {
+            let target = interpolate_keyframe(0.0_f32, 1.0_f32, progress);
+            scale_transform(model, Some(target), Some(target))
+        };
+
+        let first = CATransform3D::from(scale_at_progress(0.5));
+        let second = CATransform3D::from(scale_at_progress(0.5));
+        let (first_x, first_y, second_x, second_y) = (first.m11, first.m22, second.m11, second.m22);
+        let (first_skew, second_skew) = (first.m12, second.m12);
+        let (translation, perspective) = (first.m41, first.m44);
+        let (first_x_len, first_y_len) = (
+            (first_x * first_x + first_skew * first_skew).sqrt(),
+            (first_y * first_y + first.m21 * first.m21).sqrt(),
+        );
+
+        assert_eq!((first_x, first_y), (second_x, second_y));
+        assert!((first_x_len - 0.5).abs() < 0.0001);
+        assert!((first_y_len - 0.5).abs() < 0.0001);
+        assert_eq!(first_skew, second_skew);
+        assert_ne!(first_skew, 0.0);
+        assert_eq!((translation, perspective), (40.0, 2.0));
+    }
+
+    #[test]
+    fn transform_rotation_replaces_model_angle_and_preserves_translation() {
+        use crate::frameworks::core_animation::ca_transform3d::{
+            CATransform3D, CATransform3DIdentity,
+        };
+
+        let mut model = CATransform3D::from(CATransform3D::make_rotation(0.5, 0.0, 0.0, 1.0));
+        model.m41 = 32.0;
+        model.m44 = 2.0;
+        let rotation_at_progress = |progress: f32| {
+            let target = interpolate_keyframe(implicit_rotation_start(model), 1.0_f32, progress);
+            replace_z_rotation(model, target)
+        };
+
+        let first = CATransform3D::from(rotation_at_progress(0.5));
+        let again = CATransform3D::from(rotation_at_progress(0.5));
+        let first_angle = first.m12.atan2(first.m11);
+        let again_angle = again.m12.atan2(again.m11);
+        assert!((first_angle - 0.75).abs() < 0.0001);
+        assert!((again_angle - first_angle).abs() < 0.0001);
+        assert_eq!((first.m41, first.m44), (32.0, 2.0));
+    }
+
+    #[test]
+    fn transform_rotation_preserves_nonuniform_scale_and_skew() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let mut model = CATransform3D::make_rotation(0.4, 0.0, 0.0, 1.0).scale(2.0, 3.0, 1.0);
+        model.m12 += 0.25; // Add a small skew to the XY basis.
+        model.m41 = 17.0;
+        model.m44 = 2.0;
+        let changed = CATransform3D::from(replace_z_rotation(model, 1.2));
+        let expected = CATransform3D::from(model);
+        let (a11, a12, a21, a22) = (expected.m11, expected.m12, expected.m21, expected.m22);
+        let (b11, b12, b21, b22) = (changed.m11, changed.m12, changed.m21, changed.m22);
+        // Right-multiplying by a pure rotation preserves the basis row lengths
+        // and dot product (the scale and skew), while replacing its orientation.
+        let before_x = a11 * a11 + a12 * a12;
+        let before_y = a21 * a21 + a22 * a22;
+        let before_dot = a11 * a21 + a12 * a22;
+        let after_x = b11 * b11 + b12 * b12;
+        let after_y = b21 * b21 + b22 * b22;
+        let after_dot = b11 * b21 + b12 * b22;
+        assert!((before_x - after_x).abs() < 0.0001);
+        assert!((before_y - after_y).abs() < 0.0001);
+        assert!((before_dot - after_dot).abs() < 0.0001);
+        assert_eq!((changed.m41, changed.m44), (17.0, 2.0));
+        let angle = (changed.m12 - changed.m21).atan2(changed.m11 + changed.m22);
+        assert!((angle - 1.2).abs() < 0.0001);
+        assert!(implicit_rotation_start(model).is_finite());
+    }
+
+    #[test]
+    fn transform_axis_scale_preserves_other_model_axis() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let model = CATransform3D::make_scale(2.0, 3.0, 1.0);
+        let x_only = CATransform3D::from(scale_transform(model, Some(0.5), None));
+        let y_only = CATransform3D::from(scale_transform(model, None, Some(0.5)));
+        assert_eq!((x_only.m11, x_only.m22), (0.5, 3.0));
+        assert_eq!((y_only.m11, y_only.m22), (2.0, 0.5));
+    }
+
+    #[test]
+    fn transform_implicit_start_values_come_from_model_transform() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let model = CATransform3D::make_rotation(0.5, 0.0, 0.0, 1.0).scale(2.0, 3.0, 1.0);
+        assert!((implicit_rotation_start(model) - 0.5).abs() < 0.0001);
+        assert!((implicit_scale_start(model, Some(true)) - 2.0).abs() < 0.0001);
+        assert!((implicit_scale_start(model, Some(false)) - 3.0).abs() < 0.0001);
+        assert!((implicit_scale_start(model, None) - 2.5).abs() < 0.0001);
+    }
+
+    #[test]
     fn interpolates_scalar_values() {
         assert_eq!(interpolate_keyframe(0.2, 1.0, 0.5), 0.6);
     }
@@ -694,7 +1126,9 @@ mod keyframe_tests {
             2
         );
         assert_eq!(
-            select_keyframe_segment(1.0, None, 3, false).unwrap().from_index,
+            select_keyframe_segment(1.0, None, 3, false)
+                .unwrap()
+                .from_index,
             2
         );
     }
@@ -720,6 +1154,7 @@ where
                  ignoring byValue"
             );
         }
+
         let by_value = to_value - from_value.to_owned();
         (from_value, by_value)
     } else if let (Some(from_value), Some(by_value)) = (from_value, by_value) {
