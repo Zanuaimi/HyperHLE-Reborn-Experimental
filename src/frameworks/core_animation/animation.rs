@@ -16,11 +16,11 @@
 //!   <https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/AdvancedAnimationTricks/AdvancedAnimationTricks.html>
 //! - Algorithm for choosing interpolation values
 //!   <https://developer.apple.com/documentation/quartzcore/cabasicanimation?language=objc>
-use std::ops::Sub;
+use std::ops::{Add, Mul, Sub};
 
 use crate::frameworks::core_animation::ca_animation::{
-    get_animation_start_time, kCAFillModeBackwards, kCAFillModeBoth, kCAFillModeForwards,
-    CAMediaTimingFillMode,
+    get_animation_start_time, kCAAnimationDiscrete, kCAAnimationLinear, kCAFillModeBackwards,
+    kCAFillModeBoth, kCAFillModeForwards, CAMediaTimingFillMode,
 };
 use crate::frameworks::core_animation::ca_layer::remove_anonymous_animation;
 use crate::frameworks::core_animation::{ca_layer::CALayerHostObject, CACurrentMediaTime};
@@ -29,6 +29,146 @@ use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
 use crate::objc::{id, msg, nil, release, retain};
 use crate::Environment;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KeyframeSegment {
+    from_index: usize,
+    to_index: usize,
+    amount: f32,
+}
+
+fn select_keyframe_segment(
+    progress: f32,
+    key_times: Option<&[f32]>,
+    value_count: usize,
+    discrete: bool,
+) -> Option<KeyframeSegment> {
+    if value_count == 0 {
+        return None;
+    }
+
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let times: Vec<f32> = match key_times {
+        Some(times)
+            if times.len() == value_count
+                && times.first().copied() == Some(0.0)
+                && times.last().copied() == Some(1.0)
+                && times.iter().all(|time| time.is_finite())
+                && times.windows(2).all(|pair| pair[0] < pair[1]) =>
+        {
+            times.to_vec()
+        }
+        _ if value_count == 1 => vec![0.0],
+        _ => (0..value_count)
+            .map(|index| index as f32 / (value_count - 1) as f32)
+            .collect(),
+    };
+
+    if value_count == 1 {
+        return Some(KeyframeSegment {
+            from_index: 0,
+            to_index: 0,
+            amount: 0.0,
+        });
+    }
+
+    if discrete {
+        let index = times
+            .iter()
+            .rposition(|time| *time <= progress)
+            .unwrap_or(0);
+        return Some(KeyframeSegment {
+            from_index: index,
+            to_index: index,
+            amount: 0.0,
+        });
+    }
+
+    let from_index = if progress >= 1.0 {
+        value_count - 1
+    } else {
+        times
+            .windows(2)
+            .position(|pair| progress < pair[1])
+            .unwrap_or(value_count - 2)
+    };
+    let to_index = (from_index + 1).min(value_count - 1);
+    let amount = if from_index == to_index {
+        0.0
+    } else {
+        ((progress - times[from_index]) / (times[to_index] - times[from_index])).clamp(0.0, 1.0)
+    };
+
+    Some(KeyframeSegment {
+        from_index,
+        to_index,
+        amount,
+    })
+}
+
+fn interpolate_keyframe<T>(from: T, to: T, amount: f32) -> T
+where
+    T: Copy + Add<Output = T> + Mul<f32, Output = T> + Sub<Output = T>,
+{
+    from + (to - from) * amount
+}
+
+fn interpolate_values<T>(
+    current: T,
+    basic_from: Option<T>,
+    basic_to: Option<T>,
+    basic_by: Option<T>,
+    keyframe_from: Option<T>,
+    keyframe_to: Option<T>,
+    amount: f32,
+) -> T
+where
+    T: Copy + Add<Output = T> + Mul<f32, Output = T> + Sub<Output = T>,
+{
+    if let Some(from) = keyframe_from {
+        interpolate_keyframe(from, keyframe_to.unwrap_or(from), amount)
+    } else {
+        let (from, by) = get_from_and_by_values(Some(current), basic_from, basic_to, basic_by);
+        from + by * amount
+    }
+}
+
+fn apply_keyframe_timing_function(
+    env: &mut Environment,
+    timing_functions: id,
+    segment: KeyframeSegment,
+    amount: f32,
+) -> f32 {
+    if timing_functions == nil || segment.amount == 0.0 || segment.amount == 1.0 {
+        return amount;
+    }
+
+    let function_count: usize = msg![env; timing_functions count];
+    if segment.from_index >= function_count {
+        return amount;
+    }
+
+    let function: id = msg![env; timing_functions objectAtIndex:segment.from_index];
+    let function_class = msg![env; function class];
+    let Some(timing_function_class) = env
+        .objc
+        .try_get_known_class("CAMediaTimingFunction", &mut env.mem)
+    else {
+        return amount;
+    };
+    if env
+        .objc
+        .class_is_subclass_of(function_class, timing_function_class)
+    {
+        msg![env; function _solveForInput: amount]
+    } else {
+        amount
+    }
+}
 
 #[derive(Default)]
 pub struct State {
@@ -137,8 +277,22 @@ impl State {
                 progress = ((progress * 2.0 - 1.0).abs() - 1.0).abs();
             }
 
-            let timing_function: id = msg![env; animation timingFunction];
-            let interpolation_amount: f32 = msg![env; timing_function _solveForInput: progress];
+            let animation_class = msg![env; animation class];
+            let is_keyframe = match env
+                .objc
+                .try_get_known_class("CAKeyframeAnimation", &mut env.mem)
+            {
+                Some(keyframe_class) => env
+                    .objc
+                    .class_is_subclass_of(animation_class, keyframe_class),
+                None => false,
+            };
+            let timing_function_amount = if is_keyframe {
+                progress
+            } else {
+                let timing_function: id = msg![env; animation timingFunction];
+                msg![env; timing_function _solveForInput: progress]
+            };
 
             if current_repeat >= effective_repeat_count {
                 let removed_on_completion: bool = msg![env; animation isRemovedOnCompletion];
@@ -154,13 +308,84 @@ impl State {
                 }
             }
 
-            // Assuming all animations here are CABasicAnimation
-            // TODO: Handle other types of animations
-
-            let from_value: id = msg![env; animation fromValue];
-            let to_value: id = msg![env; animation toValue];
-            let by_value: id = msg![env; animation byValue];
-
+            let mut keyframe_from = None;
+            let mut keyframe_to = None;
+            let (from_value, to_value, by_value, interpolation_amount) = if is_keyframe {
+                let values: id = msg![env; animation values];
+                if values == nil {
+                    continue;
+                }
+                let value_count: usize = msg![env; values count];
+                let key_times: id = msg![env; animation keyTimes];
+                let key_times = if key_times == nil {
+                    None
+                } else {
+                    let count: usize = msg![env; key_times count];
+                    if count != value_count {
+                        None
+                    } else {
+                        Some(
+                            (0..count)
+                                .map(|index| {
+                                    let value: id = msg![env; key_times objectAtIndex:index];
+                                    msg![env; value floatValue]
+                                })
+                                .collect::<Vec<f32>>(),
+                        )
+                    }
+                };
+                let calculation_mode: id = msg![env; animation calculationMode];
+                let calculation_mode = if calculation_mode == nil {
+                    kCAAnimationLinear.to_owned()
+                } else {
+                    to_rust_string(env, calculation_mode)
+                };
+                let calculation_mode = calculation_mode.as_str();
+                if calculation_mode != kCAAnimationDiscrete
+                    && calculation_mode != kCAAnimationLinear
+                {
+                    log_dbg!(
+                        "Skipping unsupported CAKeyframeAnimation calculation mode {:?}",
+                        calculation_mode
+                    );
+                    continue;
+                }
+                let discrete_mode = calculation_mode == kCAAnimationDiscrete;
+                let segment = match select_keyframe_segment(
+                    progress,
+                    key_times.as_deref(),
+                    value_count,
+                    discrete_mode,
+                ) {
+                    Some(segment) => segment,
+                    None => continue,
+                };
+                let segment_timing_functions: id = msg![env; animation timingFunctions];
+                if segment.from_index == segment.to_index {
+                    keyframe_from = Some(msg![env; values objectAtIndex:segment.from_index]);
+                } else {
+                    keyframe_from = Some(msg![env; values objectAtIndex:segment.from_index]);
+                    keyframe_to = Some(msg![env; values objectAtIndex:segment.to_index]);
+                }
+                let amount = if discrete_mode {
+                    0.0
+                } else {
+                    apply_keyframe_timing_function(
+                        env,
+                        segment_timing_functions,
+                        segment,
+                        segment.amount,
+                    )
+                };
+                (nil, nil, nil, amount)
+            } else {
+                (
+                    msg![env; animation fromValue],
+                    msg![env; animation toValue],
+                    msg![env; animation byValue],
+                    timing_function_amount,
+                )
+            };
             // Update values only in the presentation layer
             let key_path: id = msg![env; animation keyPath];
             let key_path = to_rust_string(env, key_path);
@@ -172,13 +397,15 @@ impl State {
                         id_as_option(from_value).map(|obj| msg![env; obj CGPointValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj CGPointValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj CGPointValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.anchor_point),
+                    presentation.anchor_point = interpolate_values(
+                        presentation.anchor_point,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from.map(|value| msg![env; value CGPointValue]),
+                        keyframe_to.map(|value| msg![env; value CGPointValue]),
+                        interpolation_amount,
                     );
-                    presentation.anchor_point = from_value + by_value * interpolation_amount;
                 }
                 "backgroundColor" => {
                     let from_value = id_as_option(from_value)
@@ -187,38 +414,58 @@ impl State {
                         .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
                     let by_value = id_as_option(by_value)
                         .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
-                    let (from_value, by_value) = get_from_and_by_values(
-                        presentation.background_color,
-                        from_value,
-                        to_value,
-                        by_value,
-                    );
-                    presentation.background_color =
-                        Some(from_value + by_value * interpolation_amount)
+                    let keyframe_from_value = keyframe_from
+                        .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
+                    let keyframe_to_value = keyframe_to
+                        .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
+                    if let Some(from) = keyframe_from_value {
+                        presentation.background_color = Some(interpolate_keyframe(
+                            from,
+                            keyframe_to_value.unwrap_or(from),
+                            interpolation_amount,
+                        ));
+                    } else {
+                        let (from_value, by_value) = get_from_and_by_values(
+                            presentation.background_color,
+                            from_value,
+                            to_value,
+                            by_value,
+                        );
+                        presentation.background_color =
+                            Some(from_value + by_value * interpolation_amount);
+                    }
                 }
                 "bounds" => {
                     let from_value = id_as_option(from_value).map(|obj| msg![env; obj CGRectValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj CGRectValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj CGRectValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.bounds),
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj CGRectValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj CGRectValue]);
+                    presentation.bounds = interpolate_values(
+                        presentation.bounds,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.bounds = from_value + by_value * interpolation_amount;
                 }
                 "cornerRadius" => {
                     let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.corner_radius),
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    presentation.corner_radius = interpolate_values(
+                        presentation.corner_radius,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.corner_radius = from_value + by_value * interpolation_amount;
                 }
                 "hidden" => {
                     let from_value = id_as_option(from_value)
@@ -230,38 +477,55 @@ impl State {
                     let by_value = id_as_option(by_value)
                         .map(|obj| msg![env; obj boolValue])
                         .map(|val: bool| val as i32 as f32);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.hidden as i32 as f32),
+                    let keyframe_from_value = keyframe_from
+                        .map(|obj| msg![env; obj boolValue])
+                        .map(|val: bool| val as i32 as f32);
+                    let keyframe_to_value = keyframe_to
+                        .map(|obj| msg![env; obj boolValue])
+                        .map(|val: bool| val as i32 as f32);
+                    presentation.hidden = interpolate_values(
+                        presentation.hidden as i32 as f32,
                         from_value,
                         to_value,
                         by_value,
-                    );
-                    presentation.hidden = (from_value + by_value * interpolation_amount) > 0.5;
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    ) > 0.5;
                 }
                 "opacity" => {
                     let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.opacity),
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    presentation.opacity = interpolate_values(
+                        presentation.opacity,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.opacity = from_value + by_value * interpolation_amount;
                 }
                 "position" => {
                     let from_value =
                         id_as_option(from_value).map(|obj| msg![env; obj CGPointValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj CGPointValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj CGPointValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.position),
+                    let keyframe_from_value =
+                        keyframe_from.map(|obj| msg![env; obj CGPointValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj CGPointValue]);
+                    presentation.position = interpolate_values(
+                        presentation.position,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.position = from_value + by_value * interpolation_amount;
                 }
                 _ => {
                     log_dbg!(
@@ -325,6 +589,114 @@ impl State {
 
             release(env, layer);
         }
+    }
+}
+
+#[cfg(test)]
+mod keyframe_tests {
+    use super::{interpolate_keyframe, select_keyframe_segment};
+
+    #[test]
+    fn selects_evenly_spaced_linear_segment() {
+        assert_eq!(
+            select_keyframe_segment(0.25, None, 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 0,
+                to_index: 1,
+                amount: 0.5,
+            })
+        );
+    }
+
+    #[test]
+    fn selects_explicit_key_times_and_discrete_holds() {
+        assert_eq!(
+            select_keyframe_segment(0.4, Some(&[0.0, 0.25, 1.0]), 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 1,
+                to_index: 2,
+                amount: 0.2,
+            })
+        );
+        assert_eq!(
+            select_keyframe_segment(0.3, Some(&[0.0, 0.25, 1.0]), 3, true),
+            Some(super::KeyframeSegment {
+                from_index: 1,
+                to_index: 1,
+                amount: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn falls_back_for_invalid_key_times_and_clamps_progress() {
+        assert_eq!(
+            select_keyframe_segment(-1.0, Some(&[0.0, 0.8]), 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 0,
+                to_index: 1,
+                amount: 0.0,
+            })
+        );
+        assert_eq!(
+            select_keyframe_segment(2.0, None, 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 2,
+                to_index: 2,
+                amount: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn handles_segment_boundaries_and_single_values() {
+        assert_eq!(
+            select_keyframe_segment(0.5, Some(&[0.0, 0.5, 1.0]), 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 1,
+                to_index: 2,
+                amount: 0.0,
+            })
+        );
+        assert_eq!(
+            select_keyframe_segment(0.5, None, 1, false),
+            Some(super::KeyframeSegment {
+                from_index: 0,
+                to_index: 0,
+                amount: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn interpolates_scalar_values() {
+        assert_eq!(interpolate_keyframe(0.2, 1.0, 0.5), 0.6);
+    }
+
+    #[test]
+    fn discrete_mode_selects_the_held_value() {
+        assert_eq!(
+            select_keyframe_segment(0.499, Some(&[0.0, 0.5, 1.0]), 3, true)
+                .unwrap()
+                .from_index,
+            0
+        );
+        assert_eq!(
+            select_keyframe_segment(0.5, Some(&[0.0, 0.5, 1.0]), 3, true)
+                .unwrap()
+                .from_index,
+            1
+        );
+        assert_eq!(
+            select_keyframe_segment(1.0, Some(&[0.0, 0.5, 1.0]), 3, true)
+                .unwrap()
+                .from_index,
+            2
+        );
+        assert_eq!(
+            select_keyframe_segment(1.0, None, 3, false).unwrap().from_index,
+            2
+        );
     }
 }
 

@@ -376,6 +376,13 @@ CFTimeInterval CACurrentMediaTime();
 - (void)setFromValue:(id)value;
 - (void)setToValue:(id)value;
 @end
+@interface CAKeyframeAnimation : CAPropertyAnimation
+@property(copy) NSArray *values;
+@property(copy) NSArray *keyTimes;
+@property(copy) NSArray *timingFunctions;
+@property(copy) NSString *calculationMode;
+@end
+
 @interface CALayer : NSObject
 - (void)setAffineTransform:(CGAffineTransform)transform;
 - (void)setAnchorPoint:(CGPoint)point;

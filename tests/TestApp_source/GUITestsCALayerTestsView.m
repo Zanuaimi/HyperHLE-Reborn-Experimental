@@ -9,7 +9,7 @@
 
 #include "GUITestsCALayerTestsView.h"
 
-#define NUM_TESTS 19
+#define NUM_TESTS 20
 
 @implementation GUITestsCALayerTestsView : UIView
 
@@ -491,5 +491,18 @@ CALayer *sublayer;
   [sublayer setPosition:position];
 
   [CATransaction commit];
+}
+
+- (void)test20 {
+  UIView *view = [self addViewWithFrame:CGRectMake(0, 0, 80, 80)
+                                  color:[UIColor redColor]];
+  CAKeyframeAnimation *animation =
+      [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+  animation.values = @[ @0.2, @1.0, @0.2 ];
+  animation.keyTimes = @[ @0.0, @0.5, @1.0 ];
+  animation.calculationMode = @"linear";
+  animation.duration = 1000.0;
+  animation.beginTime = CACurrentMediaTime() - 500.0;
+  [view.layer addAnimation:animation forKey:@"keyframe-opacity"];
 }
 @end
