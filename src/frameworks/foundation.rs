@@ -73,6 +73,7 @@ pub mod ns_persistent_store_coordinator;
 pub mod ns_pointer_array;
 pub mod ns_port;
 pub mod ns_predicate;
+mod ns_predicate_format;
 pub mod ns_progress;
 pub mod ns_process_info;
 pub mod ns_property_list_serialization;

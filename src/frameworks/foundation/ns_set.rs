@@ -448,6 +448,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, array)
 }
 
+- (id)filteredSetUsingPredicate:(id)predicate {
+    if predicate == nil {
+        log!("NSSet filteredSetUsingPredicate: received nil predicate");
+        return nil;
+    }
+    let objects: id = msg![env; this allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    let filtered: id = msg_class![env; NSMutableArray array];
+    for index in 0..count {
+        let object: id = msg![env; objects objectAtIndex:index];
+        let matches: bool = msg![env; predicate evaluateWithObject:object];
+        if matches {
+            () = msg![env; filtered addObject:object];
+        }
+    }
+    msg_class![env; NSSet setWithArray:filtered]
+}
+
 // Apple: "Returns the object in the set that is equal to a given object, or
 // nil if no such object exists."
 // https://developer.apple.com/documentation/foundation/nsset/1414703-member

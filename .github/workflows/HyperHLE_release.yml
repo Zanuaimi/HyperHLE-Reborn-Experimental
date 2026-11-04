@@ -22,7 +22,6 @@ on:
     branches: [ "trunk" ]
   pull_request:
     branches: [ "trunk" ]
-  create: # for tags
 
 env:
   CARGO_TERM_COLOR: always

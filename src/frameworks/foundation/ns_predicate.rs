@@ -19,8 +19,8 @@ enum PredicateKind {
     /// `Default` for the phantom-fallback host object (yielding a
     /// predicate that always returns `false`).
     Constant(bool),
-    /// Raw format string — stored but not parsed/evaluated.
-    Format(String),
+    /// Format predicate, parsed when evaluated.
+    Format,
     /// NOT of another predicate.
     Not(id),
     /// AND of two predicates.
@@ -41,6 +41,10 @@ struct NSPredicateHostObject {
     kind: PredicateKind,
     /// Original format string if created with predicateWithFormat:.
     format: Option<String>,
+    /// Retained values supplied as positional format arguments.
+    arguments: Vec<id>,
+    /// Retained values supplied as named variable substitutions.
+    variables: std::collections::HashMap<String, id>,
 }
 impl HostObject for NSPredicateHostObject {}
 
@@ -58,6 +62,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(NSPredicateHostObject {
         kind: PredicateKind::Constant(false),
         format: None,
+        arguments: Vec::new(),
+        variables: std::collections::HashMap::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -73,7 +79,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     crate::objc::autorelease(env, new)
 }
 
-// predicateWithFormat: — stores the format string; evaluation is stubbed.
+// predicateWithFormat: — stores the format string for shared evaluation.
 + (id)predicateWithFormat:(id)format { // NSString*
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initWithFormat:format];
@@ -81,11 +87,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // predicateWithFormat:argumentArray:
-+ (id)predicateWithFormat:(id)format
-           argumentArray:(id)_arguments { // NSArray*
-    // Argument substitution is not implemented — treat as plain format.
++ (id)predicateWithFormat:(id)format argumentArray:(id)_arguments {
     let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initWithFormat:format];
+    let new: id = msg![env; new initWithFormat:format argumentArray:_arguments];
     crate::objc::autorelease(env, new)
 }
 
@@ -138,9 +142,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     {
         let host = env.objc.borrow_mut::<NSPredicateHostObject>(this);
         host.format = Some(fmt_str.clone());
-        host.kind = PredicateKind::Format(fmt_str);
+        host.kind = PredicateKind::Format;
     }
     this
+}
+
+- (id)initWithFormat:(id)format argumentArray:(id)_arguments {
+    let new: id = msg![env; this initWithFormat:format];
+    if new == nil || _arguments == nil {
+        return new;
+    }
+    let count: crate::frameworks::foundation::NSUInteger = msg![env; _arguments count];
+    let mut arguments = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let argument: id = msg![env; _arguments objectAtIndex:index];
+        retain(env, argument);
+        arguments.push(argument);
+    }
+    env.objc.borrow_mut::<NSPredicateHostObject>(new).arguments = arguments;
+    new
 }
 
 - (id)initWithNotPredicate:(id)subpredicate {
@@ -219,6 +239,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         _ => {}
     }
+    let arguments = std::mem::take(&mut env.objc.borrow_mut::<NSPredicateHostObject>(this).arguments);
+    for argument in arguments {
+        release(env, argument);
+    }
+    let variables = std::mem::take(&mut env.objc.borrow_mut::<NSPredicateHostObject>(this).variables);
+    for value in variables.into_values() {
+        release(env, value);
+    }
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
@@ -227,7 +255,44 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (id)copyWithZone:(NSZonePtr)_zone {
-    retain(env, this)
+    let (kind, format, arguments, variables) = {
+        let host = env.objc.borrow::<NSPredicateHostObject>(this);
+        let kind = match &host.kind {
+            PredicateKind::Constant(value) => PredicateKind::Constant(*value),
+            PredicateKind::Format => PredicateKind::Format,
+            PredicateKind::Not(predicate) => PredicateKind::Not(*predicate),
+            PredicateKind::And(left, right) => PredicateKind::And(*left, *right),
+            PredicateKind::Or(left, right) => PredicateKind::Or(*left, *right),
+            PredicateKind::Block => PredicateKind::Block,
+        };
+        (
+            kind,
+            host.format.clone(),
+            host.arguments.clone(),
+            host.variables.clone(),
+        )
+    };
+    let copy: id = msg![env; this alloc];
+    for predicate in match &kind {
+        PredicateKind::Not(predicate) => vec![*predicate],
+        PredicateKind::And(left, right) | PredicateKind::Or(left, right) => vec![*left, *right],
+        _ => Vec::new(),
+    } {
+        retain(env, predicate);
+    }
+    for argument in &arguments {
+        retain(env, *argument);
+    }
+    for value in variables.values() {
+        retain(env, *value);
+    }
+    *env.objc.borrow_mut::<NSPredicateHostObject>(copy) = NSPredicateHostObject {
+        kind,
+        format,
+        arguments,
+        variables,
+    };
+    copy
 }
 
 // =========================================================================
@@ -236,14 +301,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // evaluateWithObject: — evaluate against a single object.
 - (bool)evaluateWithObject:(id)object {
-    evaluate_predicate(env, this, object)
+    evaluate_predicate(env, this, object, &[])
 }
 
-// evaluateWithObject:substitutionVariables: — variable substitution not
-// implemented; delegates to plain evaluateWithObject:.
+// evaluateWithObject:substitutionVariables: — resolve basic variables.
 - (bool)evaluateWithObject:(id)object
    substitutionVariables:(id)_variables { // NSDictionary*
-    evaluate_predicate(env, this, object)
+    let mut variables = Vec::new();
+    if _variables != nil {
+        let keys: id = msg![env; _variables allKeys];
+        let count: crate::frameworks::foundation::NSUInteger = msg![env; keys count];
+        for index in 0..count {
+            let key: id = msg![env; keys objectAtIndex:index];
+            let name = substitution_variable_name(ns_string::to_rust_string(env, key).as_ref());
+            let value: id = msg![env; _variables objectForKey:key];
+            variables.push((name, value));
+        }
+    }
+    evaluate_predicate(env, this, object, &variables)
 }
 
 // =========================================================================
@@ -257,7 +332,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             PredicateKind::Constant(v) => {
                 if *v { "TRUEPREDICATE".to_string() } else { "FALSEPREDICATE".to_string() }
             }
-            PredicateKind::Format(s) => s.clone(),
+            PredicateKind::Format => host.format.clone().unwrap_or_default(),
             PredicateKind::Not(_)    => "NOT (...)".to_string(),
             PredicateKind::And(_, _) => "(...) AND (...)".to_string(),
             PredicateKind::Or(_, _)  => "(...) OR (...)".to_string(),
@@ -268,10 +343,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     crate::objc::autorelease(env, s)
 }
 
-// predicateWithSubstitutionVariables: — returns self (no substitution).
+// Return a copied predicate; variable operands are resolved on evaluation.
 - (id)predicateWithSubstitutionVariables:(id)_variables {
-    retain(env, this);
-    crate::objc::autorelease(env, this)
+    let new: id = msg![env; this copy];
+    if _variables != nil {
+        let keys: id = msg![env; _variables allKeys];
+        let count: crate::frameworks::foundation::NSUInteger = msg![env; keys count];
+        for index in 0..count {
+            let key: id = msg![env; keys objectAtIndex:index];
+            let name = substitution_variable_name(ns_string::to_rust_string(env, key).as_ref());
+            let value: id = msg![env; _variables objectForKey:key];
+            retain(env, value);
+            let old = env.objc.borrow_mut::<NSPredicateHostObject>(new).variables.insert(name, value);
+            if let Some(old) = old {
+                release(env, old);
+            }
+        }
+    }
+    crate::objc::autorelease(env, new)
 }
 
 // =========================================================================
@@ -376,9 +465,16 @@ fn evaluate_predicate(
     env: &mut crate::Environment,
     predicate: crate::objc::id,
     object: crate::objc::id,
+    variables: &[(String, id)],
 ) -> bool {
     // Read kind without holding borrow across recursive calls.
-    let kind_snapshot = {
+    enum Snapshot {
+        Format(String, Vec<id>, Vec<(String, id)>),
+        Not(id),
+        And(id, id),
+        Or(id, id),
+    }
+    let snapshot = {
         let host = env.objc.borrow::<NSPredicateHostObject>(predicate);
         match &host.kind {
             PredicateKind::Constant(v) => return *v,
@@ -386,22 +482,130 @@ fn evaluate_predicate(
                 log!("NSPredicate block evaluation not supported — returning false");
                 return false;
             }
-            PredicateKind::Format(s) => {
-                log_dbg!(
-                    "NSPredicate evaluateWithObject: format predicate {:?} — returning false (not parsed)",
-                    s
-                );
-                return false;
-            }
-            PredicateKind::Not(p) => ('n', *p, nil),
-            PredicateKind::And(a, b) => ('a', *a, *b),
-            PredicateKind::Or(a, b) => ('o', *a, *b),
+            PredicateKind::Format => Snapshot::Format(
+                host.format.clone().unwrap_or_default(),
+                host.arguments.clone(),
+                host.variables
+                    .iter()
+                    .map(|(name, value)| (name.clone(), *value))
+                    .collect(),
+            ),
+            PredicateKind::Not(predicate) => Snapshot::Not(*predicate),
+            PredicateKind::And(left, right) => Snapshot::And(*left, *right),
+            PredicateKind::Or(left, right) => Snapshot::Or(*left, *right),
         }
     };
-    match kind_snapshot {
-        ('n', p, _) => !evaluate_predicate(env, p, object),
-        ('a', a, b) => evaluate_predicate(env, a, object) && evaluate_predicate(env, b, object),
-        ('o', a, b) => evaluate_predicate(env, a, object) || evaluate_predicate(env, b, object),
-        _ => false,
+    match snapshot {
+        Snapshot::Not(predicate) => !evaluate_predicate(env, predicate, object, variables),
+        Snapshot::And(left, right) => {
+            evaluate_predicate(env, left, object, variables)
+                && evaluate_predicate(env, right, object, variables)
+        }
+        Snapshot::Or(left, right) => {
+            evaluate_predicate(env, left, object, variables)
+                || evaluate_predicate(env, right, object, variables)
+        }
+        Snapshot::Format(format, arguments, stored_variables) => {
+            let expression = match super::ns_predicate_format::parse_with_arguments(&format) {
+                Ok(expression) => expression,
+                Err(error) => {
+                    log!("NSPredicate format not supported ({:?}): {}", format, error);
+                    return false;
+                }
+            };
+            let mut variable_operands = Vec::new();
+            for (name, value) in stored_variables.iter().chain(variables.iter()) {
+                let value: id = *value;
+                let operand = match object_to_operand(env, value) {
+                    Some(operand) => operand,
+                    None => {
+                        log!(
+                            "NSPredicate substitution variable {:?} has unsupported value",
+                            name
+                        );
+                        return false;
+                    }
+                };
+                variable_operands.push((name.clone(), operand));
+            }
+            let expression = expression.substitute(&variable_operands);
+            let resolved_arguments: Option<Vec<_>> = arguments
+                .iter()
+                .map(|argument| {
+                    let argument: id = *argument;
+                    object_to_operand(env, argument)
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(resolved_arguments) = resolved_arguments else {
+                log!(
+                    "NSPredicate format {:?} has unsupported argument value",
+                    format
+                );
+                return false;
+            };
+            expression
+                .evaluate(
+                    |key_path| {
+                        let key = ns_string::from_rust_string(env, key_path.to_string());
+                        let value: id = msg![env; object valueForKeyPath:key];
+                        release(env, key);
+                        if value == nil {
+                            Some(super::ns_predicate_format::Operand::Null)
+                        } else {
+                            object_to_operand(env, value)
+                        }
+                    },
+                    &resolved_arguments,
+                )
+                .unwrap_or_else(|error| {
+                    log!(
+                        "NSPredicate evaluation unsupported for {:?}: {}",
+                        format,
+                        error
+                    );
+                    false
+                })
+        }
+    }
+}
+
+fn object_to_operand(
+    env: &mut crate::Environment,
+    object: crate::objc::id,
+) -> Option<super::ns_predicate_format::Operand> {
+    use super::ns_predicate_format::Operand;
+    if object == nil {
+        return Some(Operand::Null);
+    }
+    let null_class = env.objc.get_known_class("NSNull", &mut env.mem);
+    if msg![env; object isKindOfClass:null_class] {
+        return Some(Operand::Null);
+    }
+    let number_class = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if msg![env; object isKindOfClass:number_class] {
+        return Some(
+            match *env
+                .objc
+                .borrow::<super::ns_value::NSNumberHostObject>(object)
+            {
+                super::ns_value::NSNumberHostObject::Bool(value) => Operand::Bool(value),
+                _ => Operand::Number(msg![env; object doubleValue]),
+            },
+        );
+    }
+    let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+    if msg![env; object isKindOfClass:string_class] {
+        return Some(Operand::String(
+            ns_string::to_rust_string(env, object).into_owned(),
+        ));
+    }
+    None
+}
+
+fn substitution_variable_name(name: &str) -> String {
+    if name.starts_with('$') {
+        name.to_owned()
+    } else {
+        format!("${name}")
     }
 }
