@@ -37,14 +37,13 @@ use crate::fs::BundleData;
 use crate::image::Image;
 use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
-use crate::options::{
-    Options, PerformanceOverlayCorner, PerformanceOverlayMode, RendererMode,
-};
+use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode, RendererMode};
 use crate::paths;
 use crate::window::DeviceOrientation;
 use crate::Environment;
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicI8, Ordering};
@@ -93,7 +92,55 @@ fn remember_last_app_path(path: &Path) {
     }
 }
 
-pub fn app_picker(options: Options, show_lock_screen: bool) -> Result<(PathBuf, Vec<String>), String> {
+fn inspect_profile_corruption_options(
+    built_in: &mut (impl Read + std::io::Seek),
+    user: &mut (impl Read + std::io::Seek),
+    app_id: &str,
+) -> (Option<bool>, bool) {
+    let built_in = crate::options::get_options_from_file(built_in, app_id);
+    let user = crate::options::get_options_from_file(user, app_id);
+    let (mode, failed) = crate::options::profile_corruption_mode_from_results([built_in, user]);
+    (mode, failed)
+}
+
+fn profile_corruption_mode_for_app_id(
+    app_id: &str,
+    built_in: Result<Option<String>, String>,
+    user: Result<Option<String>, String>,
+) -> (Option<bool>, bool) {
+    if app_id.is_empty() {
+        return (None, true);
+    }
+    crate::options::profile_corruption_mode_from_results([built_in, user])
+}
+
+fn inspect_app_profile_corruption_options(app_id: &str) -> (Option<bool>, bool) {
+    if app_id.is_empty() {
+        log!("Warning: Couldn't inspect app corruption settings without a bundle identifier");
+        return (None, true);
+    }
+    let built_in_path = paths::default_options_file();
+    let built_in = paths::ResourceFile::open(&built_in_path)
+        .map_err(|error| format!("{}: {error}", built_in_path))
+        .and_then(|mut file| crate::options::get_options_from_file(file.get(), app_id));
+
+    let user_path = paths::user_data_base_path().join(paths::USER_OPTIONS_FILE);
+    let user = std::fs::File::open(&user_path)
+        .map_err(|error| format!("{}: {error}", user_path.display()))
+        .and_then(|mut file| crate::options::get_options_from_file(&mut file, app_id));
+
+    for result in [&built_in, &user] {
+        if let Err(error) = result {
+            log!("Warning: Couldn't inspect app corruption settings: {error}");
+        }
+    }
+    profile_corruption_mode_for_app_id(app_id, built_in, user)
+}
+
+pub fn app_picker(
+    options: Options,
+    show_lock_screen: bool,
+) -> Result<(PathBuf, Vec<String>), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
@@ -279,7 +326,10 @@ mod delete_app_tests {
     #[test]
     fn sqlite_namespace_matches_libsqlite3() {
         assert_eq!(sqlite_namespace("com.example.game"), "com.example.game");
-        assert_eq!(sqlite_namespace("com.example.my game"), "com.example.my_game");
+        assert_eq!(
+            sqlite_namespace("com.example.my game"),
+            "com.example.my_game"
+        );
     }
 
     #[test]
@@ -394,6 +444,8 @@ struct AppPickerDelegateHostObject {
     rotation_fix: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch.
     fix_movie_player: Option<bool>,
+    corruption_mode: Option<CorruptionMode>,
+    corruption_mode_changed: bool,
     preserve_aspect_ratio: Option<bool>,
     show_lock_screen: Option<bool>,
     force_composition: Option<bool>,
@@ -407,6 +459,7 @@ struct AppPickerDelegateHostObject {
     language_scroll_to: Option<CGFloat>,
     renderer_mode_toggle: bool,
     renderer_mode_scroll_to: Option<CGFloat>,
+    gles2_mode: Option<Gles2Mode>,
     /// Set when a finger goes down on an app icon (`UIControlEventTouchDown`).
     icon_touch_down: id,
     /// Set when a touch that started on an icon stops being a tap.
@@ -439,12 +492,99 @@ struct PickerSettings {
     /// an options file which enables the fix (e.g. GTA III defaults).
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
+    corruption_mode: CorruptionMode,
+    gles2_mode: Gles2Mode,
     cheat_engine: bool,
     network: bool,
     game_center_authenticated: bool,
     analog_stick_tilt_controls: bool,
     device_model_tag: Option<i32>,
     language_tag: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Gles2Mode {
+    #[default]
+    Off,
+    PreferContext,
+    Compatibility,
+}
+
+impl Gles2Mode {
+    fn selected_index(self) -> i32 {
+        match self {
+            Self::Off => 0,
+            Self::PreferContext => 1,
+            Self::Compatibility => 2,
+        }
+    }
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::PreferContext => "prefer-context",
+            Self::Compatibility => "compatibility",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "prefer-context" => Some(Self::PreferContext),
+            "compatibility" => Some(Self::Compatibility),
+            _ => None,
+        }
+    }
+
+    fn arguments(self) -> Vec<String> {
+        match self {
+            Self::Off => Vec::new(),
+            Self::PreferContext => vec!["--prefer-gles2-context".to_string()],
+            Self::Compatibility => vec!["--gles2-compat".to_string()],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorruptionMode {
+    Off,
+    NoCorrupt,
+    Corrupt,
+}
+
+impl CorruptionMode {
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::NoCorrupt => "no-corrupt",
+            Self::Corrupt => "corrupt",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "no-corrupt" => Some(Self::NoCorrupt),
+            "corrupt" => Some(Self::Corrupt),
+            _ => None,
+        }
+    }
+
+    fn option(self) -> Option<bool> {
+        match self {
+            Self::Off => None,
+            Self::NoCorrupt => Some(false),
+            Self::Corrupt => Some(true),
+        }
+    }
+
+    fn selected_index(self) -> i32 {
+        match self {
+            Self::Off => 0,
+            Self::NoCorrupt => 1,
+            Self::Corrupt => 2,
+        }
+    }
 }
 
 fn saved_renderer_mode(contents: &str) -> Option<RendererMode> {
@@ -465,7 +605,7 @@ fn saved_renderer_mode(contents: &str) -> Option<RendererMode> {
                 "true" => legacy_mode = Some(RendererMode::NativeGles),
                 "false" => legacy_mode = Some(RendererMode::Angle),
                 _ => (),
-            }
+            },
             _ => (),
         }
     }
@@ -492,6 +632,8 @@ impl PickerSettings {
             // app-specific defaults in the options files still apply.
             rotation_fix: options.rotation_fix.then_some(true),
             fix_movie_player: options.fix_movie_player.then_some(true),
+            corruption_mode: CorruptionMode::Off,
+            gles2_mode: Gles2Mode::Off,
             cheat_engine: quick_options_trainer_enabled(options),
             network: options.network_access,
             game_center_authenticated: options.game_center_authenticated,
@@ -544,6 +686,16 @@ impl PickerSettings {
                 }
                 "rotation_fix" => set_bool_override(value, &mut settings.rotation_fix),
                 "fix_movie_player" => set_bool_override(value, &mut settings.fix_movie_player),
+                "corruption_mode" => {
+                    if let Some(mode) = CorruptionMode::from_short_name(value) {
+                        settings.corruption_mode = mode;
+                    }
+                }
+                "gles2_mode" => {
+                    if let Some(mode) = Gles2Mode::from_short_name(value) {
+                        settings.gles2_mode = mode;
+                    }
+                }
                 "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
                 "network" => set_bool(value, &mut settings.network),
                 "game_center_authenticated" => {
@@ -586,6 +738,8 @@ impl PickerSettings {
              overlay_corner={}\n\
              rotation_fix={}\n\
              fix_movie_player={}\n\
+             corruption_mode={}\n\
+             gles2_mode={}\n\
              cheat_engine={}\n\
              network={}\n\
              game_center_authenticated={}\n\
@@ -604,6 +758,8 @@ impl PickerSettings {
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
             optional_bool(self.fix_movie_player),
+            self.corruption_mode.short_name(),
+            self.gles2_mode.short_name(),
             self.cheat_engine,
             self.network,
             self.game_center_authenticated,
@@ -779,6 +935,27 @@ const CLASSES: ClassExports = objc_classes! {
 - (())scaleHack4 {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack4 = true;
 }
+- (())corruptionOff {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::Off);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
+}
+- (())corruptionNo {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::NoCorrupt);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
+}
+- (())corruptionOn {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::Corrupt);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
+}
+- (())gles2Off {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles2_mode = Some(Gles2Mode::Off);
+}
+- (())gles2Prefer {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles2_mode = Some(Gles2Mode::PreferContext);
+}
+- (())gles2Compatibility {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles2_mode = Some(Gles2Mode::Compatibility);
+}
 - (())orientationDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_default = true;
 }
@@ -938,7 +1115,9 @@ fn show_app_picker_gui(
 
     let icon = {
         let bytes: &[u8] = match crate::branding() {
-            "" | "UNOFFICIAL" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
+            "" | "UNOFFICIAL" => {
+                include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png"))
+            }
             "PREVIEW" => {
                 include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon_preview.png"))
             }
@@ -1140,7 +1319,9 @@ fn app_picker_inner(
         delegate,
         main_view,
         app_frame.size,
-        recent_app.as_ref().map(|(_, name, image)| (name.as_str(), *image)),
+        recent_app
+            .as_ref()
+            .map(|(_, name, image)| (name.as_str(), *image)),
     );
     // Build stamp on the page-dot row, right-aligned like the one in the
     // reference home screen. It is added after the dock so nothing covers it.
@@ -1188,8 +1369,7 @@ fn app_picker_inner(
     let renderer_mode_dropdown_enabled = cfg!(target_os = "android") && angle_backend_available;
     let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
     let overlay_hidden_by_environment = crate::gles::perf_overlay::hidden_by_environment();
-    let initial_quick_options_show_fps =
-        picker_settings.show_fps && !overlay_hidden_by_environment;
+    let initial_quick_options_show_fps = picker_settings.show_fps && !overlay_hidden_by_environment;
     let settings = setup_settings(
         env,
         delegate,
@@ -1210,6 +1390,9 @@ fn app_picker_inner(
     let mut quick_options_overlay_corner = picker_settings.overlay_corner;
     let mut quick_options_rotation_fix = picker_settings.rotation_fix;
     let mut quick_options_fix_movie_player = picker_settings.fix_movie_player;
+    let mut quick_options_corruption_mode = picker_settings.corruption_mode;
+    let mut quick_options_corruption_mode_changed = false;
+    let mut quick_options_gles2_mode = picker_settings.gles2_mode;
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
     let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
@@ -1230,13 +1413,27 @@ fn app_picker_inner(
     let mut last_saved_picker_settings = picker_settings.clone();
 
     update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
-    update_orientation_buttons(env, &settings.orientation_buttons, quick_options_orientation);
+    update_orientation_buttons(
+        env,
+        &settings.orientation_buttons,
+        quick_options_orientation,
+    );
     update_performance_overlay_buttons(
         env,
         &settings.overlay_mode_buttons,
         &settings.overlay_corner_buttons,
         quick_options_overlay_mode,
         quick_options_overlay_corner,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_mode_buttons,
+        quick_options_corruption_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.gles2_mode_buttons,
+        quick_options_gles2_mode.selected_index() as usize,
     );
     refresh_dropdown(
         env,
@@ -1322,7 +1519,7 @@ fn app_picker_inner(
     }
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
-    let app_path = loop {
+    let (app_path, app_id) = loop {
         run_run_loop_single_iteration(env, main_run_loop);
         sync_dropdown_scroll(env, &settings.device_dropdown, &mut device_state);
         sync_dropdown_scroll(env, &settings.language_dropdown, &mut language_state);
@@ -1461,13 +1658,7 @@ fn app_picker_inner(
                 if let (Some(app_idx), Some(name)) = (app_idx, name) {
                     long_pressed_icon = Some(button);
                     pending_delete = Some(app_idx);
-                    show_delete_dialog(
-                        env,
-                        main_run_loop,
-                        delegate,
-                        &delete_dialog,
-                        &name,
-                    );
+                    show_delete_dialog(env, main_run_loop, delegate, &delete_dialog, &name);
                 }
             }
         }
@@ -1485,7 +1676,9 @@ fn app_picker_inner(
                 .copied()
             {
                 Some(app_idx) => {
-                    let app_path = apps.as_ref().unwrap()[app_idx].path.clone();
+                    let app = &apps.as_ref().unwrap()[app_idx];
+                    let app_path = app.path.clone();
+                    let app_id = app.bundle_id.clone();
                     remember_last_app_path(&app_path);
                     echo!("Picked: {}", app_path.display());
                     // iOS-style launch: the icon travels to the middle of the
@@ -1501,16 +1694,14 @@ fn app_picker_inner(
                         icon_frame,
                         icon_image,
                     );
-                    break app_path;
+                    break (app_path, app_id);
                 }
                 None => (), // Tapped on a black space
             }
             continue;
         }
         let status_accessory_tapped = {
-            let host = env
-                .objc
-                .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+            let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
             std::mem::take(&mut host.status_accessory_tapped)
         };
         if status_accessory_tapped {
@@ -1533,9 +1724,7 @@ fn app_picker_inner(
             // Both screens use nested event loops. Do not let their touches or
             // swipes leak back into the home screen.
             {
-                let host = env
-                    .objc
-                    .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
                 host.icon_tapped = nil;
                 host.icon_touch_down = nil;
                 host.icon_touch_cancelled = false;
@@ -1549,20 +1738,9 @@ fn app_picker_inner(
             if downloaded {
                 awaited_ipa = None;
                 if let Some(grid) = icon_grid_stuff.as_mut() {
-                    let page_count = reload_app_grid(
-                        env,
-                        grid,
-                        &mut apps,
-                        &mut current_page,
-                        &apps_dir,
-                    );
-                    rebuild_page_dots(
-                        env,
-                        main_view,
-                        app_frame.size,
-                        &mut page_dots,
-                        page_count,
-                    );
+                    let page_count =
+                        reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
+                    rebuild_page_dots(env, main_view, app_frame.size, &mut page_dots, page_count);
                     update_page_dots(env, &page_dots, current_page);
                 }
             }
@@ -1573,7 +1751,17 @@ fn app_picker_inner(
         if std::mem::take(&mut host_obj.recent_app_tapped) {
             if let Some((path, _, _)) = recent_app.as_ref() {
                 echo!("Picked last launched app: {}", path.display());
-                break path.clone();
+                let app_id = BundleData::open_any(path)
+                    .and_then(|data| Bundle::new_bundle_and_fs_from_host_path(data, true))
+                    .map(|(bundle, _)| bundle.bundle_identifier().to_owned());
+                let app_id = match app_id {
+                    Ok(app_id) if !app_id.is_empty() => app_id,
+                    Ok(_) | Err(_) => {
+                        log!("Warning: Couldn't inspect the last app's bundle identifier; its corruption profile will not be overridden");
+                        String::new()
+                    }
+                };
+                break (path.clone(), app_id);
             }
         }
         if std::mem::take(&mut host_obj.add_ipa) {
@@ -1683,7 +1871,8 @@ fn app_picker_inner(
                 &device_state,
             );
         } else if let Some(position) = std::mem::take(&mut host_obj.device_model_scroll_to) {
-            device_state.scroll = dropdown_scroll_at(position, settings.device_dropdown.items.len());
+            device_state.scroll =
+                dropdown_scroll_at(position, settings.device_dropdown.items.len());
             refresh_dropdown(
                 env,
                 &settings.device_dropdown,
@@ -1735,7 +1924,8 @@ fn app_picker_inner(
                 &language_state,
             );
         } else if let Some(position) = std::mem::take(&mut host_obj.language_scroll_to) {
-            language_state.scroll = dropdown_scroll_at(position, settings.language_dropdown.items.len());
+            language_state.scroll =
+                dropdown_scroll_at(position, settings.language_dropdown.items.len());
             refresh_dropdown(
                 env,
                 &settings.language_dropdown,
@@ -1749,7 +1939,8 @@ fn app_picker_inner(
             if let Some(app_idx) = pending_delete.take() {
                 hide_delete_dialog(env, main_run_loop, delegate, &delete_dialog);
                 let result = match apps.as_ref().ok().and_then(|list| {
-                    list.get(app_idx).map(|app| delete_app(app, list.as_slice()))
+                    list.get(app_idx)
+                        .map(|app| delete_app(app, list.as_slice()))
                 }) {
                     Some(res) => res,
                     None => Err("the app is no longer in the list".to_string()),
@@ -1815,6 +2006,31 @@ fn app_picker_inner(
             quick_options_rotation_fix = Some(rotation_fix);
         } else if let Some(fix_movie_player) = std::mem::take(&mut host_obj.fix_movie_player) {
             quick_options_fix_movie_player = Some(fix_movie_player);
+        } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
+            quick_options_corruption_mode = host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
+            quick_options_corruption_mode_changed = true;
+            update_segment_buttons(
+                env,
+                &settings.corruption_mode_buttons,
+                quick_options_corruption_mode.selected_index() as usize,
+            );
+            picker_settings.corruption_mode = quick_options_corruption_mode;
+            if picker_settings != last_saved_picker_settings {
+                picker_settings.save();
+                last_saved_picker_settings = picker_settings.clone();
+            }
+        } else if let Some(mode) = std::mem::take(&mut host_obj.gles2_mode) {
+            quick_options_gles2_mode = mode;
+            update_segment_buttons(
+                env,
+                &settings.gles2_mode_buttons,
+                quick_options_gles2_mode.selected_index() as usize,
+            );
+            picker_settings.gles2_mode = mode;
+            if picker_settings != last_saved_picker_settings {
+                picker_settings.save();
+                last_saved_picker_settings = picker_settings.clone();
+            }
         } else if let Some(preserve_aspect_ratio) =
             std::mem::take(&mut host_obj.preserve_aspect_ratio)
         {
@@ -1874,6 +2090,8 @@ fn app_picker_inner(
         picker_settings.overlay_corner = quick_options_overlay_corner;
         picker_settings.rotation_fix = quick_options_rotation_fix;
         picker_settings.fix_movie_player = quick_options_fix_movie_player;
+        picker_settings.corruption_mode = quick_options_corruption_mode;
+        picker_settings.gles2_mode = quick_options_gles2_mode;
         picker_settings.cheat_engine = quick_options_cheat_engine;
         picker_settings.network = quick_options_network;
         picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
@@ -1902,18 +2120,19 @@ fn app_picker_inner(
                 if let Some(grid) = icon_grid_stuff.as_mut() {
                     let page_count =
                         reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
-                    rebuild_page_dots(
-                        env,
-                        main_view,
-                        app_frame.size,
-                        &mut page_dots,
-                        page_count,
-                    );
+                    rebuild_page_dots(env, main_view, app_frame.size, &mut page_dots, page_count);
                     update_page_dots(env, &page_dots, current_page);
                 }
             }
         }
     };
+
+    let (profile_corruption_mode, profile_load_failed) =
+        inspect_app_profile_corruption_options(&app_id);
+    let emit_picker_corruption_mode = crate::options::should_emit_picker_corruption_mode(
+        profile_corruption_mode,
+        profile_load_failed,
+    );
 
     // Apply user-specified overrides
     if let Some(scale_hack) = quick_options_scale_hack {
@@ -2012,6 +2231,13 @@ fn app_picker_inner(
         option_args.push(arg);
     }
 
+    option_args.extend(quick_options_corruption_arguments(
+        quick_options_corruption_mode,
+        profile_corruption_mode,
+        profile_load_failed,
+    ));
+    option_args.extend(quick_options_gles2_mode.arguments());
+
     // Return the environment so some parts of it can be salvaged.
     (app_path, option_args)
 }
@@ -2083,12 +2309,12 @@ fn app_picker_layout(screen_width: CGFloat, screen_height: CGFloat) -> AppPicker
         .min(icon_by_height)
         .clamp(APP_PICKER_ICON_MIN_SIZE, APP_PICKER_ICON_MAX_SIZE)
         .floor();
-    let icon_gap_x = ((inner_width - icon_size * cols) / (cols - 1.0))
-        .clamp(0.0, APP_PICKER_ICON_GAP_X_MAX);
+    let icon_gap_x =
+        ((inner_width - icon_size * cols) / (cols - 1.0)).clamp(0.0, APP_PICKER_ICON_GAP_X_MAX);
     let grid_width = icon_size * cols + icon_gap_x * (cols - 1.0);
     let cell_height = icon_size + row_chrome;
-    let icon_gap_y = ((available_height - rows * cell_height) / (rows - 1.0))
-        .max(APP_PICKER_ROW_GAP_MIN);
+    let icon_gap_y =
+        ((available_height - rows * cell_height) / (rows - 1.0)).max(APP_PICKER_ROW_GAP_MIN);
 
     AppPickerLayout {
         icon_size,
@@ -2242,11 +2468,9 @@ fn make_icon_grid(
             // Rounding is needed here to avoid blurry text.
             let label_frame = CGRect {
                 origin: CGPoint {
-                    x: (icon_frame.origin.x
-                        - (layout.label_size.width - layout.icon_size) / 2.0)
+                    x: (icon_frame.origin.x - (layout.label_size.width - layout.icon_size) / 2.0)
                         .round(),
-                    y: (icon_frame.origin.y + layout.icon_size + APP_PICKER_LABEL_TOP_GAP)
-                        .round(),
+                    y: (icon_frame.origin.y + layout.icon_size + APP_PICKER_LABEL_TOP_GAP).round(),
                 },
                 size: layout.label_size,
             };
@@ -2491,13 +2715,27 @@ fn run_lock_screen(
     let header_edge = new_view(env, rect(0.0, 137.0, size.width, 1.0), header_edge_color);
     () = msg![env; lock addSubview:header_edge];
     let white: id = msg_class![env; UIColor whiteColor];
-    let clock = new_label(env, rect(0.0, 12.0, size.width, 82.0), &lock_screen_time_string(), 68.0, false, white);
+    let clock = new_label(
+        env,
+        rect(0.0, 12.0, size.width, 82.0),
+        &lock_screen_time_string(),
+        68.0,
+        false,
+        white,
+    );
     () = msg![env; clock setTextAlignment:UITextAlignmentCenter];
     let shadow = ui_color(env, 0.0, 0.0, 0.0, 0.7);
     () = msg![env; clock setShadowColor:shadow];
     () = msg![env; clock setShadowOffset:(CGSize { width: 0.0, height: 2.0 })];
     () = msg![env; lock addSubview:clock];
-    let date = new_label(env, rect(8.0, 91.0, size.width - 16.0, 32.0), &lock_screen_date_string(), 22.0, false, white);
+    let date = new_label(
+        env,
+        rect(8.0, 91.0, size.width - 16.0, 32.0),
+        &lock_screen_date_string(),
+        22.0,
+        false,
+        white,
+    );
     () = msg![env; date setTextAlignment:UITextAlignmentCenter];
     () = msg![env; date setShadowColor:shadow];
     () = msg![env; date setShadowOffset:(CGSize { width: 0.0, height: 1.0 })];
@@ -2517,7 +2755,11 @@ fn run_lock_screen(
     // Raised metal bezel around the black glass slider, like the inset 3D
     // capsule on the reference iPhone OS lock screen.
     let bezel_color = ui_color(env, 0.25, 0.26, 0.28, 1.0);
-    let bezel = new_view(env, rect(17.0, bottom + 10.0, size.width - 34.0, 68.0), bezel_color);
+    let bezel = new_view(
+        env,
+        rect(17.0, bottom + 10.0, size.width - 34.0, 68.0),
+        bezel_color,
+    );
     let bezel_layer: id = msg![env; bezel layer];
     () = msg![env; bezel_layer setCornerRadius:(20.0 as CGFloat)];
     let bezel_edge = ui_color(env, 0.62, 0.64, 0.67, 1.0);
@@ -2527,7 +2769,11 @@ fn run_lock_screen(
     () = msg![env; lock addSubview:bezel];
 
     let track_color = ui_color(env, 0.008, 0.012, 0.02, 0.90);
-    let track = new_view(env, rect(21.0, bottom + 13.0, size.width - 42.0, 62.0), track_color);
+    let track = new_view(
+        env,
+        rect(21.0, bottom + 13.0, size.width - 42.0, 62.0),
+        track_color,
+    );
     let track_layer: id = msg![env; track layer];
     () = msg![env; track_layer setCornerRadius:(18.0 as CGFloat)];
     () = msg![env; track setClipsToBounds:true];
@@ -2539,7 +2785,11 @@ fn run_lock_screen(
     // A single restrained top glint keeps the capsule glossy without visible
     // striping on renderers that do not composite translucent bands smoothly.
     let track_glint_color = ui_color(env, 1.0, 1.0, 1.0, 0.11);
-    let track_glint = new_view(env, rect(14.0, 2.0, size.width - 70.0, 1.0), track_glint_color);
+    let track_glint = new_view(
+        env,
+        rect(14.0, 2.0, size.width - 70.0, 1.0),
+        track_glint_color,
+    );
     () = msg![env; track addSubview:track_glint];
     let track_width = size.width - 42.0;
     let thumb_width = (track_width * 0.245).clamp(76.0, 100.0);
@@ -2644,14 +2894,18 @@ fn run_lock_screen(
             let host = env.objc.borrow::<AppPickerDelegateHostObject>(delegate);
             (host.lock_screen_unlocked, host.lock_slider_progress)
         };
-        if unlocked { break; }
+        if unlocked {
+            break;
+        }
         let tracking: bool = msg![env; slider tracking];
         if !tracking && progress > 0.0 {
             // A partial swipe eases back to the start; a completed one is
             // handled above by the unlock transition.
             progress = (progress - 0.055).max(0.0);
             () = msg![env; slider setValue:progress];
-            env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_slider_progress = progress;
+            env.objc
+                .borrow_mut::<AppPickerDelegateHostObject>(delegate)
+                .lock_slider_progress = progress;
         }
         if shimmer_updated.elapsed() >= Duration::from_millis(33) {
             shimmer_updated = Instant::now();
@@ -2689,12 +2943,18 @@ fn run_lock_screen(
         host.swipe_right = false;
         host.swipe_left = false;
     }
-    animate_for(env, run_loop, delegate, Duration::from_millis(480), |env, t| {
-        let p = ease_in_out_cubic(t) as CGFloat;
-        let mut frame: CGRect = msg![env; lock frame];
-        frame.origin.y = -size.height * p;
-        () = msg![env; lock setFrame:frame];
-    });
+    animate_for(
+        env,
+        run_loop,
+        delegate,
+        Duration::from_millis(480),
+        |env, t| {
+            let p = ease_in_out_cubic(t) as CGFloat;
+            let mut frame: CGRect = msg![env; lock frame];
+            frame.origin.y = -size.height * p;
+            () = msg![env; lock setFrame:frame];
+        },
+    );
     () = msg![env; lock setHidden:true];
     if let Some(bar) = status_bar {
         () = msg![env; bar setBackgroundColor:clear];
@@ -2734,21 +2994,58 @@ fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) {
         let mut now: libc::time_t = 0;
         libc::time(&mut now);
         let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() { return (14, 50, 3, 0, 21, 2026); }
-        (tm.tm_hour, tm.tm_min, tm.tm_wday, tm.tm_mon, tm.tm_mday, tm.tm_year + 1900)
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return (14, 50, 3, 0, 21, 2026);
+        }
+        (
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_wday,
+            tm.tm_mon,
+            tm.tm_mday,
+            tm.tm_year + 1900,
+        )
     }
 }
 #[cfg(not(unix))]
-fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) { (14, 50, 3, 0, 21, 2026) }
+fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) {
+    (14, 50, 3, 0, 21, 2026)
+}
 fn lock_screen_time_string() -> String {
     let (hour, minute, ..) = lock_screen_calendar_parts();
     format!("{:02}:{:02}", hour, minute)
 }
 fn lock_screen_date_string() -> String {
     let (_, _, weekday, month, day, _) = lock_screen_calendar_parts();
-    let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    let months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-    format!("{}, {} {}", weekdays[weekday.clamp(0, 6) as usize], months[month.clamp(0, 11) as usize], day)
+    let weekdays = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    let months = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    format!(
+        "{}, {} {}",
+        weekdays[weekday.clamp(0, 6) as usize],
+        months[month.clamp(0, 11) as usize],
+        day
+    )
 }
 
 /// Builds a fake old-iOS status bar: signal bars, carrier, clock and battery.
@@ -2815,7 +3112,11 @@ fn make_status_bar(
     () = msg![env; bar addSubview:time];
 
     // Battery: a white rounded shell with a black inside and a charge bar.
-    let battery = new_view(env, rect(width - BATTERY_RIGHT_INSET, 5.0, 24.0, 11.0), white);
+    let battery = new_view(
+        env,
+        rect(width - BATTERY_RIGHT_INSET, 5.0, 24.0, 11.0),
+        white,
+    );
     let battery_layer: id = msg![env; battery layer];
     () = msg![env; battery_layer setCornerRadius:(2.5 as CGFloat)];
     () = msg![env; bar addSubview:battery];
@@ -2829,11 +3130,20 @@ fn make_status_bar(
     () = msg![env; bar addSubview:battery_inner];
     let charge = new_view(
         env,
-        rect(width - BATTERY_CHARGE_LEFT, 7.5, BATTERY_CHARGE_MAX_WIDTH, 6.0),
+        rect(
+            width - BATTERY_CHARGE_LEFT,
+            7.5,
+            BATTERY_CHARGE_MAX_WIDTH,
+            6.0,
+        ),
         white,
     );
     () = msg![env; bar addSubview:charge];
-    let nub = new_view(env, rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0), white);
+    let nub = new_view(
+        env,
+        rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0),
+        white,
+    );
     () = msg![env; bar addSubview:nub];
     access_prompt::add_status_target(env, delegate, bar, width);
 
@@ -2953,7 +3263,11 @@ fn update_page_dots(env: &mut Environment, dots: &[id], current_page: usize) {
     let active: id = msg_class![env; UIColor whiteColor];
     let inactive = ui_color(env, 0.75, 0.75, 0.75, 0.45);
     for (idx, &dot) in dots.iter().enumerate() {
-        let color = if idx == current_page { active } else { inactive };
+        let color = if idx == current_page {
+            active
+        } else {
+            inactive
+        };
         () = msg![env; dot setBackgroundColor:color];
     }
 }
@@ -2991,7 +3305,11 @@ fn make_dock(
     let dock_width = width - dock_inset * 2.0;
     let top = screen_size.height - APP_PICKER_DOCK_HEIGHT + 2.0;
     let background = ui_color(env, 0.035, 0.045, 0.065, 0.62);
-    let dock = new_view(env, rect(dock_inset, top, dock_width, APP_PICKER_DOCK_HEIGHT - 4.0), background);
+    let dock = new_view(
+        env,
+        rect(dock_inset, top, dock_width, APP_PICKER_DOCK_HEIGHT - 4.0),
+        background,
+    );
     let dock_layer: id = msg![env; dock layer];
     () = msg![env; dock_layer setCornerRadius:(12.0 as CGFloat)];
     let hairline_color = ui_color(env, 1.0, 1.0, 1.0, 0.38);
@@ -3000,8 +3318,8 @@ fn make_dock(
 
     let count: CGFloat = 4.0;
     let side_inset: CGFloat = 8.0;
-    let gap = ((dock_width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
-        .clamp(2.0, 18.0);
+    let gap =
+        ((dock_width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0)).clamp(2.0, 18.0);
     let first_x = (dock_width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
@@ -3009,7 +3327,9 @@ fn make_dock(
     let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
     let browse_image = make_browse_app_icon(env);
     let step = DOCK_ICON_SIZE + gap;
-    make_dock_item(env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa");
+    make_dock_item(
+        env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa",
+    );
     make_dock_item(
         env,
         delegate,
@@ -3031,7 +3351,15 @@ fn make_dock(
         recent_label,
         "openRecentApp",
     );
-    make_dock_item(env, delegate, dock, first_x + step * 2.0, browse_image, "Browse", "addIpa");
+    make_dock_item(
+        env,
+        delegate,
+        dock,
+        first_x + step * 2.0,
+        browse_image,
+        "Browse",
+        "addIpa",
+    );
     () = msg![env; main_view addSubview:dock];
     dock
 }
@@ -3376,15 +3704,9 @@ fn play_home_screen_unlock_animation(
         host_obj.icon_touch_down = nil;
     }
 
-    animate_for(
-        env,
-        run_loop,
-        delegate,
-        HOME_UNLOCK_DURATION,
-        |env, t| {
-            apply_unlock_step(env, &cells, &targets, wallpaper, chrome_views, t);
-        },
-    );
+    animate_for(env, run_loop, delegate, HOME_UNLOCK_DURATION, |env, t| {
+        apply_unlock_step(env, &cells, &targets, wallpaper, chrome_views, t);
+    });
 
     if let Some(wallpaper) = wallpaper {
         () = msg![env; wallpaper setAlpha:(1.0 as CGFloat)];
@@ -3655,7 +3977,10 @@ fn make_dock_asset_icon(env: &mut Environment, bytes: &[u8]) -> id {
 }
 
 fn make_settings_app_icon(env: &mut Environment) -> id {
-    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/settings_icon.png"));
+    let bytes: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/res/settings_icon.png"
+    ));
     make_dock_asset_icon(env, bytes)
 }
 
@@ -3828,6 +4153,8 @@ struct SettingsStuff {
     orientation_buttons: [id; 4],
     overlay_mode_buttons: Vec<id>,
     overlay_corner_buttons: Vec<id>,
+    corruption_mode_buttons: Vec<id>,
+    gles2_mode_buttons: Vec<id>,
     /// The "Device model" dropdown.
     device_dropdown: SettingsDropdown,
     /// The "Language" dropdown.
@@ -3973,7 +4300,11 @@ fn setup_settings(
     let stripe = ui_color(env, 0.55, 0.58, 0.62, 0.10);
     let mut stripe_x: CGFloat = 2.0;
     while stripe_x < width {
-        let stripe_view = new_view(env, rect(stripe_x, 0.0, 1.0, height + status_offset), stripe);
+        let stripe_view = new_view(
+            env,
+            rect(stripe_x, 0.0, 1.0, height + status_offset),
+            stripe,
+        );
         () = msg![env; settings_view addSubview:stripe_view];
         stripe_x += 5.0;
     }
@@ -3996,20 +4327,19 @@ fn setup_settings(
         let t = step as CGFloat / (NAV_GRADIENT_STEPS - 1) as CGFloat;
         let y = nav_height * t;
         let band_height = nav_height / NAV_GRADIENT_STEPS as CGFloat + 0.5;
-        let color = ui_color(
-            env,
-            0.39 - 0.18 * t,
-            0.56 - 0.25 * t,
-            0.75 - 0.23 * t,
-            1.0,
-        );
+        let color = ui_color(env, 0.39 - 0.18 * t, 0.56 - 0.25 * t, 0.75 - 0.23 * t, 1.0);
         let band = new_view(env, rect(0.0, y, width, band_height), color);
         () = msg![env; nav_bar addSubview:band];
     }
     let nav_separator_color = ui_color(env, 0.12, 0.22, 0.36, 1.0);
     let nav_separator = new_view(
         env,
-        rect(0.0, SETTINGS_NAV_BAR_HEIGHT + status_offset - 1.0, width, 1.0),
+        rect(
+            0.0,
+            SETTINGS_NAV_BAR_HEIGHT + status_offset - 1.0,
+            width,
+            1.0,
+        ),
         nav_separator_color,
     );
     () = msg![env; settings_view addSubview:nav_separator];
@@ -4027,7 +4357,8 @@ fn setup_settings(
     () = msg![env; settings_view addSubview:title];
 
     let done: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-    () = msg![env; done setFrame:(rect(width - 72.0, status_offset, 64.0, SETTINGS_NAV_BAR_HEIGHT))];
+    () =
+        msg![env; done setFrame:(rect(width - 72.0, status_offset, 64.0, SETTINGS_NAV_BAR_HEIGHT))];
     let done_text = ns_string::get_static_str(env, "Done");
     () = msg![env; done setTitle:done_text forState:UIControlStateNormal];
     // FIXME: manually calling layoutSubviews shouldn't be needed?
@@ -4094,7 +4425,10 @@ fn setup_settings(
     sections.push(("DISPLAY", display_rows));
     let overlay_mode_options: &'static [(&'static str, &'static str)] =
         if cfg!(any(target_os = "android", target_os = "ios")) {
-            &[("Full", "overlayModeFull"), ("Minimal", "overlayModeMinimal")]
+            &[
+                ("Full", "overlayModeFull"),
+                ("Minimal", "overlayModeMinimal"),
+            ]
         } else {
             &[
                 ("Full", "overlayModeFull"),
@@ -4104,6 +4438,22 @@ fn setup_settings(
         };
     let mut graphics_rows = vec![
         SettingsRow::RendererDropdown,
+        SettingsRow::Segmented(
+            "Corruption engine",
+            &[
+                ("Off", "corruptionOff"),
+                ("No", "corruptionNo"),
+                ("On", "corruptionOn"),
+            ],
+        ),
+        SettingsRow::Segmented(
+            "GLES2 compatibility",
+            &[
+                ("Off", "gles2Off"),
+                ("Prefer context", "gles2Prefer"),
+                ("GL2.1", "gles2Compatibility"),
+            ],
+        ),
         SettingsRow::Toggle(
             FORCE_COMPOSITION_LABEL,
             "forceComposition:",
@@ -4154,15 +4504,17 @@ fn setup_settings(
     sections.push(("GRAPHICS", graphics_rows));
     sections.push((
         "DEVICE",
-        vec![
-            SettingsRow::DeviceDropdown,
-            SettingsRow::LanguageDropdown,
-        ],
+        vec![SettingsRow::DeviceDropdown, SettingsRow::LanguageDropdown],
     ));
     sections.push((
         "EMULATION",
         vec![
-            SettingsRow::Toggle("Cheat Engine", "cheatEngine:", picker_settings.cheat_engine, true),
+            SettingsRow::Toggle(
+                "Cheat Engine",
+                "cheatEngine:",
+                picker_settings.cheat_engine,
+                true,
+            ),
             SettingsRow::Toggle("Network access", "network:", picker_settings.network, true),
             SettingsRow::Toggle(
                 "Local Game Center sign-in",
@@ -4188,6 +4540,8 @@ fn setup_settings(
     let mut renderer_dropdown: Option<SettingsDropdown> = None;
     let mut overlay_mode_buttons = Vec::new();
     let mut overlay_corner_buttons = Vec::new();
+    let mut corruption_mode_buttons = Vec::new();
+    let mut gles2_mode_buttons = Vec::new();
     let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
     // Where dropdown menus open: just under the navigation bar.
     let menu_origin = CGPoint {
@@ -4211,7 +4565,16 @@ fn setup_settings(
 
         let group_height: CGFloat = rows.iter().map(settings_row_height).sum();
         let outline_color = ui_color(env, 0.66, 0.67, 0.69, 1.0);
-        let outline = new_view(env, rect(SETTINGS_GROUP_INSET - 1.0, y - 1.0, inner_width + 2.0, group_height + 2.0), outline_color);
+        let outline = new_view(
+            env,
+            rect(
+                SETTINGS_GROUP_INSET - 1.0,
+                y - 1.0,
+                inner_width + 2.0,
+                group_height + 2.0,
+            ),
+            outline_color,
+        );
         let outline_layer: id = msg![env; outline layer];
         () = msg![env; outline_layer setCornerRadius:(11.0 as CGFloat)];
         () = msg![env; scroll addSubview:outline];
@@ -4252,6 +4615,8 @@ fn setup_settings(
                         "orientationDefault" => orientation_buttons = seg_buttons,
                         "overlayModeFull" => overlay_mode_buttons = seg_buttons,
                         "overlayCornerTopLeft" => overlay_corner_buttons = seg_buttons,
+                        "corruptionOff" => corruption_mode_buttons = seg_buttons,
+                        "gles2Off" => gles2_mode_buttons = seg_buttons,
                         _ => unreachable!(),
                     }
                 }
@@ -4424,6 +4789,8 @@ fn setup_settings(
         orientation_buttons: orientation_buttons.try_into().unwrap(),
         overlay_mode_buttons,
         overlay_corner_buttons,
+        corruption_mode_buttons,
+        gles2_mode_buttons,
         device_dropdown: device_dropdown
             .expect("the settings screen always has a device model row"),
         language_dropdown: language_dropdown
@@ -5063,12 +5430,7 @@ const DELETE_DIALOG_DISAPPEAR_DURATION: Duration = Duration::from_millis(150);
 
 /// Closes the delete dialog with the reverse of its pop-in animation. This
 /// returns once the dialog is hidden.
-fn hide_delete_dialog(
-    env: &mut Environment,
-    run_loop: id,
-    delegate: id,
-    dialog: &DeleteDialog,
-) {
+fn hide_delete_dialog(env: &mut Environment, run_loop: id, delegate: id, dialog: &DeleteDialog) {
     animate_for(
         env,
         run_loop,
@@ -5151,6 +5513,21 @@ fn quick_options_fix_arguments(
         args.push(quick_options_fix_movie_player_argument(enabled).to_string());
     }
     args
+}
+
+fn quick_options_corruption_arguments(
+    mode: CorruptionMode,
+    profile_mode: Option<bool>,
+    profile_load_failed: bool,
+) -> Vec<String> {
+    if !crate::options::should_emit_picker_corruption_mode(profile_mode, profile_load_failed) {
+        return Vec::new();
+    }
+    match mode {
+        CorruptionMode::Off => Vec::new(),
+        CorruptionMode::NoCorrupt => vec!["--no-corrupt-game".to_string()],
+        CorruptionMode::Corrupt => vec!["--corrupt-game".to_string()],
+    }
 }
 
 /// Explicit launch argument so the picker choice overrides option-file values.
@@ -5300,7 +5677,6 @@ mod quick_options_renderer_mode_tests {
             quick_options_renderer_mode_argument(mode),
             "--renderer-mode=angle"
         );
-
     }
 }
 
@@ -5357,6 +5733,72 @@ mod quick_options_fix_tests {
     }
 
     #[test]
+    fn profile_corruption_options_are_resolved_from_built_in_then_user_file() {
+        let built_in = b"com.example.game: --corrupt-game\n";
+        let user = b"com.example.game: --device-family=iphone-4 --no-corrupt-game\n";
+        let (mode, failed) = inspect_profile_corruption_options(
+            &mut std::io::Cursor::new(built_in),
+            &mut std::io::Cursor::new(user),
+            "com.example.game",
+        );
+        assert_eq!(mode, Some(false));
+        assert!(!failed);
+    }
+
+    #[test]
+    fn missing_bundle_identifier_suppresses_picker_corruption_override() {
+        let (mode, failed) = profile_corruption_mode_for_app_id(
+            "",
+            Ok(Some("--no-corrupt-game".to_owned())),
+            Ok(None),
+        );
+        assert_eq!(mode, None);
+        assert!(failed);
+        assert!(!crate::options::should_emit_picker_corruption_mode(mode, failed));
+    }
+
+    #[test]
+    fn saved_gles2_and_corruption_modes_round_trip() {
+        for mode in [
+            CorruptionMode::Off,
+            CorruptionMode::NoCorrupt,
+            CorruptionMode::Corrupt,
+        ] {
+            assert_eq!(
+                CorruptionMode::from_short_name(mode.short_name()),
+                Some(mode)
+            );
+        }
+        for mode in [
+            Gles2Mode::Off,
+            Gles2Mode::PreferContext,
+            Gles2Mode::Compatibility,
+        ] {
+            assert_eq!(Gles2Mode::from_short_name(mode.short_name()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn corruption_mode_arguments_are_tristate_and_profile_aware() {
+        assert!(quick_options_corruption_arguments(CorruptionMode::Off, None, false).is_empty());
+        assert_eq!(
+            quick_options_corruption_arguments(CorruptionMode::NoCorrupt, None, false),
+            vec!["--no-corrupt-game"]
+        );
+        assert_eq!(
+            quick_options_corruption_arguments(CorruptionMode::Corrupt, None, false),
+            vec!["--corrupt-game"]
+        );
+        assert!(
+            quick_options_corruption_arguments(CorruptionMode::Corrupt, Some(false), false)
+                .is_empty()
+        );
+        assert!(
+            quick_options_corruption_arguments(CorruptionMode::NoCorrupt, None, true).is_empty()
+        );
+    }
+
+    #[test]
     fn saved_overrides_round_trip_without_cancelling_cli_flags() {
         // An untouched switch is saved as "default" and must not emit an
         // argument, so app-specific defaults (e.g. GTA III) still apply.
@@ -5380,6 +5822,23 @@ mod quick_options_fix_tests {
         // (or the other way round).
         set_bool_override("garbage", &mut setting);
         assert_eq!(setting, Some(true));
+    }
+
+    #[test]
+    fn gles2_modes_emit_their_distinct_arguments() {
+        assert!(Gles2Mode::Off.arguments().is_empty());
+        assert_eq!(
+            Gles2Mode::PreferContext.arguments(),
+            ["--prefer-gles2-context"]
+        );
+        assert_eq!(Gles2Mode::Compatibility.arguments(), ["--gles2-compat"]);
+    }
+
+    #[test]
+    fn compatibility_mode_does_not_emit_prefer_context() {
+        let args = Gles2Mode::Compatibility.arguments();
+        assert!(args.contains(&"--gles2-compat".to_string()));
+        assert!(!args.contains(&"--prefer-gles2-context".to_string()));
     }
 }
 

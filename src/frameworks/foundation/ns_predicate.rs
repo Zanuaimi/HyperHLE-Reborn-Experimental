@@ -5,6 +5,7 @@
  */
 //! `NSPredicate`.
 
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::frameworks::foundation::ns_string;
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
@@ -27,8 +28,9 @@ enum PredicateKind {
     And(id, id),
     /// OR of two predicates.
     Or(id, id),
-    /// Block-based predicate (not supported — always returns false).
-    Block,
+    /// `predicateWithBlock:` predicate. Holds a heap copy of the guest
+    /// block, `BOOL (^)(id evaluatedObject, NSDictionary *bindings)`.
+    Block(id),
 }
 impl Default for PredicateKind {
     fn default() -> Self {
@@ -93,11 +95,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     crate::objc::autorelease(env, new)
 }
 
-// predicateWithBlock: — block evaluation is not supported; the predicate
-// always evaluates to false (and logs when evaluated).
-+ (id)predicateWithBlock:(id)_block {
+// predicateWithBlock: — evaluates the block against each object. The
+// predicate keeps a copy of the block, like any object that stores one.
+// https://developer.apple.com/documentation/foundation/nspredicate/1416185-predicatewithblock
++ (id)predicateWithBlock:(id)block {
     let new: id = msg![env; this alloc];
-    env.objc.borrow_mut::<NSPredicateHostObject>(new).kind = PredicateKind::Block;
+    if block != nil {
+        let copy = crate::libc::blocks::_Block_copy(env, block.cast().cast_const());
+        env.objc.borrow_mut::<NSPredicateHostObject>(new).kind =
+            PredicateKind::Block(copy.cast_mut().cast());
+    }
     crate::objc::autorelease(env, new)
 }
 
@@ -237,6 +244,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             release(env, a);
             release(env, b);
         }
+        PredicateKind::Block(block) => {
+            crate::libc::blocks::_Block_release(env, block.cast().cast_const());
+        }
         _ => {}
     }
     let arguments = std::mem::take(&mut env.objc.borrow_mut::<NSPredicateHostObject>(this).arguments);
@@ -263,7 +273,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             PredicateKind::Not(predicate) => PredicateKind::Not(*predicate),
             PredicateKind::And(left, right) => PredicateKind::And(*left, *right),
             PredicateKind::Or(left, right) => PredicateKind::Or(*left, *right),
-            PredicateKind::Block => PredicateKind::Block,
+            PredicateKind::Block(block) => PredicateKind::Block(*block),
         };
         (
             kind,
@@ -301,7 +311,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // evaluateWithObject: — evaluate against a single object.
 - (bool)evaluateWithObject:(id)object {
-    evaluate_predicate(env, this, object, &[])
+    evaluate_predicate(env, this, object, nil, &[])
 }
 
 // evaluateWithObject:substitutionVariables: — resolve basic variables.
@@ -318,7 +328,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             variables.push((name, value));
         }
     }
-    evaluate_predicate(env, this, object, &variables)
+    evaluate_predicate(env, this, object, _variables, &variables)
 }
 
 // =========================================================================
@@ -336,7 +346,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             PredicateKind::Not(_)    => "NOT (...)".to_string(),
             PredicateKind::And(_, _) => "(...) AND (...)".to_string(),
             PredicateKind::Or(_, _)  => "(...) OR (...)".to_string(),
-            PredicateKind::Block     => "BLOCK".to_string(),
+            PredicateKind::Block(block) => format!("BLOCKPREDICATE({:#x})", block.to_bits()),
         }
     };
     let s: id = ns_string::from_rust_string(env, fmt);
@@ -465,6 +475,7 @@ fn evaluate_predicate(
     env: &mut crate::Environment,
     predicate: crate::objc::id,
     object: crate::objc::id,
+    bindings: crate::objc::id,
     variables: &[(String, id)],
 ) -> bool {
     // Read kind without holding borrow across recursive calls.
@@ -473,15 +484,13 @@ fn evaluate_predicate(
         Not(id),
         And(id, id),
         Or(id, id),
+        Block(id),
     }
     let snapshot = {
         let host = env.objc.borrow::<NSPredicateHostObject>(predicate);
         match &host.kind {
             PredicateKind::Constant(v) => return *v,
-            PredicateKind::Block => {
-                log!("NSPredicate block evaluation not supported — returning false");
-                return false;
-            }
+            PredicateKind::Block(block) => Snapshot::Block(*block),
             PredicateKind::Format => Snapshot::Format(
                 host.format.clone().unwrap_or_default(),
                 host.arguments.clone(),
@@ -496,14 +505,16 @@ fn evaluate_predicate(
         }
     };
     match snapshot {
-        Snapshot::Not(predicate) => !evaluate_predicate(env, predicate, object, variables),
+        Snapshot::Not(predicate) => {
+            !evaluate_predicate(env, predicate, object, bindings, variables)
+        }
         Snapshot::And(left, right) => {
-            evaluate_predicate(env, left, object, variables)
-                && evaluate_predicate(env, right, object, variables)
+            evaluate_predicate(env, left, object, bindings, variables)
+                && evaluate_predicate(env, right, object, bindings, variables)
         }
         Snapshot::Or(left, right) => {
-            evaluate_predicate(env, left, object, variables)
-                || evaluate_predicate(env, right, object, variables)
+            evaluate_predicate(env, left, object, bindings, variables)
+                || evaluate_predicate(env, right, object, bindings, variables)
         }
         Snapshot::Format(format, arguments, stored_variables) => {
             let expression = match super::ns_predicate_format::parse_with_arguments(&format) {
@@ -565,6 +576,12 @@ fn evaluate_predicate(
                     );
                     false
                 })
+        }
+        Snapshot::Block(block) => {
+            let invoke: u32 = env.mem.read(block.cast::<u32>() + 3u32);
+            let invoke = GuestFunction::from_addr_with_thumb_bit(invoke);
+            let result: u8 = invoke.call_from_host(env, (block, object, bindings));
+            result != 0
         }
     }
 }

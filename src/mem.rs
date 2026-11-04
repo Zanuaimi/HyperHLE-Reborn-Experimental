@@ -1199,6 +1199,20 @@ impl Mem {
         self.allocator.live_allocations()
     }
 
+    /// Replace a byte in a live guest allocation and return its previous value.
+    /// Returns `None` if `addr` is not inside a live allocation.
+    pub fn corrupt_byte(&mut self, addr: GuestUSize, value: u8) -> Option<u8> {
+        self.allocator
+            .live_allocations()
+            .into_iter()
+            .find(|(base, size)| addr >= *base && addr.wrapping_sub(*base) < *size)?;
+        let ptr: MutPtr<u8> = Ptr::from_bits(addr);
+        let byte = &mut self.bytes_at_mut(ptr, 1)[0];
+        let previous = *byte;
+        *byte = value;
+        Some(previous)
+    }
+
     pub fn realloc(&mut self, old_ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
         if old_ptr.is_null() {
             return self.alloc(size);
@@ -1332,7 +1346,10 @@ impl Mem {
     /// POSIX paths and most guest C strings are byte strings, so callers that
     /// must accept arbitrary bytes (e.g. `open(2)`, which the kernel never
     /// validates as UTF-8) use this instead of [Self::cstr_at_utf8].
-    pub fn cstr_at_utf8_lossy<const MUT: bool>(&self, ptr: Ptr<u8, MUT>) -> std::borrow::Cow<'_, str> {
+    pub fn cstr_at_utf8_lossy<const MUT: bool>(
+        &self,
+        ptr: Ptr<u8, MUT>,
+    ) -> std::borrow::Cow<'_, str> {
         match self.cstr_at_utf8(ptr) {
             Ok(s) => std::borrow::Cow::Borrowed(s),
             Err(bytes) => String::from_utf8_lossy(bytes),
@@ -1566,6 +1583,33 @@ mod mem_tests {
     }
 
     #[test]
+    fn corrupt_byte_only_writes_inside_live_allocations() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(super::PAGE_SIZE);
+        let allocation = mem.alloc(4);
+        let base = allocation.to_bits();
+        mem.bytes_at_mut(allocation.cast(), 4)
+            .copy_from_slice(&[1, 2, 3, 4]);
+
+        assert_eq!(mem.corrupt_byte(base + 2, 99), Some(3));
+        assert_eq!(
+            mem.bytes_at(allocation.cast::<u8>().cast_const(), 4),
+            &[1, 2, 99, 4]
+        );
+
+        mem.free(allocation);
+        assert!(
+            !mem.live_allocations().iter().any(|(live_base, size)| {
+                base + 2 >= *live_base && base + 2 - *live_base < *size
+            }),
+            "base {base:#x}; live {:?}",
+            mem.live_allocations()
+        );
+        assert_eq!(mem.corrupt_byte(base + 2, 100), None);
+        assert_eq!(mem.corrupt_byte(base + 16, 100), None);
+    }
+
+    #[test]
     fn cstr_at_utf8_lossy_keeps_non_utf8_paths_usable() {
         // Unity's shader cache opens paths whose name ends in uninitialised
         // bytes. POSIX paths are byte strings, so the helper must return a
@@ -1576,10 +1620,7 @@ mod mem_tests {
             .copy_from_slice(&[b'/', b'a', 0xA5, b'b', 0xAA, 0]);
 
         assert!(mem.cstr_at_utf8(p).is_err());
-        assert_eq!(
-            mem.cstr_at_utf8_lossy(p).as_ref(),
-            "/a\u{FFFD}b\u{FFFD}"
-        );
+        assert_eq!(mem.cstr_at_utf8_lossy(p).as_ref(), "/a\u{FFFD}b\u{FFFD}");
         // '/', 'a', U+FFFD, 'b', U+FFFD: each bad byte becomes one
         // replacement character, and the name stays stable across calls so
         // repeated opens of one cache entry still hit the same file.

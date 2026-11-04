@@ -164,6 +164,28 @@ pub enum RendererMode {
     NativeGles,
 }
 
+/// Parameters for the opt-in RTCV-style memory corruption engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CorruptionOptions {
+    pub enabled: bool,
+    pub interval_frames: u32,
+    pub bytes_per_burst: u32,
+    pub max_offset: Option<u32>,
+    pub seed: u64,
+}
+
+impl Default for CorruptionOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_frames: 30,
+            bytes_per_burst: 8,
+            max_offset: None,
+            seed: 0,
+        }
+    }
+}
+
 impl RendererMode {
     pub fn from_short_name(name: &str) -> Result<Self, ()> {
         match name {
@@ -229,6 +251,7 @@ pub struct Options {
     /// Allow selected early OpenGL ES 2.0 apps to use the GLES2 subset exposed
     /// through touchHLE's desktop OpenGL 2.1 compatibility backend.
     pub gles2_compat: bool,
+    pub corruption: CorruptionOptions,
     pub direct_memory_access: bool,
     /// CPU affinity policy for the emulator thread on Android
     /// (`--affinity=`): `None` = default (big cores), or one of
@@ -406,6 +429,7 @@ impl Default for Options {
             stabilize_virtual_cursor: None,
             gles1_implementation: None,
             gles2_compat: false,
+            corruption: CorruptionOptions::default(),
             direct_memory_access: true,
             affinity: None,
             gdb_listen_addrs: None,
@@ -668,6 +692,42 @@ impl Options {
             );
         } else if arg == "--gles2-compat" {
             self.gles2_compat = true;
+        } else if arg == "--corrupt-game" {
+            self.corruption.enabled = true;
+        } else if arg == "--no-corrupt-game" {
+            self.corruption.enabled = false;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-interval=") {
+            let frames: u32 = value
+                .parse()
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or_else(|| "Invalid value for --corrupt-interval= (must be > 0)".to_string())?;
+            self.corruption.enabled = true;
+            self.corruption.interval_frames = frames;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-intensity=") {
+            let bytes: u32 = value
+                .parse()
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or_else(|| {
+                    "Invalid value for --corrupt-intensity= (must be > 0)".to_string()
+                })?;
+            self.corruption.enabled = true;
+            self.corruption.bytes_per_burst = bytes;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-seed=") {
+            self.corruption.seed = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-seed=".to_string())?;
+            self.corruption.enabled = true;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-max-offset=") {
+            let max_offset: u32 = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-max-offset=".to_string())?;
+            if max_offset == 0 {
+                return Err("--corrupt-max-offset= must be > 0".to_string());
+            }
+            self.corruption.max_offset = Some(max_offset);
+            self.corruption.enabled = true;
         } else if let Some(value) = arg.strip_prefix("--affinity=") {
             self.affinity = Some(value.to_string());
         } else if arg == "--disable-direct-memory-access" {
@@ -717,17 +777,15 @@ impl Options {
             self.force_composition = false;
         } else if let Some(value) = arg.strip_prefix("--present-mode=") {
             self.present_mode = PresentMode::from_short_name(value).map_err(|_| {
-                "Invalid value for --present-mode= (expected auto, direct or readback)"
-                    .to_string()
+                "Invalid value for --present-mode= (expected auto, direct or readback)".to_string()
             })?;
         } else if arg == "--present-finish" {
             self.present_finish = true;
         } else if arg == "--no-present-finish" {
             self.present_finish = false;
         } else if let Some(value) = arg.strip_prefix("--vsync=") {
-            self.vsync = VsyncMode::from_short_name(value).map_err(|_| {
-                "Invalid value for --vsync= (expected auto, on or off)".to_string()
-            })?;
+            self.vsync = VsyncMode::from_short_name(value)
+                .map_err(|_| "Invalid value for --vsync= (expected auto, on or off)".to_string())?;
         } else if arg == "--vsync" {
             self.vsync = VsyncMode::On;
         } else if arg == "--no-vsync" {
@@ -742,11 +800,13 @@ impl Options {
             // layer reads this via the env var, so set it here.
             std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
         } else if let Some(value) = arg.strip_prefix("--present-rotate=") {
-            let deg: u32 = value
-                .parse()
-                .map_err(|_| "Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string())?;
+            let deg: u32 = value.parse().map_err(|_| {
+                "Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string()
+            })?;
             if !matches!(deg, 0 | 90 | 180 | 270) {
-                return Err("Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string());
+                return Err(
+                    "Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string(),
+                );
             }
             self.present_rotate = Some(deg);
         } else if arg == "--rotation-fix" {
@@ -870,6 +930,50 @@ pub fn get_options_from_file<F: Read>(file: F, app_id: &str) -> Result<Option<St
     Ok(None)
 }
 
+/// Finds the last corruption mode explicitly set by ordered app profiles.
+/// Profile contents must be supplied built-in first, then user options.
+pub(crate) fn profile_corruption_mode(profiles: &[&str]) -> Option<bool> {
+    profiles
+        .iter()
+        .flat_map(|profile| profile.split_ascii_whitespace())
+        .filter_map(|arg| match arg {
+            "--corrupt-game" => Some(true),
+            "--no-corrupt-game" => Some(false),
+            _ => None,
+        })
+        .last()
+}
+
+/// Picker mode is safe to emit only when both profiles loaded and neither
+/// profile explicitly selected a corruption mode.
+pub(crate) fn should_emit_picker_corruption_mode(
+    profile_mode: Option<bool>,
+    profile_load_failed: bool,
+) -> bool {
+    profile_mode.is_none() && !profile_load_failed
+}
+
+/// Resolves ordered app-profile results, preserving the last explicit mode.
+/// A failed profile is reported separately so callers can suppress UI defaults.
+pub(crate) fn profile_corruption_mode_from_results<E>(
+    profiles: impl IntoIterator<Item = Result<Option<String>, E>>,
+) -> (Option<bool>, bool) {
+    let mut mode = None;
+    let mut failed = false;
+    for profile in profiles {
+        match profile {
+            Ok(Some(options)) => {
+                if let Some(profile_mode) = profile_corruption_mode(&[&options]) {
+                    mode = Some(profile_mode);
+                }
+            }
+            Ok(None) => (),
+            Err(_) => failed = true,
+        }
+    }
+    (mode, failed)
+}
+
 #[derive(Default, Clone)]
 pub struct DumpingOptions {
     pub linking_info: bool,
@@ -902,6 +1006,132 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
 #[cfg(test)]
 mod option_parsing_tests {
     use super::*;
+
+    #[test]
+    fn app_profile_corruption_mode_uses_exact_tokens_and_last_profile_wins() {
+        assert_eq!(
+            profile_corruption_mode(&[
+                "--device-family=iphone-4 --corrupt-game-extra",
+                "--landscape-left --no-corrupt-game",
+            ]),
+            Some(false)
+        );
+        assert_eq!(
+            profile_corruption_mode(&["--corrupt-game", "--corrupt-game"]),
+            Some(true)
+        );
+        assert_eq!(
+            profile_corruption_mode(&["--corrupt-game --no-corrupt-game"]),
+            Some(false)
+        );
+        assert_eq!(profile_corruption_mode(&["--device-family=auto"]), None);
+        assert_eq!(
+            profile_corruption_mode(&["--device-family=iphone-4 --no-corrupt-game"]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn failed_profile_read_suppresses_picker_mode() {
+        assert!(!should_emit_picker_corruption_mode(None, true));
+        assert!(should_emit_picker_corruption_mode(None, false));
+        assert!(!should_emit_picker_corruption_mode(Some(true), false));
+        assert!(!should_emit_picker_corruption_mode(Some(false), true));
+    }
+
+    #[test]
+    fn app_profile_mode_uses_the_same_parser_as_runtime_loading() {
+        let built_in = "com.example.game: --device-family=iphone-4 --corrupt-game\n";
+        let user = "com.example.game: --no-corrupt-game\n";
+        assert_eq!(
+            profile_corruption_mode_from_results([
+                get_options_from_file(built_in.as_bytes(), "com.example.game"),
+                get_options_from_file(user.as_bytes(), "com.example.game"),
+            ]),
+            (Some(false), false)
+        );
+    }
+
+    #[test]
+    fn malformed_profile_suppresses_generated_corruption_mode() {
+        let built_in = "this line has no separator\n";
+        let user = "com.example.game: --corrupt-game\n";
+        let (mode, failed) = profile_corruption_mode_from_results([
+            get_options_from_file(built_in.as_bytes(), "com.example.game"),
+            get_options_from_file(user.as_bytes(), "com.example.game"),
+        ]);
+        assert_eq!(mode, Some(true));
+        assert!(failed);
+        assert!(!should_emit_picker_corruption_mode(mode, failed));
+    }
+
+    #[test]
+    fn profile_open_failure_is_reported_as_failed() {
+        let (mode, failed) = profile_corruption_mode_from_results([
+            Ok(Some("--corrupt-game".to_string())),
+            Err("unreadable"),
+        ]);
+        assert_eq!(mode, Some(true));
+        assert!(failed);
+        assert!(!should_emit_picker_corruption_mode(mode, failed));
+    }
+
+    #[test]
+    fn corruption_is_disabled_by_default_and_explicit_flag_wins() {
+        let mut options = Options::default();
+        assert!(!options.corruption.enabled);
+        assert_eq!(options.corruption.seed, 0);
+
+        assert!(options.parse_argument("--corrupt-game").unwrap());
+        assert!(options.corruption.enabled);
+
+        assert!(options.parse_argument("--no-corrupt-game").unwrap());
+        assert!(!options.corruption.enabled);
+
+        assert!(options.parse_argument("--corrupt-game").unwrap());
+        assert!(options.corruption.enabled);
+    }
+
+    #[test]
+    fn corruption_tuning_options_enable_and_validate() {
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-interval=7").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.interval_frames, 7);
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-intensity=12").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.bytes_per_burst, 12);
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-seed=42").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.seed, 42);
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-max-offset=16").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.max_offset, Some(16));
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-interval=0").is_err());
+        assert!(options.parse_argument("--corrupt-intensity=0").is_err());
+        assert!(options.parse_argument("--corrupt-seed=nope").is_err());
+        assert!(options.parse_argument("--corrupt-max-offset=nope").is_err());
+        assert!(options.parse_argument("--corrupt-max-offset=0").is_err());
+    }
+
+    #[test]
+    fn corruption_tuning_flags_can_be_disabled_by_later_explicit_flag() {
+        let mut options = Options::default();
+        options.parse_argument("--corrupt-intensity=5").unwrap();
+        options.parse_argument("--no-corrupt-game").unwrap();
+        assert!(!options.corruption.enabled);
+
+        options.parse_argument("--corrupt-game").unwrap();
+        assert!(options.corruption.enabled);
+    }
 
     #[test]
     fn force_composition_can_be_enabled_and_disabled() {
@@ -981,9 +1211,13 @@ mod option_parsing_tests {
     fn local_game_center_sign_in_is_opt_in_and_can_be_disabled() {
         let mut options = Options::default();
         assert!(!options.game_center_authenticated);
-        assert!(options.parse_argument("--game-center-authenticated").unwrap());
+        assert!(options
+            .parse_argument("--game-center-authenticated")
+            .unwrap());
         assert!(options.game_center_authenticated);
-        assert!(options.parse_argument("--no-game-center-authenticated").unwrap());
+        assert!(options
+            .parse_argument("--no-game-center-authenticated")
+            .unwrap());
         assert!(!options.game_center_authenticated);
     }
 
@@ -1013,16 +1247,27 @@ mod option_parsing_tests {
             PerformanceOverlayMode::TitleBar
         };
         assert_eq!(options.performance_overlay_mode, default_mode);
-        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::TopRight);
+        assert_eq!(
+            options.performance_overlay_corner,
+            PerformanceOverlayCorner::TopRight
+        );
 
         assert!(options.parse_argument("--overlay=off").unwrap());
         assert!(!options.performance_overlay_enabled);
         assert!(options.parse_argument("--overlay=on").unwrap());
         assert!(options.performance_overlay_enabled);
         assert!(options.parse_argument("--overlay-mode=full").unwrap());
-        assert_eq!(options.performance_overlay_mode, PerformanceOverlayMode::Full);
-        assert!(options.parse_argument("--overlay-corner=bottomleft").unwrap());
-        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::BottomLeft);
+        assert_eq!(
+            options.performance_overlay_mode,
+            PerformanceOverlayMode::Full
+        );
+        assert!(options
+            .parse_argument("--overlay-corner=bottomleft")
+            .unwrap());
+        assert_eq!(
+            options.performance_overlay_corner,
+            PerformanceOverlayCorner::BottomLeft
+        );
         assert!(options.parse_argument("--overlay-mode=invalid").is_err());
         assert!(options.parse_argument("--overlay-corner=invalid").is_err());
     }

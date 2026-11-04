@@ -26,24 +26,26 @@
 
 #[macro_use]
 mod log;
-mod env_flags;
-mod fastmap;
 mod abi;
 mod android_jni;
 mod android_media;
 mod android_web_view;
 mod audio;
 mod bundle;
+mod corrupt;
 mod cpu;
 mod crash_handler;
 mod debug;
 mod dyld;
+mod env_flags;
 mod environment;
+mod fastmap;
 pub mod font;
 mod frameworks;
 mod fs;
 mod gdb;
 mod gles;
+mod guest_clock;
 mod image;
 mod libc;
 mod mach_o;
@@ -54,7 +56,6 @@ mod options;
 mod paths;
 mod perf_hints;
 mod stack;
-mod guest_clock;
 mod trainer;
 mod trainer_ui;
 mod window;
@@ -69,9 +70,9 @@ use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAU
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "ios")]
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ALLOCATION_METER_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -304,7 +305,11 @@ fn run_session<T: Iterator<Item = String>>(
         // openal-soft's wave backend only reads its output path from the
         // config key `wave/file`; it does not honour an env override, so
         // generate a minimal config file and point ALSOFT_CONF at it.
-        std::fs::write(&conf, format!("[wave]\nfile = {}\n", path.to_string_lossy())).ok();
+        std::fs::write(
+            &conf,
+            format!("[wave]\nfile = {}\n", path.to_string_lossy()),
+        )
+        .ok();
         // SAFETY: runs before any thread spawn or OpenAL call in this process.
         unsafe {
             std::env::set_var("ALSOFT_DRIVERS", "wave");

@@ -259,9 +259,9 @@ Graphics driver options:
         --renderer-mode=angle respectively.
 
     --gles2-compat
-        Enables touchHLE's experimental OpenGL ES 2.0 subset using the desktop
-        OpenGL 2.1 compatibility backend. This is an app-specific option and
-        is not a complete implementation of OpenGL ES 2.0.
+        Force the desktop OpenGL 2.1 compatibility backend for guest OpenGL ES
+        2.0 contexts. This backend is an experimental, incomplete GLES2 subset;
+        context creation fails if it is unavailable.
 
     --gles1=...
         Force touchHLE to use a particular OpenGL ES 1.1 implementation.
@@ -450,6 +450,33 @@ Other options:
     --prefer-gles2-context
         Force EAGL initWithAPI: to create an OpenGL ES 2.0 context even when
         the app requested an OpenGL ES 1.1 context.
+
+    --gles2-compat
+        Force the legacy desktop OpenGL 2.1 compatibility backend for guest
+        OpenGL ES 2.0 contexts. Context creation fails if it is unavailable.
+
+    --corrupt-game
+        Enable deterministic RTCV-style corruption of live guest heap bytes.
+        Reserved stack and null-page memory are excluded. Disabled by default.
+        Use --no-corrupt-game to turn it off.
+
+    --no-corrupt-game
+        Disable the RTCV-style game corruption engine.
+
+    --corrupt-interval=<frames>
+        Frames between corruption bursts (default: 30). Must be greater than
+        zero. Implies --corrupt-game.
+
+    --corrupt-intensity=<count>
+        Bytes corrupted per burst (default: 8). Must be greater than zero.
+        Implies --corrupt-game.
+
+    --corrupt-seed=<number>
+        Seed for the deterministic corruption stream. Implies --corrupt-game.
+
+    --corrupt-max-offset=<bytes>
+        Limit corruption to the first <bytes> of each allocation. Implies
+        --corrupt-game.
 
         Some apps (e.g. Lego Ninjago Spinjitzu Scavenger Hunt) ask EAGL for an
         ES 1.1 context but actually drive rendering with shader entry points
