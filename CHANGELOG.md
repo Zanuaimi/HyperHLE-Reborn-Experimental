@@ -274,6 +274,8 @@ Usability:
 
 - Quick Options now has a “May fix graphics issues.” switch for `--force-composition`, including an explicit off state that overrides app-specific defaults. Switches are aligned beside their labels, and the scale-hack button text no longer gets clipped. (@j92580498-max)
 
+- The app picker's Settings > Graphics now has “Rotation fix” and “Movie player fix” switches for `--rotation-fix` and `--fix-movie-player`, so those compatibility fixes no longer have to be added to `touchHLE_options.txt` by hand (the bundled file now points at the switches too). Leaving a switch alone keeps the app-specific defaults (including the GTA III ones); turning it on or off passes an explicit flag that overrides them. The diagnostic “Trace GL errors” switch is gone, so `--trace-gl-errors` from an options file is no longer overridden by the picker.
+
 Other:
 
 - The macOS Intel (x86_64) build is now opt-in in the release workflow. Intel Macs are rare and `macos-15-intel` is both the slowest and the scarcest GitHub-hosted runner, so that leg alone decided how long a full build took. A run now builds it only when the new “Build the macOS Intel (x86_64) DMG too” box is ticked, which means **a release published without ticking it ships no `HyperHLE_macOS_x86_64.zip`**; the publish job says so in a warning. The Apple Silicon build, the tests and every other platform are unaffected, and the tests still run on the Intel runner because that is the only one that can run the x86_64 TestApp.
