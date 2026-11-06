@@ -463,9 +463,13 @@ Other options:
     --no-corrupt-game
         Disable the RTCV-style game corruption engine.
 
-    --corrupt-interval=<frames>
-        Frames between corruption bursts (default: 30). Must be greater than
-        zero. Implies --corrupt-game.
+    --corrupt-start-delay=<seconds>
+        Active emulation time to wait after the app first runs before
+        corruption can start (default: 0). Must be finite and >= 0.
+
+    --corrupt-cooldown=<seconds>
+        Minimum active emulation time between corruption bursts (default:
+        0.5). Must be finite and >= 0. Does not enable --corrupt-game.
 
     --corrupt-intensity=<count>
         Bytes corrupted per burst (default: 8). Must be greater than zero.

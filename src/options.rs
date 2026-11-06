@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub const OPTIONS_HELP: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/OPTIONS_HELP.txt"));
@@ -168,7 +169,8 @@ pub enum RendererMode {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CorruptionOptions {
     pub enabled: bool,
-    pub interval_frames: u32,
+    pub startup_delay: Duration,
+    pub cooldown: Duration,
     pub bytes_per_burst: u32,
     pub max_offset: Option<u32>,
     pub seed: u64,
@@ -178,7 +180,8 @@ impl Default for CorruptionOptions {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval_frames: 30,
+            startup_delay: Duration::ZERO,
+            cooldown: Duration::from_millis(500),
             bytes_per_burst: 8,
             max_offset: None,
             seed: 0,
@@ -696,14 +699,11 @@ impl Options {
             self.corruption.enabled = true;
         } else if arg == "--no-corrupt-game" {
             self.corruption.enabled = false;
-        } else if let Some(value) = arg.strip_prefix("--corrupt-interval=") {
-            let frames: u32 = value
-                .parse()
-                .ok()
-                .filter(|&value| value > 0)
-                .ok_or_else(|| "Invalid value for --corrupt-interval= (must be > 0)".to_string())?;
-            self.corruption.enabled = true;
-            self.corruption.interval_frames = frames;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-start-delay=") {
+            self.corruption.startup_delay =
+                parse_corruption_duration(value, "--corrupt-start-delay=")?;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-cooldown=") {
+            self.corruption.cooldown = parse_corruption_duration(value, "--corrupt-cooldown=")?;
         } else if let Some(value) = arg.strip_prefix("--corrupt-intensity=") {
             let bytes: u32 = value
                 .parse()
@@ -944,6 +944,25 @@ pub(crate) fn profile_corruption_mode(profiles: &[&str]) -> Option<bool> {
         .last()
 }
 
+/// Whether an app profile contains any option that changes corruption behavior.
+pub(crate) fn profile_has_corruption_settings(profiles: &[&str]) -> bool {
+    profiles
+        .iter()
+        .flat_map(|profile| profile.split_ascii_whitespace())
+        .any(|arg| {
+            matches!(
+                arg.split_once('=').map_or(arg, |(name, _)| name),
+                "--corrupt-game"
+                    | "--no-corrupt-game"
+                    | "--corrupt-start-delay"
+                    | "--corrupt-cooldown"
+                    | "--corrupt-intensity"
+                    | "--corrupt-seed"
+                    | "--corrupt-max-offset"
+            )
+        })
+}
+
 /// Picker mode is safe to emit only when both profiles loaded and neither
 /// profile explicitly selected a corruption mode.
 pub(crate) fn should_emit_picker_corruption_mode(
@@ -974,6 +993,29 @@ pub(crate) fn profile_corruption_mode_from_results<E>(
     (mode, failed)
 }
 
+/// Resolves explicit corruption settings in profile order and reports whether
+/// any profile set them. Profile contents must be supplied built-in first.
+pub(crate) fn profile_corruption_settings_from_results<E>(
+    profiles: impl IntoIterator<Item = Result<Option<String>, E>>,
+) -> (Option<bool>, bool, bool) {
+    let mut mode = None;
+    let mut has_settings = false;
+    let mut failed = false;
+    for profile in profiles {
+        match profile {
+            Ok(Some(options)) => {
+                if let Some(profile_mode) = profile_corruption_mode(&[&options]) {
+                    mode = Some(profile_mode);
+                }
+                has_settings |= profile_has_corruption_settings(&[&options]);
+            }
+            Ok(None) => (),
+            Err(_) => failed = true,
+        }
+    }
+    (mode, has_settings, failed)
+}
+
 #[derive(Default, Clone)]
 pub struct DumpingOptions {
     pub linking_info: bool,
@@ -1001,6 +1043,16 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
         }
     }
     Ok(dumping_options)
+}
+
+fn parse_corruption_duration(value: &str, option: &str) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<f64>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .ok_or_else(|| format!("Invalid value for {option} (must be finite and >= 0)"))?;
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| format!("Invalid value for {option} (duration is too large)"))
 }
 
 #[cfg(test)]
@@ -1095,9 +1147,9 @@ mod option_parsing_tests {
     #[test]
     fn corruption_tuning_options_enable_and_validate() {
         let mut options = Options::default();
-        assert!(options.parse_argument("--corrupt-interval=7").unwrap());
+        assert!(options.parse_argument("--corrupt-intensity=8").unwrap());
         assert!(options.corruption.enabled);
-        assert_eq!(options.corruption.interval_frames, 7);
+        assert_eq!(options.corruption.bytes_per_burst, 8);
 
         let mut options = Options::default();
         assert!(options.parse_argument("--corrupt-intensity=12").unwrap());
@@ -1115,7 +1167,6 @@ mod option_parsing_tests {
         assert_eq!(options.corruption.max_offset, Some(16));
 
         let mut options = Options::default();
-        assert!(options.parse_argument("--corrupt-interval=0").is_err());
         assert!(options.parse_argument("--corrupt-intensity=0").is_err());
         assert!(options.parse_argument("--corrupt-seed=nope").is_err());
         assert!(options.parse_argument("--corrupt-max-offset=nope").is_err());

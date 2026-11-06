@@ -96,28 +96,27 @@ fn inspect_profile_corruption_options(
     built_in: &mut (impl Read + std::io::Seek),
     user: &mut (impl Read + std::io::Seek),
     app_id: &str,
-) -> (Option<bool>, bool) {
+) -> (Option<bool>, bool, bool) {
     let built_in = crate::options::get_options_from_file(built_in, app_id);
     let user = crate::options::get_options_from_file(user, app_id);
-    let (mode, failed) = crate::options::profile_corruption_mode_from_results([built_in, user]);
-    (mode, failed)
+    crate::options::profile_corruption_settings_from_results([built_in, user])
 }
 
 fn profile_corruption_mode_for_app_id(
     app_id: &str,
     built_in: Result<Option<String>, String>,
     user: Result<Option<String>, String>,
-) -> (Option<bool>, bool) {
+) -> (Option<bool>, bool, bool) {
     if app_id.is_empty() {
-        return (None, true);
+        return (None, false, true);
     }
-    crate::options::profile_corruption_mode_from_results([built_in, user])
+    crate::options::profile_corruption_settings_from_results([built_in, user])
 }
 
-fn inspect_app_profile_corruption_options(app_id: &str) -> (Option<bool>, bool) {
+fn inspect_app_profile_corruption_options(app_id: &str) -> (Option<bool>, bool, bool) {
     if app_id.is_empty() {
         log!("Warning: Couldn't inspect app corruption settings without a bundle identifier");
-        return (None, true);
+        return (None, false, true);
     }
     let built_in_path = paths::default_options_file();
     let built_in = paths::ResourceFile::open(&built_in_path)
@@ -446,6 +445,8 @@ struct AppPickerDelegateHostObject {
     fix_movie_player: Option<bool>,
     corruption_mode: Option<CorruptionMode>,
     corruption_mode_changed: bool,
+    corruption_startup_delay: Option<StartupDelayPreset>,
+    corruption_cooldown: Option<CooldownPreset>,
     preserve_aspect_ratio: Option<bool>,
     show_lock_screen: Option<bool>,
     force_composition: Option<bool>,
@@ -493,6 +494,8 @@ struct PickerSettings {
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
     corruption_mode: CorruptionMode,
+    corruption_startup_delay: StartupDelayPreset,
+    corruption_cooldown: CooldownPreset,
     gles2_mode: Gles2Mode,
     cheat_engine: bool,
     network: bool,
@@ -548,15 +551,105 @@ impl Gles2Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CorruptionMode {
     Off,
-    NoCorrupt,
     Corrupt,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StartupDelayPreset {
+    #[default]
+    Immediate,
+    FiveSeconds,
+    FifteenSeconds,
+    ThirtySeconds,
+}
+
+impl StartupDelayPreset {
+    const ALL: [Self; 4] = [
+        Self::Immediate,
+        Self::FiveSeconds,
+        Self::FifteenSeconds,
+        Self::ThirtySeconds,
+    ];
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Immediate => "0",
+            Self::FiveSeconds => "5",
+            Self::FifteenSeconds => "15",
+            Self::ThirtySeconds => "30",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.short_name() == value)
+    }
+
+    fn selected_index(self) -> usize {
+        Self::ALL.iter().position(|preset| *preset == self).unwrap()
+    }
+
+    fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Self::Immediate => 0,
+            Self::FiveSeconds => 5,
+            Self::FifteenSeconds => 15,
+            Self::ThirtySeconds => 30,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CooldownPreset {
+    #[default]
+    HalfSecond,
+    OneSecond,
+    FiveSeconds,
+    TenSeconds,
+}
+
+impl CooldownPreset {
+    const ALL: [Self; 4] = [
+        Self::HalfSecond,
+        Self::OneSecond,
+        Self::FiveSeconds,
+        Self::TenSeconds,
+    ];
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::HalfSecond => "0.5",
+            Self::OneSecond => "1",
+            Self::FiveSeconds => "5",
+            Self::TenSeconds => "10",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.short_name() == value)
+    }
+
+    fn selected_index(self) -> usize {
+        Self::ALL.iter().position(|preset| *preset == self).unwrap()
+    }
+
+    fn duration(self) -> std::time::Duration {
+        match self {
+            Self::HalfSecond => std::time::Duration::from_millis(500),
+            Self::OneSecond => std::time::Duration::from_secs(1),
+            Self::FiveSeconds => std::time::Duration::from_secs(5),
+            Self::TenSeconds => std::time::Duration::from_secs(10),
+        }
+    }
 }
 
 impl CorruptionMode {
     fn short_name(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::NoCorrupt => "no-corrupt",
             Self::Corrupt => "corrupt",
         }
     }
@@ -564,7 +657,6 @@ impl CorruptionMode {
     fn from_short_name(value: &str) -> Option<Self> {
         match value {
             "off" => Some(Self::Off),
-            "no-corrupt" => Some(Self::NoCorrupt),
             "corrupt" => Some(Self::Corrupt),
             _ => None,
         }
@@ -573,7 +665,6 @@ impl CorruptionMode {
     fn option(self) -> Option<bool> {
         match self {
             Self::Off => None,
-            Self::NoCorrupt => Some(false),
             Self::Corrupt => Some(true),
         }
     }
@@ -581,8 +672,7 @@ impl CorruptionMode {
     fn selected_index(self) -> i32 {
         match self {
             Self::Off => 0,
-            Self::NoCorrupt => 1,
-            Self::Corrupt => 2,
+            Self::Corrupt => 1,
         }
     }
 }
@@ -633,6 +723,8 @@ impl PickerSettings {
             rotation_fix: options.rotation_fix.then_some(true),
             fix_movie_player: options.fix_movie_player.then_some(true),
             corruption_mode: CorruptionMode::Off,
+            corruption_startup_delay: StartupDelayPreset::default(),
+            corruption_cooldown: CooldownPreset::default(),
             gles2_mode: Gles2Mode::Off,
             cheat_engine: quick_options_trainer_enabled(options),
             network: options.network_access,
@@ -691,6 +783,16 @@ impl PickerSettings {
                         settings.corruption_mode = mode;
                     }
                 }
+                "corruption_startup_delay" => {
+                    if let Some(preset) = StartupDelayPreset::from_short_name(value) {
+                        settings.corruption_startup_delay = preset;
+                    }
+                }
+                "corruption_cooldown" => {
+                    if let Some(preset) = CooldownPreset::from_short_name(value) {
+                        settings.corruption_cooldown = preset;
+                    }
+                }
                 "gles2_mode" => {
                     if let Some(mode) = Gles2Mode::from_short_name(value) {
                         settings.gles2_mode = mode;
@@ -739,6 +841,8 @@ impl PickerSettings {
              rotation_fix={}\n\
              fix_movie_player={}\n\
              corruption_mode={}\n\
+             corruption_startup_delay={}\n\
+             corruption_cooldown={}\n\
              gles2_mode={}\n\
              cheat_engine={}\n\
              network={}\n\
@@ -759,6 +863,8 @@ impl PickerSettings {
             optional_bool(self.rotation_fix),
             optional_bool(self.fix_movie_player),
             self.corruption_mode.short_name(),
+            self.corruption_startup_delay.short_name(),
+            self.corruption_cooldown.short_name(),
             self.gles2_mode.short_name(),
             self.cheat_engine,
             self.network,
@@ -939,13 +1045,33 @@ const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::Off);
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
 }
-- (())corruptionNo {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::NoCorrupt);
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
-}
 - (())corruptionOn {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::Corrupt);
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
+}
+- (())corruptionStartupImmediate {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::Immediate);
+}
+- (())corruptionStartup5 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::FiveSeconds);
+}
+- (())corruptionStartup15 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::FifteenSeconds);
+}
+- (())corruptionStartup30 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::ThirtySeconds);
+}
+- (())corruptionCooldownHalf {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::HalfSecond);
+}
+- (())corruptionCooldown1 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::OneSecond);
+}
+- (())corruptionCooldown5 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::FiveSeconds);
+}
+- (())corruptionCooldown10 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::TenSeconds);
 }
 - (())gles2Off {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles2_mode = Some(Gles2Mode::Off);
@@ -1391,7 +1517,6 @@ fn app_picker_inner(
     let mut quick_options_rotation_fix = picker_settings.rotation_fix;
     let mut quick_options_fix_movie_player = picker_settings.fix_movie_player;
     let mut quick_options_corruption_mode = picker_settings.corruption_mode;
-    let mut quick_options_corruption_mode_changed = false;
     let mut quick_options_gles2_mode = picker_settings.gles2_mode;
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
     let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
@@ -1429,6 +1554,16 @@ fn app_picker_inner(
         env,
         &settings.corruption_mode_buttons,
         quick_options_corruption_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_startup_delay_buttons,
+        picker_settings.corruption_startup_delay.selected_index(),
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_cooldown_buttons,
+        picker_settings.corruption_cooldown.selected_index(),
     );
     update_segment_buttons(
         env,
@@ -2008,13 +2143,34 @@ fn app_picker_inner(
             quick_options_fix_movie_player = Some(fix_movie_player);
         } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
             quick_options_corruption_mode = host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
-            quick_options_corruption_mode_changed = true;
             update_segment_buttons(
                 env,
                 &settings.corruption_mode_buttons,
                 quick_options_corruption_mode.selected_index() as usize,
             );
             picker_settings.corruption_mode = quick_options_corruption_mode;
+            if picker_settings != last_saved_picker_settings {
+                picker_settings.save();
+                last_saved_picker_settings = picker_settings.clone();
+            }
+        } else if let Some(preset) = std::mem::take(&mut host_obj.corruption_startup_delay) {
+            picker_settings.corruption_startup_delay = preset;
+            update_segment_buttons(
+                env,
+                &settings.corruption_startup_delay_buttons,
+                preset.selected_index(),
+            );
+            if picker_settings != last_saved_picker_settings {
+                picker_settings.save();
+                last_saved_picker_settings = picker_settings.clone();
+            }
+        } else if let Some(preset) = std::mem::take(&mut host_obj.corruption_cooldown) {
+            picker_settings.corruption_cooldown = preset;
+            update_segment_buttons(
+                env,
+                &settings.corruption_cooldown_buttons,
+                preset.selected_index(),
+            );
             if picker_settings != last_saved_picker_settings {
                 picker_settings.save();
                 last_saved_picker_settings = picker_settings.clone();
@@ -2127,13 +2283,7 @@ fn app_picker_inner(
         }
     };
 
-    let (profile_corruption_mode, profile_load_failed) =
-        inspect_app_profile_corruption_options(&app_id);
-    let emit_picker_corruption_mode = crate::options::should_emit_picker_corruption_mode(
-        profile_corruption_mode,
-        profile_load_failed,
-    );
-
+    let profile_corruption_settings = inspect_app_profile_corruption_options(&app_id);
     // Apply user-specified overrides
     if let Some(scale_hack) = quick_options_scale_hack {
         option_args.push(format!("--scale-hack={}", scale_hack.get()));
@@ -2233,8 +2383,9 @@ fn app_picker_inner(
 
     option_args.extend(quick_options_corruption_arguments(
         quick_options_corruption_mode,
-        profile_corruption_mode,
-        profile_load_failed,
+        picker_settings.corruption_startup_delay,
+        picker_settings.corruption_cooldown,
+        profile_corruption_settings,
     ));
     option_args.extend(quick_options_gles2_mode.arguments());
 
@@ -3464,6 +3615,40 @@ fn new_label(
     label
 }
 
+fn new_setting_description_label(
+    env: &mut Environment,
+    frame: CGRect,
+    text: &str,
+    text_color: id,
+) -> id {
+    let label = new_label(
+        env,
+        frame,
+        text,
+        SETTINGS_DESCRIPTION_FONT_SIZE,
+        false,
+        text_color,
+    );
+    () = msg![env; label setTextAlignment:UITextAlignmentLeft];
+    () = msg![env; label setLineBreakMode:UILineBreakModeWordWrap];
+    () = msg![env; label setNumberOfLines:0];
+    label
+}
+
+fn new_setting_title_label(
+    env: &mut Environment,
+    frame: CGRect,
+    text: &str,
+    font_size: CGFloat,
+    text_color: id,
+) -> id {
+    let label = new_label(env, frame, text, font_size, false, text_color);
+    () = msg![env; label setTextAlignment:UITextAlignmentLeft];
+    () = msg![env; label setLineBreakMode:UILineBreakModeWordWrap];
+    () = msg![env; label setNumberOfLines:0];
+    label
+}
+
 fn set_view_x(env: &mut Environment, view: id, x: CGFloat) {
     let mut frame: CGRect = msg![env; view frame];
     frame.origin.x = x;
@@ -4085,6 +4270,9 @@ fn make_segment_buttons(
         let label: id = msg![env; button titleLabel];
         let font: id = msg_class![env; UIFont systemFontOfSize:(13.0 as CGFloat)];
         () = msg![env; label setFont:font];
+        () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+        () = msg![env; label setLineBreakMode:UILineBreakModeWordWrap];
+        () = msg![env; label setNumberOfLines:2];
         let layer: id = msg![env; button layer];
         () = msg![env; layer setCornerRadius:(5.0 as CGFloat)];
         let selector = env.objc.lookup_selector(selector).unwrap();
@@ -4100,37 +4288,90 @@ fn make_segment_buttons(
 /// One row of the settings screen.
 #[derive(Clone, Copy)]
 enum SettingsRow {
-    /// A label with a row of segment buttons below it.
-    Segmented(&'static str, &'static [(&'static str, &'static str)]),
+    /// A title, description, and row of segment buttons.
+    Segmented(
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    ),
     /// The "Device model" row (its dropdown is a root-level overlay).
-    DeviceDropdown,
+    DeviceDropdown(&'static str, &'static str),
     /// The "Language" row (its dropdown is a root-level overlay).
-    LanguageDropdown,
-    /// Label and switch: (label, selector, initial state, enabled).
-    Toggle(&'static str, &'static str, bool, bool),
+    LanguageDropdown(&'static str, &'static str),
+    /// Title and description with switch: selector, initial state, enabled.
+    Toggle(&'static str, &'static str, &'static str, bool, bool),
     /// Renderer mode dropdown.
-    RendererDropdown,
+    RendererDropdown(&'static str, &'static str),
 }
 
 const SETTINGS_NAV_BAR_HEIGHT: CGFloat = 44.0;
 const SETTINGS_TOP_PADDING: CGFloat = 12.0;
 const SETTINGS_GROUP_INSET: CGFloat = 16.0;
 const SETTINGS_ROW_SIDE_INSET: CGFloat = 16.0;
-const SETTINGS_ROW_HEIGHT: CGFloat = 44.0;
-const SETTINGS_SEGMENT_ROW_HEIGHT: CGFloat = 58.0;
-const FORCE_COMPOSITION_LABEL: &str =
-    "Enable Force Composition\n(May fix graphics rendering issues)";
-const FORCE_COMPOSITION_ROW_HEIGHT: CGFloat = 64.0;
+const SETTINGS_DESCRIPTION_FONT_SIZE: CGFloat = 11.0;
 const SETTINGS_HEADER_HEIGHT: CGFloat = 28.0;
 const SETTINGS_SECTION_GAP: CGFloat = 10.0;
 /// Width of the dropdown lists (list plus scrollbar).
 const SETTINGS_DROPDOWN_MENU_WIDTH: CGFloat = 280.0;
 
-fn settings_row_height(row: &SettingsRow) -> CGFloat {
-    match row {
-        SettingsRow::Segmented(..) => SETTINGS_SEGMENT_ROW_HEIGHT,
-        SettingsRow::Toggle(FORCE_COMPOSITION_LABEL, ..) => FORCE_COMPOSITION_ROW_HEIGHT,
-        _ => SETTINGS_ROW_HEIGHT,
+fn settings_text_height(
+    env: &mut Environment,
+    text: &'static str,
+    font_size: CGFloat,
+    width: CGFloat,
+) -> CGFloat {
+    let string = ns_string::get_static_str(env, text);
+    let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
+    let size: CGSize = msg![env; string sizeWithFont:font
+                                      constrainedToSize:(CGSize { width, height: CGFloat::MAX })
+                                          lineBreakMode:UILineBreakModeWordWrap];
+    size.height
+}
+
+fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CGFloat) -> CGFloat {
+    let side = SETTINGS_ROW_SIDE_INSET;
+    match *row {
+        SettingsRow::Segmented(title, description, _) => {
+            let text_width = inner_width - 2.0 * side;
+            8.0 + settings_text_height(env, title, 15.0, text_width)
+                + 4.0
+                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + 8.0
+                + 24.0
+                + 8.0
+        }
+        SettingsRow::Toggle(title, description, _, _, _) => {
+            let text_width = inner_width - 2.0 * side - 94.0 - 8.0;
+            (settings_text_height(env, title, 16.0, text_width)
+                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + 12.0)
+                .max(27.0)
+                + 16.0
+        }
+        SettingsRow::DeviceDropdown(title, description) => {
+            let text_width = inner_width - 2.0 * side - 190.0 - 8.0;
+            (settings_text_height(env, title, 14.0, text_width)
+                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + 12.0)
+                .max(30.0)
+                + 16.0
+        }
+        SettingsRow::LanguageDropdown(title, description) => {
+            let text_width = inner_width - 2.0 * side - 170.0 - 8.0;
+            (settings_text_height(env, title, 16.0, text_width)
+                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + 12.0)
+                .max(30.0)
+                + 16.0
+        }
+        SettingsRow::RendererDropdown(title, description) => {
+            let text_width = inner_width - 2.0 * side - 130.0 - 8.0;
+            (settings_text_height(env, title, 14.0, text_width)
+                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + 12.0)
+                .max(30.0)
+                + 16.0
+        }
     }
 }
 
@@ -4154,6 +4395,8 @@ struct SettingsStuff {
     overlay_mode_buttons: Vec<id>,
     overlay_corner_buttons: Vec<id>,
     corruption_mode_buttons: Vec<id>,
+    corruption_startup_delay_buttons: Vec<id>,
+    corruption_cooldown_buttons: Vec<id>,
     gles2_mode_buttons: Vec<id>,
     /// The "Device model" dropdown.
     device_dropdown: SettingsDropdown,
@@ -4396,6 +4639,7 @@ fn setup_settings(
     let mut display_rows = vec![
         SettingsRow::Segmented(
             "Scale hack",
+            "Renders the game at a larger internal size before scaling it to your screen. This can make edges look sharper, but may slow the game or cause graphics problems.",
             &[
                 ("Default", "scaleHackDefault"),
                 ("Off", "scaleHack1"),
@@ -4406,6 +4650,7 @@ fn setup_settings(
         ),
         SettingsRow::Segmented(
             "Orientation",
+            "Choose how the game screen is turned. Default lets the game choose; the arrows force a direction if the game starts sideways.",
             &[
                 ("Default", "orientationDefault"),
                 ("←", "orientationLandscapeLeft"),
@@ -4417,6 +4662,7 @@ fn setup_settings(
     if show_fullscreen_row {
         display_rows.push(SettingsRow::Toggle(
             "Fullscreen (override)",
+            "Choose whether the game fills the screen. This overrides the app’s saved setting.",
             "fullscreen:",
             picker_settings.fullscreen,
             true,
@@ -4437,17 +4683,13 @@ fn setup_settings(
             ]
         };
     let mut graphics_rows = vec![
-        SettingsRow::RendererDropdown,
-        SettingsRow::Segmented(
-            "Corruption engine",
-            &[
-                ("Off", "corruptionOff"),
-                ("No", "corruptionNo"),
-                ("On", "corruptionOn"),
-            ],
+        SettingsRow::RendererDropdown(
+            "Renderer Mode",
+            "Android only. ANGLE translates the game’s graphics calls; Native GLES uses your device’s graphics driver. If one has problems, try the other.",
         ),
         SettingsRow::Segmented(
             "GLES2 compatibility",
+            "Changes how ES 1.1/2.0 graphics are handled. Prefer Context upgrades an app’s ES 1.1 request to ES 2.0; GL2.1 uses an older, incomplete compatibility backend. Either choice can break games.",
             &[
                 ("Off", "gles2Off"),
                 ("Prefer context", "gles2Prefer"),
@@ -4455,20 +4697,32 @@ fn setup_settings(
             ],
         ),
         SettingsRow::Toggle(
-            FORCE_COMPOSITION_LABEL,
+            "Force Composition",
+            "Sends the game’s image through an extra layer before display. This may help some graphics problems, but can reduce speed.",
             "forceComposition:",
             picker_settings.force_composition,
             true,
         ),
-        SettingsRow::Toggle("Performance display", "showFPS:", show_fps, true),
-        SettingsRow::Segmented("Display mode", overlay_mode_options),
+        SettingsRow::Toggle(
+            "Performance display",
+            "Shows performance information such as FPS while the game runs.",
+            "showFPS:",
+            show_fps,
+            true,
+        ),
+        SettingsRow::Segmented(
+            "Display mode",
+            "Choose how much performance information appears on screen. Title bar is only useful on desktop.",
+            overlay_mode_options,
+        ),
         SettingsRow::Segmented(
             "Screen corner",
+            "Choose where the on-screen performance display appears.",
             &[
-                ("Top left", "overlayCornerTopLeft"),
-                ("Top right", "overlayCornerTopRight"),
-                ("Bottom right", "overlayCornerBottomRight"),
-                ("Bottom left", "overlayCornerBottomLeft"),
+                ("Top\nLeft", "overlayCornerTopLeft"),
+                ("Top\nRight", "overlayCornerTopRight"),
+                ("Bottom\nRight", "overlayCornerBottomRight"),
+                ("Bottom\nLeft", "overlayCornerBottomLeft"),
             ],
         ),
         // Both fixes are opt-in and may be enabled per-app in the options
@@ -4476,12 +4730,14 @@ fn setup_settings(
         // (either way) is an explicit override for every later launch.
         SettingsRow::Toggle(
             "Rotation fix",
+            "Uses UIKit’s actual screen rotation to orient the game image. This may help some iPad games; it can change how other games turn.",
             "rotationFix:",
             picker_settings.rotation_fix.unwrap_or(false),
             true,
         ),
         SettingsRow::Toggle(
             "Movie player fix",
+            "Changes how in-game videos are loaded and shown. It may help some games, but can stop videos from appearing in others.",
             "moviePlayerFix:",
             picker_settings.fix_movie_player.unwrap_or(false),
             true,
@@ -4489,6 +4745,7 @@ fn setup_settings(
     ];
     graphics_rows.push(SettingsRow::Toggle(
         "Show slide to unlock",
+        "Shows the old iPhone lock screen before the game starts.",
         "showLockScreen:",
         picker_settings.show_lock_screen,
         true,
@@ -4496,6 +4753,7 @@ fn setup_settings(
     if show_fullscreen_row {
         graphics_rows.push(SettingsRow::Toggle(
             "Keep aspect ratio on resize",
+            "On desktop, keep the game’s proportions when resizing the window instead of stretching the image.",
             "preserveAspectRatio:",
             picker_settings.preserve_aspect_ratio,
             true,
@@ -4503,27 +4761,65 @@ fn setup_settings(
     }
     sections.push(("GRAPHICS", graphics_rows));
     sections.push((
+        "CORRUPTION",
+        vec![
+            SettingsRow::Segmented(
+                "Corruption engine",
+                "Intentionally changes a few bytes in the game’s live memory. This experimental effect can cause glitches or crashes; it is off by default.",
+                &[("Off", "corruptionOff"), ("On", "corruptionOn")],
+            ),
+            SettingsRow::Segmented(
+                "Startup delay",
+                "Wait this long after the game first runs before corruption starts. The timer pauses while the game is not running.",
+                &[("0s", "corruptionStartupImmediate"), ("5s", "corruptionStartup5"), ("15s", "corruptionStartup15"), ("30s", "corruptionStartup30")],
+            ),
+            SettingsRow::Segmented(
+                "Cooldown",
+                "Wait this long between corruption bursts while the game is running.",
+                &[("0.5s", "corruptionCooldownHalf"), ("1s", "corruptionCooldown1"), ("5s", "corruptionCooldown5"), ("10s", "corruptionCooldown10")],
+            ),
+        ],
+    ));
+    sections.push((
         "DEVICE",
-        vec![SettingsRow::DeviceDropdown, SettingsRow::LanguageDropdown],
+        vec![
+            SettingsRow::DeviceDropdown(
+                "Device model",
+                "Choose which iPhone, iPad, or iPod touch model the game sees. Some games only support certain models.",
+            ),
+            SettingsRow::LanguageDropdown(
+                "Language",
+                "Choose the language order reported to the game. The game decides which languages it supports.",
+            ),
+        ],
     ));
     sections.push((
         "EMULATION",
         vec![
             SettingsRow::Toggle(
                 "Cheat Engine",
+                "Enables the built-in cheat interface for supported games. It does not add cheats to every game.",
                 "cheatEngine:",
                 picker_settings.cheat_engine,
                 true,
             ),
-            SettingsRow::Toggle("Network access", "network:", picker_settings.network, true),
+            SettingsRow::Toggle(
+                "Network access",
+                "Lets the game connect to the Internet and local network. Online services may still be unavailable.",
+                "network:",
+                picker_settings.network,
+                true,
+            ),
             SettingsRow::Toggle(
                 "Local Game Center sign-in",
+                "Tells the game that a local player is signed in. Online Game Center services are not provided.",
                 "gameCenterAuthenticated:",
                 picker_settings.game_center_authenticated,
                 true,
             ),
             SettingsRow::Toggle(
                 "Use analog sticks for tilt controls",
+                "Uses a controller’s analog stick to imitate tilting the device. When enabled, the real accelerometer is ignored.",
                 "analogStickTiltControls:",
                 picker_settings.analog_stick_tilt_controls,
                 true,
@@ -4541,6 +4837,8 @@ fn setup_settings(
     let mut overlay_mode_buttons = Vec::new();
     let mut overlay_corner_buttons = Vec::new();
     let mut corruption_mode_buttons = Vec::new();
+    let mut corruption_startup_delay_buttons = Vec::new();
+    let mut corruption_cooldown_buttons = Vec::new();
     let mut gles2_mode_buttons = Vec::new();
     let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
     // Where dropdown menus open: just under the navigation bar.
@@ -4563,7 +4861,11 @@ fn setup_settings(
         scroll_items.push((header_label, y, y + 18.0));
         y += SETTINGS_HEADER_HEIGHT;
 
-        let group_height: CGFloat = rows.iter().map(settings_row_height).sum();
+        let row_heights: Vec<CGFloat> = rows
+            .iter()
+            .map(|row| settings_row_height(env, row, inner_width))
+            .collect();
+        let group_height: CGFloat = row_heights.iter().sum();
         let outline_color = ui_color(env, 0.66, 0.67, 0.69, 1.0);
         let outline = new_view(
             env,
@@ -4592,22 +4894,43 @@ fn setup_settings(
         let row_count = rows.len();
         let mut row_y: CGFloat = 0.0;
         for (index, row) in rows.iter().enumerate() {
+            let row_height = row_heights[index];
             match *row {
-                SettingsRow::Segmented(label, buttons) => {
-                    let label_view = new_label(
+                SettingsRow::Segmented(title, description, buttons) => {
+                    let text_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 15.0, text_width);
+                    let description_height = settings_text_height(
                         env,
-                        rect(side, row_y + 6.0, inner_width - 2.0 * side, 18.0),
-                        label,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        text_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, text_width, title_height),
+                        title,
                         15.0,
-                        false,
                         black,
                     );
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + title_height + 4.0,
+                            text_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
+                    let buttons_y = row_y + 8.0 + title_height + 4.0 + description_height + 8.0;
                     let seg_buttons = make_segment_buttons(
                         env,
                         delegate,
                         group,
-                        rect(side, row_y + 28.0, inner_width - 2.0 * side, 24.0),
+                        rect(side, buttons_y, text_width, 24.0),
                         buttons,
                     );
                     match buttons[0].1 {
@@ -4616,23 +4939,44 @@ fn setup_settings(
                         "overlayModeFull" => overlay_mode_buttons = seg_buttons,
                         "overlayCornerTopLeft" => overlay_corner_buttons = seg_buttons,
                         "corruptionOff" => corruption_mode_buttons = seg_buttons,
+                        "corruptionStartupImmediate" => {
+                            corruption_startup_delay_buttons = seg_buttons
+                        }
+                        "corruptionCooldownHalf" => corruption_cooldown_buttons = seg_buttons,
                         "gles2Off" => gles2_mode_buttons = seg_buttons,
                         _ => unreachable!(),
                     }
                 }
-                SettingsRow::DeviceDropdown => {
+                SettingsRow::DeviceDropdown(title, description) => {
                     let dropdown_width: CGFloat = 190.0;
                     let label_width = (inner_width - 2.0 * side - dropdown_width - 8.0).max(0.0);
-                    let label_view = new_label(
+                    let title_height = settings_text_height(env, title, 14.0, label_width);
+                    let description_height = settings_text_height(
                         env,
-                        rect(side, row_y + 4.0, label_width, 36.0),
-                        "Device model",
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        label_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, label_width, title_height),
+                        title,
                         14.0,
-                        false,
                         black,
                     );
-                    () = msg![env; label_view setNumberOfLines:2];
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + title_height + 4.0,
+                            label_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
                     device_dropdown = Some(make_settings_dropdown(
                         env,
                         delegate,
@@ -4640,7 +4984,7 @@ fn setup_settings(
                         settings_view,
                         rect(
                             inner_width - side - dropdown_width,
-                            row_y + 7.0,
+                            row_y + (row_height - 30.0) / 2.0,
                             dropdown_width,
                             30.0,
                         ),
@@ -4648,44 +4992,81 @@ fn setup_settings(
                         device_model_dropdown_spec(),
                     ));
                 }
-                SettingsRow::LanguageDropdown => {
-                    let label_view = new_label(
+                SettingsRow::LanguageDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 170.0;
+                    let label_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let title_height = settings_text_height(env, title, 16.0, label_width);
+                    let description_height = settings_text_height(
                         env,
-                        rect(side, row_y + 11.0, 150.0, 22.0),
-                        "Language",
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        label_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, label_width, title_height),
+                        title,
                         16.0,
-                        false,
                         black,
                     );
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + title_height + 4.0,
+                            label_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
                     language_dropdown = Some(make_settings_dropdown(
                         env,
                         delegate,
                         group,
                         settings_view,
-                        rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + (row_height - 30.0) / 2.0,
+                            dropdown_width,
+                            30.0,
+                        ),
                         menu_origin,
                         language_dropdown_spec(),
                     ));
                 }
-                SettingsRow::RendererDropdown => {
+                SettingsRow::RendererDropdown(title, description) => {
                     let dropdown_width: CGFloat = 130.0;
                     let label_width = inner_width - 2.0 * side - dropdown_width - 8.0;
-                    let renderer_label = if cfg!(target_os = "android") {
-                        "Renderer Mode"
-                    } else {
-                        "Renderer Mode (Android only)"
-                    };
-                    let label_view = new_label(
+                    let title_height = settings_text_height(env, title, 14.0, label_width);
+                    let description_height = settings_text_height(
                         env,
-                        rect(side, row_y + 4.0, label_width, 36.0),
-                        renderer_label,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        label_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, label_width, title_height),
+                        title,
                         14.0,
-                        false,
                         black,
                     );
-                    () = msg![env; label_view setNumberOfLines:2];
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + title_height + 4.0,
+                            label_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
                     let dropdown = make_settings_dropdown(
                         env,
                         delegate,
@@ -4693,7 +5074,7 @@ fn setup_settings(
                         settings_view,
                         rect(
                             inner_width - side - dropdown_width,
-                            row_y + 7.0,
+                            row_y + (row_height - 30.0) / 2.0,
                             dropdown_width,
                             30.0,
                         ),
@@ -4703,33 +5084,39 @@ fn setup_settings(
                     () = msg![env; (dropdown.button) setEnabled:renderer_mode_dropdown_enabled];
                     renderer_dropdown = Some(dropdown);
                 }
-                SettingsRow::Toggle(label_text, selector, default_state, enabled) => {
-                    let force_composition_label = label_text == FORCE_COMPOSITION_LABEL;
+                SettingsRow::Toggle(title, description, selector, default_state, enabled) => {
                     // Keep every switch the same size; let long labels wrap
                     // within the remaining row width instead of shrinking the
                     // control or drawing text underneath it.
                     let switch_width: CGFloat = 94.0;
-                    let label_height = if force_composition_label { 56.0 } else { 36.0 };
-                    let label_font = if force_composition_label { 13.0 } else { 16.0 };
-                    let label_lines = if force_composition_label { 3 } else { 2 };
-                    let row_height = settings_row_height(row);
-                    let label_view = new_label(
+                    let text_width = inner_width - 2.0 * side - switch_width - 8.0;
+                    let title_height = settings_text_height(env, title, 16.0, text_width);
+                    let description_height = settings_text_height(
+                        env,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        text_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, text_width, title_height),
+                        title,
+                        16.0,
+                        black,
+                    );
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
                         env,
                         rect(
                             side,
-                            row_y + 4.0,
-                            inner_width - 2.0 * side - switch_width - 8.0,
-                            label_height,
+                            row_y + 8.0 + title_height + 4.0,
+                            text_width,
+                            description_height,
                         ),
-                        label_text,
-                        label_font,
-                        false,
-                        black,
+                        description,
+                        gray_text,
                     );
-                    () = msg![env; label_view setTextAlignment:UITextAlignmentLeft];
-                    () = msg![env; label_view setLineBreakMode:UILineBreakModeWordWrap];
-                    () = msg![env; label_view setNumberOfLines:label_lines];
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:description_view];
 
                     let switch: id = msg_class![env; UISwitch alloc];
                     let switch: id = msg![env; switch initWithFrame:(rect(
@@ -4747,7 +5134,7 @@ fn setup_settings(
                     () = msg![env; group addSubview:switch];
                 }
             }
-            row_y += settings_row_height(row);
+            row_y += row_height;
             // Hairline separator between rows, inset from the left like iOS.
             if index + 1 < row_count {
                 let separator_color = ui_color(env, 0.85, 0.85, 0.87, 1.0);
@@ -4790,6 +5177,8 @@ fn setup_settings(
         overlay_mode_buttons,
         overlay_corner_buttons,
         corruption_mode_buttons,
+        corruption_startup_delay_buttons,
+        corruption_cooldown_buttons,
         gles2_mode_buttons,
         device_dropdown: device_dropdown
             .expect("the settings screen always has a device model row"),
@@ -5517,16 +5906,23 @@ fn quick_options_fix_arguments(
 
 fn quick_options_corruption_arguments(
     mode: CorruptionMode,
-    profile_mode: Option<bool>,
-    profile_load_failed: bool,
+    startup_delay: StartupDelayPreset,
+    cooldown: CooldownPreset,
+    profile_settings: (Option<bool>, bool, bool),
 ) -> Vec<String> {
-    if !crate::options::should_emit_picker_corruption_mode(profile_mode, profile_load_failed) {
+    let (profile_mode, _, profile_load_failed) = profile_settings;
+    if profile_load_failed {
         return Vec::new();
     }
     match mode {
         CorruptionMode::Off => Vec::new(),
-        CorruptionMode::NoCorrupt => vec!["--no-corrupt-game".to_string()],
-        CorruptionMode::Corrupt => vec!["--corrupt-game".to_string()],
+        CorruptionMode::Corrupt if profile_mode.is_none() => {
+            let mut args = vec!["--corrupt-game".to_string()];
+            args.push(format!("--corrupt-start-delay={}", startup_delay.duration().as_secs_f64()));
+            args.push(format!("--corrupt-cooldown={}", cooldown.duration().as_secs_f64()));
+            args
+        }
+        CorruptionMode::Corrupt => Vec::new(),
     }
 }
 
@@ -5736,34 +6132,38 @@ mod quick_options_fix_tests {
     fn profile_corruption_options_are_resolved_from_built_in_then_user_file() {
         let built_in = b"com.example.game: --corrupt-game\n";
         let user = b"com.example.game: --device-family=iphone-4 --no-corrupt-game\n";
-        let (mode, failed) = inspect_profile_corruption_options(
+        let (mode, has_settings, failed) = inspect_profile_corruption_options(
             &mut std::io::Cursor::new(built_in),
             &mut std::io::Cursor::new(user),
             "com.example.game",
         );
         assert_eq!(mode, Some(false));
+        assert!(has_settings);
         assert!(!failed);
     }
 
     #[test]
     fn missing_bundle_identifier_suppresses_picker_corruption_override() {
-        let (mode, failed) = profile_corruption_mode_for_app_id(
+        let (mode, has_settings, failed) = profile_corruption_mode_for_app_id(
             "",
             Ok(Some("--no-corrupt-game".to_owned())),
             Ok(None),
         );
         assert_eq!(mode, None);
+        assert!(!has_settings);
         assert!(failed);
-        assert!(!crate::options::should_emit_picker_corruption_mode(mode, failed));
+        assert!(quick_options_corruption_arguments(
+            CorruptionMode::Corrupt,
+            StartupDelayPreset::default(),
+            CooldownPreset::default(),
+            (mode, has_settings, failed),
+        )
+        .is_empty());
     }
 
     #[test]
     fn saved_gles2_and_corruption_modes_round_trip() {
-        for mode in [
-            CorruptionMode::Off,
-            CorruptionMode::NoCorrupt,
-            CorruptionMode::Corrupt,
-        ] {
+        for mode in [CorruptionMode::Off, CorruptionMode::Corrupt] {
             assert_eq!(
                 CorruptionMode::from_short_name(mode.short_name()),
                 Some(mode)
@@ -5779,22 +6179,35 @@ mod quick_options_fix_tests {
     }
 
     #[test]
-    fn corruption_mode_arguments_are_tristate_and_profile_aware() {
-        assert!(quick_options_corruption_arguments(CorruptionMode::Off, None, false).is_empty());
+    fn corruption_mode_arguments_preserve_profile_defaults_and_enable_on_request() {
+        assert!(quick_options_corruption_arguments(
+            CorruptionMode::Off,
+            StartupDelayPreset::default(),
+            CooldownPreset::default(),
+            (None, false, false)
+        )
+        .is_empty());
         assert_eq!(
-            quick_options_corruption_arguments(CorruptionMode::NoCorrupt, None, false),
-            vec!["--no-corrupt-game"]
+            quick_options_corruption_arguments(
+                CorruptionMode::Corrupt,
+                StartupDelayPreset::FiveSeconds,
+                CooldownPreset::OneSecond,
+                (None, false, false)
+            ),
+            vec![
+                "--corrupt-game",
+                "--corrupt-start-delay=5",
+                "--corrupt-cooldown=1"
+            ]
         );
         assert_eq!(
-            quick_options_corruption_arguments(CorruptionMode::Corrupt, None, false),
+            quick_options_corruption_arguments(
+                CorruptionMode::Corrupt,
+                StartupDelayPreset::FiveSeconds,
+                CooldownPreset::OneSecond,
+                (Some(false), true, false)
+            ),
             vec!["--corrupt-game"]
-        );
-        assert!(
-            quick_options_corruption_arguments(CorruptionMode::Corrupt, Some(false), false)
-                .is_empty()
-        );
-        assert!(
-            quick_options_corruption_arguments(CorruptionMode::NoCorrupt, None, true).is_empty()
         );
     }
 

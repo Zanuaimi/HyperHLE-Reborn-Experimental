@@ -1985,7 +1985,7 @@ impl Environment {
                     &self.objc,
                 );
             }
-            self.corruptor.tick(&mut self.mem);
+            self.corruptor.tick(&mut self.mem, self.guest_clock.now());
             if let Some(speed) = crate::trainer_ui::take_speed_request() {
                 self.guest_clock.set_speed(speed);
                 crate::trainer_ui::publish_status(format!("GAME SPEED {}", speed.label()));

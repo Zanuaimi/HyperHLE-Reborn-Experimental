@@ -7,6 +7,7 @@
 
 use crate::mem::{GuestUSize, Mem};
 use crate::options::CorruptionOptions;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct Rng {
@@ -37,7 +38,8 @@ impl Rng {
 pub struct Corruptor {
     options: CorruptionOptions,
     rng: Rng,
-    frames_since_burst: u64,
+    started_at: Option<Instant>,
+    next_burst_at: Option<Instant>,
     total_corrupted: u64,
 }
 
@@ -52,7 +54,8 @@ impl Corruptor {
         Self {
             rng: Rng::new(options.seed),
             options,
-            frames_since_burst: 0,
+            started_at: None,
+            next_burst_at: None,
             total_corrupted: 0,
         }
     }
@@ -65,16 +68,24 @@ impl Corruptor {
         self.total_corrupted
     }
 
-    pub fn tick(&mut self, mem: &mut Mem) {
+    pub fn tick(&mut self, mem: &mut Mem, guest_now: Instant) -> u32 {
         if !self.options.enabled {
-            return;
+            return 0;
         }
-        self.frames_since_burst += 1;
-        if self.frames_since_burst < u64::from(self.options.interval_frames.max(1)) {
-            return;
+        let started_at = *self.started_at.get_or_insert(guest_now);
+        if guest_now < started_at + self.options.startup_delay {
+            return 0;
         }
-        self.frames_since_burst = 0;
+        if self
+            .next_burst_at
+            .is_some_and(|deadline| guest_now < deadline)
+        {
+            return 0;
+        }
+        let before = self.total_corrupted;
         self.blast(mem);
+        self.next_burst_at = Some(guest_now + self.options.cooldown);
+        (self.total_corrupted - before) as u32
     }
 
     fn blast(&mut self, mem: &mut Mem) {
@@ -142,41 +153,42 @@ mod tests {
 
     #[test]
     fn same_seed_corrupts_same_bytes() {
-        fn run() -> Vec<u8> {
+        let now = Instant::now();
+        fn run(now: Instant) -> Vec<u8> {
             let mut mem = Mem::new();
             mem.set_null_segment_size(PAGE_SIZE);
             let ptr = mem.alloc(4096);
             mem.bytes_at_mut(ptr.cast(), 4096).fill(0xaa);
             let mut corruptor = Corruptor::new(CorruptionOptions {
                 enabled: true,
-                interval_frames: 1,
-                bytes_per_burst: 64,
                 ..CorruptionOptions::default()
             });
-            corruptor.tick(&mut mem);
+            corruptor.tick(&mut mem, now);
             mem.bytes_at(ptr.cast::<u8>().cast_const(), 4096).to_vec()
         }
-        assert_eq!(run(), run());
+        assert_eq!(run(now), run(now));
     }
 
     #[test]
-    fn burst_waits_for_configured_interval_and_respects_max_offset() {
+    fn burst_waits_for_configured_cooldown_and_respects_max_offset() {
         let mut mem = Mem::new();
         mem.set_null_segment_size(PAGE_SIZE);
         let ptr = mem.alloc(128);
         mem.bytes_at_mut(ptr.cast(), 128).fill(0xaa);
+        let now = Instant::now();
         let mut corruptor = Corruptor::new(CorruptionOptions {
             enabled: true,
-            interval_frames: 3,
+            cooldown: std::time::Duration::from_secs(3),
             bytes_per_burst: 32,
             max_offset: Some(8),
             ..CorruptionOptions::default()
         });
-        corruptor.tick(&mut mem);
-        corruptor.tick(&mut mem);
-        assert_eq!(corruptor.total_corrupted(), 0);
-        corruptor.tick(&mut mem);
+        corruptor.tick(&mut mem, now);
         assert_eq!(corruptor.total_corrupted(), 32);
+        corruptor.tick(&mut mem, now + std::time::Duration::from_secs(2));
+        assert_eq!(corruptor.total_corrupted(), 32);
+        corruptor.tick(&mut mem, now + std::time::Duration::from_secs(3));
+        assert_eq!(corruptor.total_corrupted(), 64);
         assert!(mem
             .bytes_at(ptr.cast::<u8>().cast_const(), 8)
             .iter()
@@ -201,12 +213,11 @@ mod tests {
         mem.bytes_at_mut(ptr.cast(), chunk_size).fill(0xaa);
         let mut corruptor = Corruptor::new(CorruptionOptions {
             enabled: true,
-            interval_frames: 1,
             bytes_per_burst: 16,
             max_offset: Some(32),
             ..CorruptionOptions::default()
         });
-        corruptor.tick(&mut mem);
+        corruptor.tick(&mut mem, Instant::now());
         assert_eq!(corruptor.total_corrupted(), 16);
         assert!(mem
             .bytes_at(ptr.cast::<u8>().cast_const(), chunk_size)
@@ -224,12 +235,11 @@ mod tests {
         mem.alloc(16);
         let mut corruptor = Corruptor::new(CorruptionOptions {
             enabled: true,
-            interval_frames: 1,
             bytes_per_burst: 64,
             ..CorruptionOptions::default()
         });
 
-        corruptor.tick(&mut mem);
+        corruptor.tick(&mut mem, Instant::now());
 
         assert!(mem
             .bytes_at(crate::mem::Ptr::<u8, false>::from_bits(stack_start), 64)
@@ -245,12 +255,11 @@ mod tests {
         mem.bytes_at_mut(ptr.cast(), 4).fill(0xaa);
         let mut corruptor = Corruptor::new(CorruptionOptions {
             enabled: true,
-            interval_frames: 1,
             bytes_per_burst: 4,
             max_offset: Some(0),
             ..CorruptionOptions::default()
         });
-        corruptor.tick(&mut mem);
+        corruptor.tick(&mut mem, Instant::now());
         assert_eq!(corruptor.total_corrupted(), 0);
         assert_eq!(mem.bytes_at(ptr.cast::<u8>().cast_const(), 4), &[0xaa; 4]);
     }
