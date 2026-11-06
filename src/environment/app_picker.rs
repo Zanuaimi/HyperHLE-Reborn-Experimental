@@ -5922,6 +5922,9 @@ fn quick_options_corruption_arguments(
             args.push(format!("--corrupt-cooldown={}", cooldown.duration().as_secs_f64()));
             args
         }
+        CorruptionMode::Corrupt if profile_mode == Some(false) => {
+            vec!["--corrupt-game".to_string()]
+        }
         CorruptionMode::Corrupt => Vec::new(),
     }
 }
@@ -6199,6 +6202,15 @@ mod quick_options_fix_tests {
                 "--corrupt-start-delay=5",
                 "--corrupt-cooldown=1"
             ]
+        );
+        assert_eq!(
+            quick_options_corruption_arguments(
+                CorruptionMode::Corrupt,
+                StartupDelayPreset::FiveSeconds,
+                CooldownPreset::OneSecond,
+                (Some(false), true, false)
+            ),
+            vec!["--corrupt-game"]
         );
         assert_eq!(
             quick_options_corruption_arguments(
