@@ -1168,6 +1168,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setTranslatesAutoresizingMaskIntoConstraints:(bool)_translates { }
 - (bool)translatesAutoresizingMaskIntoConstraints { true }
 - (())setNeedsLayout { }
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiview/1622450-setneedsupdateconstraints>:
+// "Sets whether the view needs to update its constraints." Auto Layout is not
+// emulated, so marking the view dirty and the follow-up passes are no-ops;
+// implementing them keeps subclasses that drive them from warning.
+- (())setNeedsUpdateConstraints { }
+- (())updateConstraintsIfNeeded { }
+- (())updateConstraints { }
 - (())addConstraint:(id)_constraint { }
 - (())addConstraints:(id)_constraints { }
 - (())removeConstraint:(id)_constraint { }
@@ -1646,6 +1654,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
+    let superview = env.objc.borrow::<UIViewHostObject>(this).superview;
+    if superview != nil {
+        log!("Warning: {:?} was deallocated while in superview {:?}", this, superview);
+        {
+            let siblings = &mut env.objc.borrow_mut::<UIViewHostObject>(superview).subviews;
+            siblings.retain(|&sibling| sibling != this);
+        }
+        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        () = msg![env; layer removeFromSuperlayer];
+    }
+
     let UIViewHostObject {
         layer, subviews, gesture_recognizers,
         accessibility_label, accessibility_hint, accessibility_value,
