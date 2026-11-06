@@ -1,7 +1,8 @@
 # HyperHLE-Reborn
 
 <p align="center"><img src="./Picsart_26-10-20_10-43-04-335.jpg" alt="Senses" width="700"></p>
-**HyperHLE-Reborn** is a community-maintained fork of [HyperHLE](https://github.com/HyperHLE/HyperHLE), itself based on [touchHLE](https://github.com/touchHLE/touchHLE). The user-facing name of this project is **HyperHLE**.
+HyperHLE-Reborn is a community-maintained fork of [HyperHLE](https://github.com/HyperHLE/HyperHLE), itself based on [touchHLE](https://github.com/touchHLE/touchHLE). The user-facing name of this project is
+HyperHLE
 
 HyperHLE is a high-level emulator for early iPhone OS apps. It reimplements selected iOS frameworks on the host, allowing compatible apps to run without booting iOS. This fork focuses on Android/mobile usability, fullscreen and orientation handling, graphics compatibility, and app-specific fixes. It is not an official Apple product.
 
@@ -38,6 +39,7 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - Asphalt 8 1.0.0-1.4.0 (Playable)
 - GTA 3 (Ingame)
 - Granny (Ingame)
+- BioShock (Ingame, not tested)
 - Talking Tom Hero Dash (Playable)
 - My Talking Hank (Playable)
 - Subway Surfers 1.118.0 (Playable)
@@ -59,5 +61,11 @@ For iOS build steps and the unsigned IPAs, see [`platform/ios`](platform/ios/REA
 Join the [HyperHLE Discord server](https://discord.gg/ZpEkAV47H9) to discuss the project and contribute.
 
 ## Credits and license
+
+Thanks to everyone who got BioShock this far in HyperHLE:
+
+- **Tog991 (goodvids56)**, developer of [HyperHLE](https://github.com/HyperHLE/HyperHLE), fixed the game's launch itself.
+- **uxazu**, creator of Aemulator, fixed the game up to the menu and half-implemented the video player.
+- The [Podroid](https://github.com/shawnw67/Podroid) fork got it through its level loads and in-game.
 
 HyperHLE-Reborn carries forward work from HyperHLE and touchHLE contributors and uses open-source libraries. It is licensed under the [Mozilla Public License 2.0](LICENSE); see the individual projects for their respective notices and licenses.
