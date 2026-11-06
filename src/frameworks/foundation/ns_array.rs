@@ -432,14 +432,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, arr)
 }
 
-- (())makeObjectsPerformSelector:(SEL)sel {
-    let count: NSUInteger = msg![env; this count];
-    for i in 0..count {
-        let obj: id = msg![env; this objectAtIndex:i];
-        let _: id = msg![env; obj performSelector:sel];
-    }
-}
-
 - (())encodeWithCoder:(id)coder {
     let class: Class = msg![env; coder class];
     let keyed_arch_class: Class = msg_class![env; NSKeyedArchiver class];

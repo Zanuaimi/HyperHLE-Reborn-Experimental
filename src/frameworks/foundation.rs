@@ -1584,7 +1584,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[
         ns_calendar::CONSTANTS,
         ns_error::CONSTANTS,
-        ns_url::CONSTANTS,
         ns_exception::CONSTANTS,
         ns_file_manager::CONSTANTS,
         ns_keyed_unarchiver::CONSTANTS,
