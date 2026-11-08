@@ -137,6 +137,8 @@ pub enum CpuError {
     UndefinedInstruction,
     /// Breakpoint (`bkpt` instruction).
     Breakpoint,
+    /// Dynarmic could not translate an instruction for its execution backend.
+    InterpreterFallback,
 }
 
 impl Cpu {
@@ -279,6 +281,13 @@ impl Cpu {
         unsafe { touchHLE_DynarmicWrapper_last_exception_pc(self.dynarmic_wrapper) }
     }
 
+    /// Address of the instruction Dynarmic could not translate. Only
+    /// meaningful immediately after [Self::run_or_step] returns
+    /// [CpuError::InterpreterFallback].
+    pub fn interpreter_fallback_pc(&self) -> VAddr {
+        unsafe { touchHLE_DynarmicWrapper_interpreter_fallback_pc(self.dynarmic_wrapper) }
+    }
+
     /// Swap the current state of the CPU (registers etc) with the state stored
     /// in the context object.
     pub fn swap_context(&mut self, context: &mut CpuContext) {
@@ -352,6 +361,7 @@ impl Cpu {
             -2 => CpuState::Error(CpuError::MemoryError),
             -3 => CpuState::Error(CpuError::UndefinedInstruction),
             -4 => CpuState::Error(CpuError::Breakpoint),
+            -5 => CpuState::Error(CpuError::InterpreterFallback),
             _ if res < -4 => panic!("Unexpected CPU execution result"),
             svc => CpuState::Svc(svc as u32),
         }

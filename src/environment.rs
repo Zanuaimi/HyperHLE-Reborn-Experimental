@@ -2381,7 +2381,9 @@ impl Environment {
     fn is_recoverable_guest_cpu_error(error: &cpu::CpuError) -> bool {
         matches!(
             error,
-            cpu::CpuError::UndefinedInstruction | cpu::CpuError::Breakpoint
+            cpu::CpuError::UndefinedInstruction
+                | cpu::CpuError::Breakpoint
+                | cpu::CpuError::InterpreterFallback
         )
     }
 
@@ -2839,6 +2841,7 @@ impl Environment {
         // long though, so this is only a fallback (see below).
         let assumed_instruction_len: u32 = if is_thumb { 2 } else { 4 };
 
+        let is_interpreter_fallback = matches!(error, cpu::CpuError::InterpreterFallback);
         let is_undefined_instruction = matches!(error, cpu::CpuError::UndefinedInstruction);
         let is_recoverable = Self::is_recoverable_guest_cpu_error(&error);
 
@@ -2849,7 +2852,9 @@ impl Environment {
         // them, but use dynarmic's exact fault address for everything else.
         let next_pc = self.cpu.regs()[cpu::Cpu::PC];
         let legacy_pc = next_pc.wrapping_sub(assumed_instruction_len);
-        let (fault_pc, instruction_len) = if is_recoverable {
+        let (fault_pc, instruction_len) = if is_interpreter_fallback {
+            (self.cpu.interpreter_fallback_pc(), assumed_instruction_len)
+        } else if is_recoverable {
             let exact_pc = self.cpu.last_exception_pc();
             match next_pc.wrapping_sub(exact_pc) {
                 len @ (2 | 4) if is_thumb || len == 4 => (exact_pc, len),
@@ -2867,9 +2872,11 @@ impl Environment {
             self.cpu.regs_mut()[cpu::Cpu::PC] = fault_pc;
         }
 
-        // Some NEON instructions are missing from dynarmic and raise an
-        // UndefinedInstruction. Perform them in software and carry on.
-        if is_undefined_instruction && self.is_guest_code_address(fault_pc) {
+        // Some NEON instructions are missing from dynarmic. Perform them in
+        // software and carry on when possible.
+        if (is_undefined_instruction || is_interpreter_fallback)
+            && self.is_guest_code_address(fault_pc)
+        {
             let guest_mem = &self.mem;
             let read_u16 = |addr: u32| Some(guest_mem.read(mem::ConstPtr::<u16>::from_bits(addr)));
             if let Some(len) =
@@ -2880,7 +2887,14 @@ impl Environment {
             }
         }
 
-        if self.gdb_server.is_none() {
+        if is_interpreter_fallback && self.gdb_server.is_none() {
+            panic!(
+                "Dynarmic interpreter fallback at unsupported guest instruction {fault_pc:#x}; {}",
+                self.dump_guest_code_around(fault_pc, is_thumb)
+            );
+        }
+
+        if self.gdb_server.is_none() && !is_interpreter_fallback {
             // Bypass guest traps without framework stubs. Games can hit an
             // UndefinedInstruction (abort/__builtin_trap) or a Breakpoint
             // (`bkpt`) when an API returns nil or unexpected data. Fake a
@@ -4570,6 +4584,9 @@ mod guest_cpu_error_tests {
         ));
         assert!(Environment::is_recoverable_guest_cpu_error(
             &cpu::CpuError::Breakpoint
+        ));
+        assert!(Environment::is_recoverable_guest_cpu_error(
+            &cpu::CpuError::InterpreterFallback
         ));
     }
 

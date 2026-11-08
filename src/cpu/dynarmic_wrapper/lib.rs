@@ -70,6 +70,9 @@ extern "C" {
     pub fn touchHLE_DynarmicWrapper_last_exception_pc(
         cpu: *const touchHLE_DynarmicWrapper,
     ) -> VAddr;
+    pub fn touchHLE_DynarmicWrapper_interpreter_fallback_pc(
+        cpu: *const touchHLE_DynarmicWrapper,
+    ) -> VAddr;
     pub fn touchHLE_DynarmicWrapper_swap_context(
         cpu: *mut touchHLE_DynarmicWrapper,
         context: *mut touchHLE_DynarmicContext,

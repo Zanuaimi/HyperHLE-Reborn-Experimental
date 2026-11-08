@@ -156,7 +156,9 @@ impl GdbServer {
             // normal Arm code, and the BKPT instruction in Thumb code.
             // It apparently expects SIGTRAP instead of SIGILL even in the
             // former case.
-            Some(CpuError::UndefinedInstruction) | Some(CpuError::Breakpoint) => {
+            Some(CpuError::UndefinedInstruction)
+            | Some(CpuError::Breakpoint)
+            | Some(CpuError::InterpreterFallback) => {
                 self.send_packet("S05"); // SIGTRAP
             }
             Some(CpuError::MemoryError) => {

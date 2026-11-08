@@ -37,6 +37,7 @@ struct touchHLE_DynarmicContext {
 const auto HaltReasonSvc = Dynarmic::HaltReason::UserDefined1;
 const auto HaltReasonUndefinedInstruction = Dynarmic::HaltReason::UserDefined2;
 const auto HaltReasonBreakpoint = Dynarmic::HaltReason::UserDefined3;
+const auto HaltReasonInterpreterFallback = Dynarmic::HaltReason::UserDefined4;
 
 class Environment final : public Dynarmic::A32::UserCallbacks {
 public:
@@ -52,6 +53,7 @@ public:
   // the instruction length from the register file alone. See
   // `touchHLE_DynarmicWrapper_last_exception_pc`.
   std::uint32_t last_exception_pc = 0;
+  std::uint32_t interpreter_fallback_pc = 0;
 
 private:
   std::uint8_t MemoryRead8(VAddr vaddr) override {
@@ -151,8 +153,11 @@ private:
     return true;
   }
 
-  void InterpreterFallback(std::uint32_t, size_t) override {
-    abort(); // TODO
+  void InterpreterFallback(std::uint32_t pc, size_t) override {
+    // Stop guest execution and report the unsupported instruction instead
+    // of aborting the emulator process.
+    interpreter_fallback_pc = pc;
+    cpu->HaltExecution(HaltReasonInterpreterFallback);
   }
   void CallSVC(std::uint32_t svc) override {
     halting_svc = svc;
@@ -369,6 +374,9 @@ public:
 
 
   std::uint32_t last_exception_pc() const { return env.last_exception_pc; }
+  std::uint32_t interpreter_fallback_pc() const {
+    return env.interpreter_fallback_pc;
+  }
 
   void invalidate_cache_range(VAddr start, std::uint32_t size) {
     cpu->InvalidateCacheRange(start, size);
@@ -404,6 +412,8 @@ public:
       res = -4;
     } else if (Dynarmic::Has(hr, HaltReasonSvc)) {
       res = std::int32_t(env.halting_svc);
+    } else if (Dynarmic::Has(hr, HaltReasonInterpreterFallback)) {
+      res = -5;
     } else {
       printf("unhandled halt reason %u\n", unsigned(hr));
       abort();
@@ -465,6 +475,11 @@ void touchHLE_DynarmicWrapper_set_tpidruro(DynarmicWrapper *cpu,
 std::uint32_t
 touchHLE_DynarmicWrapper_last_exception_pc(const DynarmicWrapper *cpu) {
   return cpu->last_exception_pc();
+}
+
+std::uint32_t touchHLE_DynarmicWrapper_interpreter_fallback_pc(
+    const DynarmicWrapper *cpu) {
+  return cpu->interpreter_fallback_pc();
 }
 
 void touchHLE_DynarmicWrapper_swap_context(DynarmicWrapper *cpu,
