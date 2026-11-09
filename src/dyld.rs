@@ -2015,42 +2015,10 @@ impl Dyld {
             return None;
         }
 
-        // Fallback: the symbol isn't implemented by any host dylib and isn't
-        // exported by any loaded guest dylib. Instead of panicking (which kills
-        // the app), install a stub that logs a warning and returns 0. This
-        // lets the emulator keep running for relatively harmless symbols like
-        // `_getuid`, `_geteuid`, `_getpid`, etc.
-        let symbol_kind = if is_gles_function_symbol(symbol) {
-            "GLES function"
-        } else {
-            "function"
-        };
-        log!(
-            "Warning: call to unimplemented {} {} at {:#x}; installing return-0 stub",
-            symbol_kind,
-            symbol,
-            svc_pc
-        );
-        // `linked_host_functions` requires a `&'static str`, so leak the name.
-        let leaked_symbol: &'static str = Box::leak(symbol.to_string().into_boxed_str());
-        let f: HostFunction = &(unimplemented_function_stub as fn(&mut Environment) -> i32);
-        // Allocate an SVC ID for this stub (same pattern as the host-dylib
-        // branch above).
-        let idx: u32 = self.linked_host_functions.len().try_into().unwrap();
-        let mut svc = idx + Self::SVC_LINKED_FUNCTIONS_BASE;
-        if info.entry_size == 4 {
-            assert!(svc < Self::SVC_LAZY_LINK_RET_FLAG);
-            svc |= Self::SVC_LAZY_LINK_RET_FLAG;
-        }
-        self.linked_host_functions.push((leaked_symbol, f));
-        // Rewrite the stub function to trap into our SVC handler.
-        let stub_function_ptr: MutPtr<u32> = Ptr::from_bits(svc_pc);
-        mem.write(stub_function_ptr, encode_a32_svc(svc));
-        if info.entry_size != 4 {
-            assert!(mem.read(stub_function_ptr + 1) == encode_a32_ret());
-        }
-        cpu.invalidate_cache_range(stub_function_ptr.to_bits(), 4);
-        Some(f)
+        // Lazy linking happens only when guest code calls this import. Unknown
+        // functions have unknown return types and side effects, so fail here
+        // rather than fabricating a return value.
+        unresolved_function_called(symbol, svc_pc)
     }
 
     /// Creates a guest function that will call a host function with the name
@@ -2253,24 +2221,6 @@ fn dyld_stub_binder(_env: &mut Environment, _arg: u32) {
     );
 }
 
-fn is_gles_function_symbol(symbol: &str) -> bool {
-    let symbol = symbol.trim_start_matches('_');
-    symbol
-        .strip_prefix("gl")
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|character| character.is_ascii_uppercase())
-}
-
-/// Generic fallback stub for functions referenced by the guest binary but
-/// not implemented by any host dylib. Returns 0 so that calls to things like
-/// `getuid`, `geteuid`, `getpid`, etc. don't panic the emulator.
-///
-/// On ARM32 the return value is placed in `r0`, which matches the C ABI for
-/// `int`/`uid_t`/`pid_t`/pointer return types.
-fn unimplemented_function_stub(_env: &mut Environment) -> i32 {
-    0
-}
-
 fn local_code_symbol(bin: &MachO, symbol: &str) -> Option<u32> {
     if bin.external_symbols.contains_key(symbol) {
         return None;
@@ -2290,6 +2240,19 @@ fn local_code_symbol(bin: &MachO, symbol: &str) -> Option<u32> {
         .then_some(address)
 }
 
+fn unresolved_function_called(symbol: &str, stub_pc: u32) -> ! {
+    log!(
+        "Error: unresolved function {} called through stub at {:#x}",
+        symbol,
+        stub_pc
+    );
+    panic!(
+        "unresolved guest function {} called through stub at {:#x}",
+        symbol,
+        stub_pc
+    )
+}
+
 fn lazy_stub_section_offset(section_addr: u32, section_size: u32, svc_pc: u32) -> Option<u32> {
     let offset = svc_pc.checked_sub(section_addr)?;
     (offset < section_size).then_some(offset)
@@ -2299,17 +2262,19 @@ fn fallback_for_unmapped_lazy_link(
     cpu: &mut Cpu,
     svc_pc: u32,
     reason: &str,
-) -> Option<HostFunction> {
+) -> ! {
     let lr = cpu.regs()[Cpu::LR];
-    log_once!("Warning: lazy-link SVC could not be matched to a symbol stub; returning 0 to the caller.");
-    log_dbg!(
-        "Unmapped lazy-link SVC at {:#x} ({}); returning to LR {:#x}.",
+    log!(
+        "Error: lazy-link SVC could not be matched to a symbol stub at {:#x} ({}); LR={:#x}.",
         svc_pc,
         reason,
         lr
     );
-    cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
-    Some(&(unimplemented_function_stub as fn(&mut Environment) -> i32))
+    panic!(
+        "unmapped lazy-link SVC at {:#x} ({})",
+        svc_pc,
+        reason
+    )
 }
 
 fn has_guest_sjlj_runtime(mut has_symbol: impl FnMut(&str) -> bool) -> bool {
@@ -2334,29 +2299,6 @@ fn cxxabi_intercept_symbol(name: &str, guest_sjlj_runtime_available: bool) -> Op
         "__cxa_throw" if !guest_sjlj_runtime_available => Some("__cxa_throw"),
         "___cxa_throw" if !guest_sjlj_runtime_available => Some("___cxa_throw"),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod gles_symbol_detection_tests {
-    use super::is_gles_function_symbol;
-
-    #[test]
-    fn recognizes_mangled_and_unmangled_gles_entry_points() {
-        for symbol in [
-            "_glBindBuffer",
-            "glGetAttachedShaders",
-            "_glDiscardFramebufferEXT",
-        ] {
-            assert!(is_gles_function_symbol(symbol));
-        }
-    }
-
-    #[test]
-    fn ignores_non_gles_symbols() {
-        for symbol in ["_getuid", "_global_init", "_GLESContext", "_gl_lowercase"] {
-            assert!(!is_gles_function_symbol(symbol));
-        }
     }
 }
 
@@ -2473,7 +2415,10 @@ mod cxxabi_runtime_detection_tests {
 
 #[cfg(test)]
 mod lazy_link_recovery_tests {
-    use super::{fallback_for_unmapped_lazy_link, lazy_stub_section_offset, local_code_symbol};
+    use super::{
+        fallback_for_unmapped_lazy_link, lazy_stub_section_offset, local_code_symbol,
+        unresolved_function_called,
+    };
     use crate::cpu::Cpu;
     use crate::mach_o::{MachO, Section, SectionType};
     use std::collections::HashMap;
@@ -2491,15 +2436,32 @@ mod lazy_link_recovery_tests {
     }
 
     #[test]
-    fn unmapped_lazy_link_returns_to_arm_or_thumb_link_register() {
+    fn unmapped_lazy_link_fails_instead_of_fabricating_a_return_value() {
         let mut cpu = Cpu::new(None);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fallback_for_unmapped_lazy_link(&mut cpu, 0x3000, "test")
+        }))
+        .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(message.contains("0x3000"));
+        assert!(message.contains("test"));
+    }
 
-        for (lr, expected_pc, expected_thumb) in [(0x1000, 0x1000, false), (0x2001, 0x2000, true)] {
-            cpu.regs_mut()[Cpu::LR] = lr;
-            assert!(fallback_for_unmapped_lazy_link(&mut cpu, 0x3000, "test").is_some());
-            assert_eq!(cpu.regs()[Cpu::PC], expected_pc);
-            assert_eq!(cpu.cpsr() & Cpu::CPSR_THUMB != 0, expected_thumb);
-        }
+    #[test]
+    fn unresolved_function_reports_symbol_and_stub_address() {
+        let panic = std::panic::catch_unwind(|| unresolved_function_called("_missing", 0x1234))
+            .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(message.contains("_missing"));
+        assert!(message.contains("0x1234"));
     }
 
     fn mock_binary(symbol: &str, address: u32, section_name: &str, external: bool) -> MachO {
