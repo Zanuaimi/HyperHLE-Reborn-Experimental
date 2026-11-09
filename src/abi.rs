@@ -306,15 +306,19 @@ macro_rules! impl_CallFromHost {
                     (old_sp, old_fp, regs[FRAME_POINTER])
                 };
 
-                assert!(R::SIZE_IN_MEM.is_none()); // pointer return TODO
                 let regs = env.cpu.regs_mut();
-
-                let _ = extend_stack_for_args(
-                    0 $(+ <$P as GuestArg>::REG_COUNT)*,
+                let mut reg_offset = 0;
+                let retval_ptr = prepare_guest_function_return_buffer::<R>(
                     regs,
+                    &mut reg_offset,
+                    &mut env.mem,
                 );
 
-                let mut reg_offset = 0;
+                let arg_reg_count = align_stack_arg_count(
+                    reg_offset $(+ <$P as GuestArg>::REG_COUNT)*,
+                );
+                let _ = extend_stack_for_args(arg_reg_count, regs);
+
                 $(write_next_arg::<$P>(&mut reg_offset, regs, &mut env.mem, args.$p);)*
 
                 // It would actually be possible to use
@@ -339,10 +343,40 @@ macro_rules! impl_CallFromHost {
                 regs[Cpu::LR] = old_lr.addr_with_thumb_bit();
                 regs[Cpu::SP] = old_sp;
                 regs[FRAME_POINTER] = old_fp;
-                <R as GuestRet>::from_regs(env.cpu.regs())
+                if let Some(retval_ptr) = retval_ptr {
+                    <R as GuestRet>::from_mem(retval_ptr.cast_const(), &env.mem)
+                } else {
+                    <R as GuestRet>::from_regs(env.cpu.regs())
+                }
             }
         }
 
+    }
+}
+
+fn prepare_guest_function_return_buffer<R: GuestRet>(
+    regs: &mut [u32],
+    reg_offset: &mut usize,
+    mem: &mut Mem,
+) -> Option<MutVoidPtr> {
+    // AAPCS32 Result Return: composites larger than 4 bytes use memory.
+    // https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst
+    R::SIZE_IN_MEM.map(|size| {
+        regs[Cpu::SP] -= size;
+        // Keep the public-interface stack aligned while leaving enough space
+        // for the result object, even when its size is not a multiple of 8.
+        regs[Cpu::SP] &= !7;
+        let ptr: MutVoidPtr = Ptr::from_bits(regs[Cpu::SP]);
+        write_next_arg(reg_offset, regs, mem, ptr.cast_const());
+        ptr
+    })
+}
+
+fn align_stack_arg_count(arg_reg_count: usize) -> usize {
+    if arg_reg_count > 4 && (arg_reg_count - 4) % 2 != 0 {
+        arg_reg_count + 1
+    } else {
+        arg_reg_count
     }
 }
 
@@ -785,6 +819,37 @@ impl GuestRet for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct LargeReturn;
+
+    impl GuestRet for LargeReturn {
+        const SIZE_IN_MEM: Option<GuestUSize> = Some(12);
+    }
+
+    #[test]
+    fn guest_function_large_return_uses_aligned_hidden_first_argument() {
+        let mut mem = Mem::new();
+        let mut regs = [0u32; 16];
+        regs[Cpu::SP] = 0x1000;
+        let mut reg_offset = 0;
+
+        let result_ptr = prepare_guest_function_return_buffer::<LargeReturn>(
+            &mut regs,
+            &mut reg_offset,
+            &mut mem,
+        )
+        .unwrap();
+
+        assert_eq!(result_ptr.to_bits(), 0xff0);
+        assert_eq!(regs[0], 0xff0);
+        assert_eq!(reg_offset, 1);
+        assert_eq!(regs[Cpu::SP] % 8, 0);
+        write_next_arg(&mut reg_offset, &mut regs, &mut mem, 0x1234u32);
+        assert_eq!(regs[1], 0x1234);
+        assert_eq!(align_stack_arg_count(5), 6);
+        assert_eq!(align_stack_arg_count(6), 6);
+    }
 
     // AAPCS32 `va_list` is a pointer into memory, so a variadic callee
     // spills r0-r3 and its later calls cannot change its arguments:
