@@ -1584,10 +1584,12 @@ impl Window {
         }
         self.last_polled = now;
 
+        let landscape_bounds_enabled = options.landscape_uiscreen_bounds_enabled();
         fn transform_input_coords(
             window: &Window,
             (in_x, in_y): (f32, f32),
             independent_of_viewport: bool,
+            landscape_bounds_enabled: bool,
         ) -> (f32, f32) {
             let (vx, vy, vw, vh) = if independent_of_viewport {
                 let (width, height) = size_for_orientation(
@@ -1609,7 +1611,7 @@ impl Window {
             // interface space: the touch must be mapped into that same space,
             // without the portrait-space rotation below, and scaled by the
             // interface size rather than the portrait one.
-            let interface_space = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
+            let interface_space = landscape_bounds_enabled;
             if interface_space {
                 log_once!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: mapping touches in interface space");
             }
@@ -1772,7 +1774,12 @@ impl Window {
                     if crate::trainer_ui::touch_down(abs_coords, self.viewport()) {
                         continue;
                     }
-                    let coords = transform_input_coords(self, abs_coords, false);
+                    let coords = transform_input_coords(
+                        self,
+                        abs_coords,
+                        false,
+                        landscape_bounds_enabled,
+                    );
                     log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
                     if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
                         log!("SDL mouse-down delivered at ({}, {}) -> {:?}", x, y, coords);
@@ -1786,7 +1793,12 @@ impl Window {
                     if crate::trainer_ui::touch_motion(abs_coords, self.viewport()) {
                         continue;
                     }
-                    let coords = transform_input_coords(self, abs_coords, false);
+                    let coords = transform_input_coords(
+                        self,
+                        abs_coords,
+                        false,
+                        landscape_bounds_enabled,
+                    );
                     log_dbg!("MouseMotion x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesMove(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1800,7 +1812,12 @@ impl Window {
                     if crate::trainer_ui::touch_up(abs_coords, self.viewport()) {
                         continue;
                     }
-                    let coords = transform_input_coords(self, abs_coords, false);
+                    let coords = transform_input_coords(
+                        self,
+                        abs_coords,
+                        false,
+                        landscape_bounds_enabled,
+                    );
                     log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1879,7 +1896,12 @@ impl Window {
                         }
 
                         // Final coords: center + movement
-                        let coords = transform_input_coords(self, (cx + dx, cy + dy), true);
+                        let coords = transform_input_coords(
+                            self,
+                            (cx + dx, cy + dy),
+                            true,
+                            landscape_bounds_enabled,
+                        );
 
                         // Send TouchDown if any dpad is held, TouchUp if none
                         let any_held = self.dpad_state.left
@@ -1907,14 +1929,24 @@ impl Window {
                         };
                         match event {
                             E::ControllerButtonUp { .. } => {
-                                let coords = transform_input_coords(self, (x, y), true);
+                                let coords = transform_input_coords(
+                                    self,
+                                    (x, y),
+                                    true,
+                                    landscape_bounds_enabled,
+                                );
                                 Event::TouchesUp(HashMap::from([(
                                     FingerId::ButtonToTouch(button),
                                     coords,
                                 )]))
                             }
                             E::ControllerButtonDown { .. } => {
-                                let coords = transform_input_coords(self, (x, y), true);
+                                let coords = transform_input_coords(
+                                    self,
+                                    (x, y),
+                                    true,
+                                    landscape_bounds_enabled,
+                                );
                                 Event::TouchesDown(HashMap::from([(
                                     FingerId::ButtonToTouch(button),
                                     coords,
@@ -1947,6 +1979,7 @@ impl Window {
                                 y + ((stick_y + 1.0) / 2.0) * h,
                             ),
                             true,
+                            landscape_bounds_enabled,
                         );
                         if stick_x.abs() < options.deadzone && stick_y.abs() < options.deadzone {
                             if !self.stick_active {
@@ -2036,7 +2069,12 @@ impl Window {
                         }
                         _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
                     };
-                    let coords = transform_input_coords(self, abs_coords, false);
+                    let coords = transform_input_coords(
+                        self,
+                        abs_coords,
+                        false,
+                        landscape_bounds_enabled,
+                    );
                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
                     let mut map = if trainer_consumed {
                         HashMap::new()
@@ -2082,7 +2120,12 @@ impl Window {
                                         crate::trainer_ui::touch_motion(abs_coords, self.viewport())
                                     }
                                 };
-                                let coords = transform_input_coords(self, abs_coords, false);
+                                let coords = transform_input_coords(
+                                    self,
+                                    abs_coords,
+                                    false,
+                                    landscape_bounds_enabled,
+                                );
                                 if !trainer_consumed {
                                     map.insert(FingerId::Touch(finger_id), coords);
                                 }
@@ -2202,15 +2245,30 @@ impl Window {
             self.event_queue
                 .push_back(match (pressed, pressed_changed, moved) {
                     (true, true, _) => {
-                        let coords = transform_input_coords(self, (new_x, new_y), false);
+                        let coords = transform_input_coords(
+                            self,
+                            (new_x, new_y),
+                            false,
+                            landscape_bounds_enabled,
+                        );
                         Event::TouchesDown(HashMap::from([(FingerId::VirtualCursor, coords)]))
                     }
                     (false, true, _) => {
-                        let coords = transform_input_coords(self, (new_x, new_y), false);
+                        let coords = transform_input_coords(
+                            self,
+                            (new_x, new_y),
+                            false,
+                            landscape_bounds_enabled,
+                        );
                         Event::TouchesUp(HashMap::from([(FingerId::VirtualCursor, coords)]))
                     }
                     (true, _, true) => {
-                        let coords = transform_input_coords(self, (new_x, new_y), false);
+                        let coords = transform_input_coords(
+                            self,
+                            (new_x, new_y),
+                            false,
+                            landscape_bounds_enabled,
+                        );
                         Event::TouchesMove(HashMap::from([(FingerId::VirtualCursor, coords)]))
                     }
                     _ => return,

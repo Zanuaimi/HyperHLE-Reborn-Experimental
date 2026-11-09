@@ -298,6 +298,10 @@ pub struct Options {
     /// command line. Apps that legitimately rely on the ES 1.1 fixed-function
     /// pipeline should NOT enable this flag.
     pub prefer_gles2_context: bool,
+    /// Override the host/global landscape UIScreen-bounds setting for this app.
+    /// `None` keeps the `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS` environment
+    /// setting; `Some(false)` lets a later profile or CLI argument undo it.
+    pub landscape_uiscreen_bounds: Option<bool>,
     /// Break an otherwise-infinite `semaphore_wait()` by returning
     /// KERN_SUCCESS spuriously after this many milliseconds.
     ///
@@ -463,6 +467,7 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(true),
             prefer_gles2_context: false,
+            landscape_uiscreen_bounds: None,
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
             rotation_fix: false,
@@ -492,7 +497,7 @@ impl Default for Options {
             // black/white shapes (Temple Run on Mali-G57 is a textbook
             // case). Default the fix-up to ON so games work out of the
             // box on Android — users can still disable it via
-            // `--fix-texture-min-filter=false` in
+            // `--no-fix-texture-min-filter` in
             // `touchHLE_options.txt` if they hit a game that genuinely
             // depends on mipmap minification (rare among iOS 2.x/3.x
             // titles). On desktop hosts (where the user is likely
@@ -511,6 +516,12 @@ impl Default for Options {
 }
 
 impl Options {
+    /// Resolve the per-app override against the host/global environment flag.
+    pub fn landscape_uiscreen_bounds_enabled(&self) -> bool {
+        self.landscape_uiscreen_bounds
+            .unwrap_or_else(|| crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS"))
+    }
+
     /// Parse the command-line argument syntax for an option. Returns `Ok(true)`
     /// if the option was valid and has been applied, or `Ok(false)` if the
     /// option was not recognized.
@@ -791,14 +802,9 @@ impl Options {
         } else if arg == "--no-vsync" {
             self.vsync = VsyncMode::Off;
         } else if arg == "--landscape-uiscreen-bounds" {
-            // Report UIScreen.bounds (and therefore the EAGL layer / renderbuffer
-            // size) as landscape instead of the iOS-accurate portrait-native
-            // bounds. Apps that lay their render target out directly from
-            // UIScreen.bounds without applying the interface-orientation
-            // rotation (e.g. Minecraft: Story Mode) otherwise render a portrait
-            // frame that gets stretched into the landscape window. The GLES
-            // layer reads this via the env var, so set it here.
-            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
+            self.landscape_uiscreen_bounds = Some(true);
+        } else if arg == "--no-landscape-uiscreen-bounds" {
+            self.landscape_uiscreen_bounds = Some(false);
         } else if let Some(value) = arg.strip_prefix("--present-rotate=") {
             let deg: u32 = value.parse().map_err(|_| {
                 "Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string()
@@ -813,6 +819,8 @@ impl Options {
             self.rotation_fix = true;
         } else if arg == "--no-rotation-fix" {
             self.rotation_fix = false;
+        } else if arg == "--no-present-rotate" {
+            self.present_rotate = None;
         } else if arg == "--perf-hints" {
             self.perf_hints = true;
         } else if arg == "--no-perf-hints" {
@@ -826,6 +834,8 @@ impl Options {
             self.mach_semaphore_spurious_wake_ms = (ms != 0).then_some(ms);
         } else if arg == "--prefer-gles2-context" {
             self.prefer_gles2_context = true;
+        } else if arg == "--no-prefer-gles2-context" {
+            self.prefer_gles2_context = false;
         } else if arg == "--force-gles1-context" {
             self.force_gles1_context = true;
             // GLES-native backend selection and EAGL both read this env var
@@ -847,6 +857,8 @@ impl Options {
             self.dumping_file = crate::paths::user_data_base_path().join(path);
         } else if arg == "--ignore-gl-errors" {
             self.ignore_gl_errors = true;
+        } else if arg == "--no-ignore-gl-errors" {
+            self.ignore_gl_errors = false;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
         } else if arg == "--no-trace-gl-errors" {
@@ -873,9 +885,10 @@ impl Options {
             self.fix_texture_min_filter = false;
             std::env::set_var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER", "0");
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
-            self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
+            let bytes: u32 = value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
-            })?);
+            })?;
+            self.zero_stack_after_guest_to_host_call = (bytes != 0).then_some(bytes);
         } else if arg == "--no-trainer" {
             self.trainer_disabled = true;
         } else if arg == "--trainer" {
@@ -1194,6 +1207,94 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-force-composition").unwrap());
         assert!(!options.force_composition);
+    }
+
+    #[test]
+    fn app_compatibility_options_can_override_profile_values() {
+        let mut options = Options::default();
+
+        assert!(!options.ios_es2_direct_present);
+        options.parse_argument("--ios-es2-direct-present").unwrap();
+        assert!(options.ios_es2_direct_present);
+        options
+            .parse_argument("--no-ios-es2-direct-present")
+            .unwrap();
+        assert!(!options.ios_es2_direct_present);
+
+        assert!(!options.prefer_gles2_context);
+        options.parse_argument("--prefer-gles2-context").unwrap();
+        assert!(options.prefer_gles2_context);
+        options.parse_argument("--no-prefer-gles2-context").unwrap();
+        assert!(!options.prefer_gles2_context);
+
+        options.parse_argument("--ignore-gl-errors").unwrap();
+        assert!(options.ignore_gl_errors);
+        options.parse_argument("--no-ignore-gl-errors").unwrap();
+        assert!(!options.ignore_gl_errors);
+
+        options
+            .parse_argument("--landscape-uiscreen-bounds")
+            .unwrap();
+        assert_eq!(options.landscape_uiscreen_bounds, Some(true));
+        assert!(options.landscape_uiscreen_bounds_enabled());
+        options
+            .parse_argument("--no-landscape-uiscreen-bounds")
+            .unwrap();
+        assert_eq!(options.landscape_uiscreen_bounds, Some(false));
+        assert!(!options.landscape_uiscreen_bounds_enabled());
+    }
+
+    #[test]
+    fn presentation_rotation_can_return_to_automatic() {
+        let mut options = Options::default();
+        assert_eq!(options.present_rotate, None);
+
+        options.parse_argument("--present-rotate=0").unwrap();
+        assert_eq!(options.present_rotate, Some(0));
+        options.parse_argument("--no-present-rotate").unwrap();
+        assert_eq!(options.present_rotate, None);
+        assert!(options.parse_argument("--present-rotate=45").is_err());
+    }
+
+    #[test]
+    fn semaphore_spurious_wake_zero_disables_the_workaround() {
+        let mut options = Options::default();
+        assert_eq!(options.mach_semaphore_spurious_wake_ms, None);
+
+        options
+            .parse_argument("--mach-semaphore-spurious-wake=100")
+            .unwrap();
+        assert_eq!(options.mach_semaphore_spurious_wake_ms, Some(100));
+        options
+            .parse_argument("--mach-semaphore-spurious-wake=0")
+            .unwrap();
+        assert_eq!(options.mach_semaphore_spurious_wake_ms, None);
+    }
+
+    #[test]
+    fn zero_stack_option_zero_disables_the_workaround() {
+        let mut options = Options::default();
+        assert_eq!(options.zero_stack_after_guest_to_host_call, None);
+
+        options
+            .parse_argument("--zero-stack-after-guest-to-host-call=52")
+            .unwrap();
+        assert_eq!(options.zero_stack_after_guest_to_host_call, Some(52));
+        options
+            .parse_argument("--zero-stack-after-guest-to-host-call=0")
+            .unwrap();
+        assert_eq!(options.zero_stack_after_guest_to_host_call, None);
+    }
+
+    #[test]
+    fn gl_error_tracing_can_be_enabled_and_disabled() {
+        let mut options = Options::default();
+        assert!(!options.trace_gl_errors);
+
+        options.parse_argument("--trace-gl-errors").unwrap();
+        assert!(options.trace_gl_errors);
+        options.parse_argument("--no-trace-gl-errors").unwrap();
+        assert!(!options.trace_gl_errors);
     }
 
     #[test]

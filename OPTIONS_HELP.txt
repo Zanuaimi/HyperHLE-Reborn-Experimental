@@ -377,6 +377,38 @@ Other options:
         Disables forced composition, including when it was enabled by an
         app-specific options file.
 
+    --ios-es2-direct-present
+    --no-ios-es2-direct-present
+        On iOS, present an ES 2.0 drawable directly even when it is not the
+        fullscreen layer. This makes The Sims Medieval visible, but forces a
+        renderbuffer readback and upload every frame and can starve UIKit's
+        event loop. Off by default; the `--no-` form restores composition even
+        when an app profile enabled the direct path.
+
+    --landscape-uiscreen-bounds
+    --no-landscape-uiscreen-bounds
+        Report UIScreen bounds in the current landscape orientation instead of
+        iOS's portrait-native bounds. This is for apps that size their
+        renderbuffer directly from UIScreen.bounds without accounting for
+        orientation; it also changes the coordinate space used for touch
+        mapping. Off by default unless `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS` is
+        set. The `--no-` form overrides both an app profile and the environment
+        setting for this app.
+
+    --present-rotate=0|90|180|270
+    --no-present-rotate
+        Replace orientation-derived EAGL presentation rotation with the fixed
+        clockwise angle. Use 0 when the guest already draws upright. Clearing
+        the override restores automatic rotation, including when an app profile
+        specified a fixed angle.
+
+    --ignore-gl-errors
+    --no-ignore-gl-errors
+        Make guest glGetError() report GL_NO_ERROR even when the host reports an
+        error. This can keep games running past harmless host-driver errors, but
+        hides real guest-visible GL failures and makes diagnosis harder. Off by
+        default; the `--no-` form overrides app-specific profiles.
+
     --present-mode=...
         How a frame that an app rendered into a fullscreen EAGL layer is put
         on the screen. One of:
@@ -451,6 +483,20 @@ Other options:
         Force EAGL initWithAPI: to create an OpenGL ES 2.0 context even when
         the app requested an OpenGL ES 1.1 context.
 
+        This is for apps that request ES 1.1 but use shader entry points. It
+        fixes their black frames on backends where those calls otherwise reach
+        ES 1.1 stubs. Apps that use the ES 1.1 fixed-function pipeline can
+        break; leave the option off unless the app needs shaders.
+
+    --no-prefer-gles2-context
+        Keep the API requested by the app, even if an app-specific profile
+        enabled the ES 2.0 upgrade.
+
+    --force-gles1-context
+        Force EAGL initWithAPI: to create an ES 1.1 fixed-function context even
+        when the app requested ES 2.0 or 3.x. This can recover engines with a
+        broken shader path, but ES 2.0-only apps will fail to create a context.
+
     --gles2-compat
         Force the legacy desktop OpenGL 2.1 compatibility backend for guest
         OpenGL ES 2.0 contexts. Context creation fails if it is unavailable.
@@ -482,18 +528,6 @@ Other options:
         Limit corruption to the first <bytes> of each allocation. Implies
         --corrupt-game.
 
-        Some apps (e.g. Lego Ninjago Spinjitzu Scavenger Hunt) ask EAGL for an
-        ES 1.1 context but actually drive rendering with shader entry points
-        such as glUseProgram and glCreateShader. Without this flag, on real
-        ES drivers (e.g. Adreno / Mali on Android) those calls fall through
-        to the GLES 1.1-only stubs and the app renders an empty (black)
-        frame even though its render loop is alive.
-
-        Apps that legitimately rely on the ES 1.1 fixed-function pipeline
-        (glMatrixMode, glColor4f, glEnableClientState, glVertexPointer, …)
-        should NOT enable this flag, because real ES 2.0 has no fixed-function
-        pipeline.
-
     --allow-network-access
     --no-network-access
         Allow apps running in touchHLE to access the Internet and the local network,
@@ -507,12 +541,6 @@ Other options:
         that require authentication at startup enter their offline content.
         Also available as "Local Game Center sign-in" in Settings > Emulation.
         Disabled by default. Online Game Center services remain unavailable.
-
-    --ignore-gl-errors
-        Ignore host OpenGL errors as queried by glGetError function.
-        This only affects return value of glGetError as seen by the guest
-        and nothing else. Should be enabled only for apps which really
-        need this behaviour.
 
     --trace-gl-errors
     --no-trace-gl-errors
@@ -568,7 +596,8 @@ Other options:
         state. This can make a difference for apps that store data on the
         stack and branch based on the stack's content. There is normally
         no reason to enable this option. The number of bytes must be
-        chosen carefully on a per-app basis.
+        chosen carefully on a per-app basis. Use 0 to disable it, including
+        when an app-specific profile enabled it.
 
     --fix-movie-player
         Opt in to the newer MPMoviePlayerController lifecycle and fullscreen

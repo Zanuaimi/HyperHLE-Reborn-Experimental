@@ -436,7 +436,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let should = msg![env; vc shouldAutorotateToInterfaceOrientation:orientation];
         log_dbg!("[{:?} shouldAutorotateToInterfaceOrientation:{:?}] => {:?}", vc, orientation, should);
         if should
-            && crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS")
+            && env.options.landscape_uiscreen_bounds_enabled()
             && env.options.present_rotate == Some(0)
         {
             // The app is set up to report the *interface-oriented* screen size

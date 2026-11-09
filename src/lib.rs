@@ -443,17 +443,6 @@ fn run_session<T: Iterator<Item = String>>(
 
     let app_id = bundle.bundle_identifier();
 
-    // Gangstar Rio is landscape-only. Keep UIScreen's point and pixel axes
-    // aligned with the active orientation; portrait axes leave its EAGL scene
-    // occupying only a small portion of the display.
-    if app_id == "com.gameloft.gangstar3"
-        && std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_none()
-    {
-        unsafe {
-            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
-        }
-    }
-
     // ULTRAHLE_MINIONJUMP_SCREEN_BEGIN
     // Minion Jump / SheepEscape needs the iPad landscape identity/profile.
     unsafe {
@@ -511,13 +500,11 @@ fn run_session<T: Iterator<Item = String>>(
     }
     // ULTRAHLE_POTATO_LANDSCAPE_END
 
-    // Mutant Fridge: the game is a landscape-only Cocos2d build. Report
-    // landscape UIScreen bounds and force the 480x320 landscape viewport so the
-    // menu and gameplay layers are laid out the way they are on a real device.
+    // Mutant Fridge: its options profile reports landscape UIScreen bounds; this
+    // also forces the 480x320 Cocos viewport used by the game on a real device.
     if app_id == "com.turner.mfm" {
         log!("Applying Mutant Fridge landscape screen and Cocos compatibility profile.");
         unsafe {
-            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
             std::env::set_var("TOUCHHLE_FORCE_LANDSCAPE_VIEWPORT", "1");
             std::env::set_var("TOUCHHLE_COCOS_TOUCH_REMAP", "1");
             std::env::set_var("TOUCHHLE_COCOS_TOUCH_MODE", "identity");
@@ -658,13 +645,9 @@ fn run_session<T: Iterator<Item = String>>(
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
     }
-    // Options that tweak the emulated device profile work by setting
-    // `TOUCHHLE_*` environment variables, and several subsystems cache those
-    // flags for the lifetime of the process. The app picker runs the same
-    // UIKit/OpenGL ES code as the app and can read them before this point
-    // (`UIScreen.bounds` reading `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS`), so make
-    // every cached flag re-read the environment now that all options for this
-    // app are known.
+    // Some options update `TOUCHHLE_*` environment flags, and the app picker
+    // may have cached them before these options were applied. Refresh caches so
+    // consumers see the final app-specific settings.
     crate::env_flags::invalidate_caches();
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
