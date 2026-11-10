@@ -1,3 +1,4 @@
+# Keep action refs pinned to full commit SHAs; update deliberately.
 name: Build HyperHLE
 
 on:
@@ -26,13 +27,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Runs on trunk queue instead of cancelling each other: a cancelled run never
-  # publishes its release, so frequent pushes could otherwise hold releases
-  # back indefinitely. Queued runs start after the previous one finishes and
-  # so see any tag it published.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
+  # Queue instead of replacing pending runs. Non-trunk runs also queue rather
+  # than cancel stale CI runs; GitHub retains at most 100 pending per group.
+  queue: max
 
 jobs:
   # Intel Macs are rare and `macos-15-intel` is both the slowest runner and the
@@ -59,7 +61,7 @@ jobs:
           BUILD_MACOS_X86_64: ${{ inputs.build_macos_x86_64 || 'false' }}
         run: |
           set -eu
-          arm='{"target":"aarch64-apple-darwin","runner":"macos-15","artifact":"HyperHLE_macOS_AArch64"}'
+          arm='{"target":"aarch64-apple-darwin","runner":"macos-latest","artifact":"HyperHLE_macOS_AArch64"}'
           intel='{"target":"x86_64-apple-darwin","runner":"macos-15-intel","artifact":"HyperHLE_macOS_x86_64"}'
           if [ "${BUILD_MACOS_X86_64:-false}" = "true" ]; then
             echo "build_x86_64=true" >> "$GITHUB_OUTPUT"
@@ -79,13 +81,13 @@ jobs:
       # The `cmake` crate runs `cmake --build` without `--parallel`, and CMake
       # picks its platform default generator (Unix Makefiles here), so the
       # vendored SDL2, OpenAL Soft, libxml2 and Dynarmic trees were compiled
-      # one source file at a time on a 4-core runner. CMake's `--build`
+      # one source file at a time on the hosted runner. CMake's `--build`
       # honours this variable, so this single line parallelises all of them
       # without touching any build script. Only matters on a cold cache.
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       # `Cargo.toml` ships `codegen-units = 1` with `lto = "fat"`, so the LTO
       # pass and the final machine-code generation run as a single unit and
-      # leave three of this runner's four cores idle for the tail of the build.
+      # leave most of the runner's cores idle for the tail of the build.
       # Partitioning the post-LTO code generation costs well under a percent of
       # runtime and buys several minutes here. Scoped to the Intel build on
       # purpose: the arm64 leg keeps the shipped `1`, so only the slower
@@ -97,7 +99,7 @@ jobs:
 
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           # The version string needs `rev-parse HEAD` and `git status`;
@@ -112,13 +114,13 @@ jobs:
       # seven jobs, and losing this key takes the `Build` step from about 13
       # minutes to about 26. See dev-scripts/ci-performance-macos-x86_64.md.
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost  
         id: cache-boost  
-        uses: actions/cache@main
+        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
         with:  
           path: vendor/boost  
           key: boost_1_81_0_macos  
@@ -132,7 +134,7 @@ jobs:
         run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost  
 
       - name: Setup CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
         with:
           cmakeVersion: "~3.29.0"
 
@@ -150,7 +152,7 @@ jobs:
 
       - name: Upload cargo build timings
         if: ${{ always() && inputs.ci_timings }}
-        uses: actions/upload-artifact@main
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: cargo-timings-${{ matrix.target }}
           # Cargo documents `<target-dir>/cargo-timings`; a `--target` build
@@ -162,8 +164,8 @@ jobs:
           if-no-files-found: ignore
 
       - name: Create .app bundle and DMG
-        # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
-        # Actions runners with `hdiutil: create failed - Resource busy` when
+        # `hdiutil create` periodically fails on GitHub-hosted macOS arm64
+        # runners with `hdiutil: create failed - Resource busy` when
         # Spotlight (`mds`/`mds_stores`) decides to index `touchHLE-dmg-src`
         # at the same moment hdiutil tries to snapshot it, or when a stale
         # `/Volumes/touchHLE` from a previous run hasn't fully detached.
@@ -206,7 +208,7 @@ jobs:
           done
           mv touchHLE.dmg ../touchHLE_${{ matrix.target }}.dmg
           
-      - uses: actions/upload-artifact@main
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ matrix.artifact }}
           path: touchHLE_${{ matrix.target }}.dmg
@@ -224,20 +226,20 @@ jobs:
 
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           fetch-depth: 1
           fetch-tags: true
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost
         id: cache-boost
-        uses: actions/cache@main
+        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: vendor/boost
           key: boost_1_81_0_macos
@@ -251,7 +253,7 @@ jobs:
         run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
 
       - name: Setup CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
         with:
           cmakeVersion: "~3.29.0"
 
@@ -259,7 +261,7 @@ jobs:
       # touchHLE's CI. These steps were removed in 49d9d48e.
       - name: Try to get cached copy of LLVM
         id: cache-llvm
-        uses: actions/cache@main
+        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: tests/llvm
           key: llvm_12_0_0_macOS_x64
@@ -290,7 +292,7 @@ jobs:
 
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           fetch-depth: 0
@@ -324,13 +326,13 @@ jobs:
             libegl1-mesa-dev
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost
         id: cache-boost
-        uses: actions/cache@main
+        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: vendor/boost
           key: boost_1_81_0_linux
@@ -344,7 +346,7 @@ jobs:
         run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
 
       - name: Setup CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
         with:
           cmakeVersion: "~3.29.0"
 
@@ -354,7 +356,7 @@ jobs:
       - name: Create bundle
         run: cd dev-scripts && ./make-linux-bundle.sh ../target/release/touchHLE && mv touchHLE_linux_bundle/ ..
 
-      - uses: actions/upload-artifact@main
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: HyperHLE_Linux_x86_64
           path: touchHLE_linux_bundle/
@@ -364,14 +366,14 @@ jobs:
 
     steps:  
     - name: Checkout touchHLE
-      uses: actions/checkout@main
+      uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
       with:
         submodules: recursive
         fetch-depth: 0
         fetch-tags: true
 
     - name: Cache Rust build artifacts
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:
         path: |
           ~/.cargo/registry
@@ -383,7 +385,7 @@ jobs:
           
     - name: Try to get cached copy of Boost  
       id: cache-boost  
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:  
         path: vendor/boost  
         key: boost_1_81_0  
@@ -398,7 +400,7 @@ jobs:
 
     - name: Try to get cached copy of cmake  
       id: cache-cmake  
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:  
         path: vendor/cmake  
         key: cmake_3_31_6_linux  
@@ -419,7 +421,7 @@ jobs:
 
     - name: Try to get a cached copy of Gradle  
       id: cache-gradle  
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:  
         path: gradle  
         key: gradle-8.11.1  
@@ -434,7 +436,7 @@ jobs:
 
     - name: Try to get a cached copy of Android NDK  
       id: cache-android-ndk  
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:  
         path: android-ndk  
         key: android-ndk-r25c  
@@ -454,51 +456,79 @@ jobs:
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
 
     - name: Set up JDK 17  
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
       with:
         distribution: temurin
         java-version: '17'
 
-    - name: Build for Android  
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk  
-      env:  
-        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
-        HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
-        HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
-        ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'  
-        CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake  
-
-    - name: Apply APK v3 key-rotation lineage (if configured)
+    - name: Build Android APK without release credentials
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk
       env:
-        HYPERHLE_KEY_LINEAGE_B64: ${{ secrets.HYPERHLE_KEY_LINEAGE_B64 }}
-        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
-        HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
-        HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
-      run: |
-        set -euo pipefail
-        if [ -z "${HYPERHLE_KEY_LINEAGE_B64:-}" ] || [ -z "${HYPERHLE_KEYSTORE_B64:-}" ]; then
-          exit 0
-        fi
-        APKSIGNER="$(ls -1 "$ANDROID_SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -n1)"
-        KS_TMP="$(mktemp --suffix=.keystore)"
-        LIN_TMP="$(mktemp --suffix=.lineage)"
-        trap 'rm -f "$KS_TMP" "$LIN_TMP"' EXIT
-        printf '%s' "$HYPERHLE_KEYSTORE_B64" | base64 -d > "$KS_TMP"
-        printf '%s' "$HYPERHLE_KEY_LINEAGE_B64" | base64 -d > "$LIN_TMP"
-        "$APKSIGNER" sign \
-          --ks "$KS_TMP" \
-          --ks-key-alias "${HYPERHLE_KEY_ALIAS:-hyperhle}" \
-          --ks-pass env:HYPERHLE_KEYSTORE_PASSWORD \
-          --v1-signing-enabled true \
-          --v2-signing-enabled true \
-          --v3-signing-enabled true \
-          --lineage "$LIN_TMP" \
-          HyperHLE-Reborn.apk
+        ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
+        CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
 
-    - uses: actions/upload-artifact@main
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:  
-        name: HyperHLE_Android_AArch64  
+        name: HyperHLE_Android_AArch64_build
         path: HyperHLE-Reborn.apk
+
+  sign-android-release:
+    needs: [build-android]
+    if: github.ref == 'refs/heads/trunk' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    # Repository-level signing secrets are used only on trusted trunk runs.
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: HyperHLE_Android_AArch64_build
+          path: android-artifact
+      - name: Sign Android APK for release
+        env:
+          HYPERHLE_KEY_LINEAGE_B64: ${{ secrets.HYPERHLE_KEY_LINEAGE_B64 }}
+          HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
+          HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
+          HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          mv android-artifact/HyperHLE-Reborn.apk HyperHLE-Reborn.apk
+          if [ -z "${HYPERHLE_KEYSTORE_B64:-}" ]; then
+            echo "No repository release keystore configured; keeping the APK's existing signature."
+            exit 0
+          fi
+          export HYPERHLE_KEYSTORE_PASSWORD="${HYPERHLE_KEYSTORE_PASSWORD:-hyperhle}"
+          APKSIGNER="$(ls -1 "$ANDROID_SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -n1)"
+          KS_TMP="$(mktemp --suffix=.keystore)"
+          LIN_TMP=""
+          cleanup() {
+            rm -f "$KS_TMP"
+            if [ -n "$LIN_TMP" ]; then rm -f "$LIN_TMP"; fi
+          }
+          trap cleanup EXIT
+          printf '%s' "$HYPERHLE_KEYSTORE_B64" | base64 -d > "$KS_TMP"
+          SIGN_ARGS=(sign
+            --ks "$KS_TMP"
+            --ks-key-alias "${HYPERHLE_KEY_ALIAS:-hyperhle}"
+            --ks-pass env:HYPERHLE_KEYSTORE_PASSWORD
+            --v1-signing-enabled true
+            --v2-signing-enabled true
+            --v3-signing-enabled true)
+          if [ -n "${HYPERHLE_KEY_LINEAGE_B64:-}" ]; then
+            LIN_TMP="$(mktemp --suffix=.lineage)"
+            printf '%s' "$HYPERHLE_KEY_LINEAGE_B64" | base64 -d > "$LIN_TMP"
+            SIGN_ARGS+=(--lineage "$LIN_TMP")
+          fi
+          "$APKSIGNER" "${SIGN_ARGS[@]}" HyperHLE-Reborn.apk
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: HyperHLE_Android_AArch64
+          path: HyperHLE-Reborn.apk
 
   build-ios:
     # The iOS app (platform/ios) and its packaging come from Applesauce
@@ -506,8 +536,8 @@ jobs:
     # unsigned/fakesigned IPAs it ships and uploads each one on its own.
     #
     # It waits for check-hyperhle-release only to learn the version a release
-    # build will be tagged with; that job is skipped outside trunk pushes and
-    # manual runs, and the iOS build runs regardless.
+    # build will be tagged with; that job is skipped for PRs and manual runs
+    # off trunk, while the iOS build runs regardless.
     needs: [check-hyperhle-release]
     if: ${{ !cancelled() }}
     runs-on: macos-latest
@@ -522,7 +552,7 @@ jobs:
 
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           # Full history and tags: the app version comes from the latest
@@ -547,14 +577,14 @@ jobs:
         run: rustup target add aarch64-apple-ios
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: ". -> build/rust-ios-native"
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost
         id: cache-boost
-        uses: actions/cache@main
+        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: vendor/boost
           key: boost_1_81_0_macos
@@ -568,7 +598,7 @@ jobs:
         run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
 
       - name: Setup CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
         with:
           cmakeVersion: "~3.29.0"
 
@@ -593,17 +623,17 @@ jobs:
           sh platform/ios/scripts/verify-ipa.sh --trollstore-permanent-jit dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
 
       # Each IPA is uploaded as-is rather than wrapped in a zip.
-      - uses: actions/upload-artifact@main
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           path: dist/HyperHLE-iOS-unsigned.ipa
           archive: false
 
-      - uses: actions/upload-artifact@main
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           path: dist/HyperHLE-iOS-trollstore.ipa
           archive: false
 
-      - uses: actions/upload-artifact@main
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           path: dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
           archive: false
@@ -625,18 +655,18 @@ jobs:
 
     steps:
     - name: Checkout touchHLE
-      uses: actions/checkout@main
+      uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
       with:
         submodules: recursive
         
     - name: Cache Rust build artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
     - name: Try to get cached copy of Boost  
       id: cache-boost  
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:  
         path: vendor\boost  
         key: boost_1_81_0  
@@ -650,7 +680,7 @@ jobs:
       run: 7z -ovendor x boost_1_81_0.7z && ren vendor\boost_1_81_0 boost  
 
     - name: Setup CMake
-      uses: lukka/get-cmake@latest
+      uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
       with:
         cmakeVersion: "~3.29.0"
 
@@ -661,7 +691,7 @@ jobs:
       shell: bash  
       run: cd dev-scripts && ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..  
       
-    - uses: actions/upload-artifact@main
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: HyperHLE_Windows_x86_64
         path: touchHLE_windows_bundle/
@@ -694,7 +724,7 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     # Uploaded as-is rather than wrapped in a zip.
-    - uses: actions/upload-artifact@main
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         path: HyperHLE_Windows_x86_64_Setup.exe
         archive: false
@@ -702,8 +732,8 @@ jobs:
   check-hyperhle-release:
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/trunk') ||
-      github.event_name == 'workflow_dispatch'
+      github.ref == 'refs/heads/trunk' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       version: ${{ steps.check.outputs.version }}
@@ -711,7 +741,7 @@ jobs:
       changelog_limit: ${{ steps.check.outputs.changelog_limit }}
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -722,8 +752,9 @@ jobs:
         run: ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
-    needs: [check-hyperhle-release, plan-macos, build-osx, test-macos, build-linux, build-android, build-win, build-ios]
+    needs: [check-hyperhle-release, plan-macos, build-osx, test-macos, build-linux, build-android, sign-android-release, build-win, build-ios]
     if: >-
+      github.ref == 'refs/heads/trunk' &&
       needs.check-hyperhle-release.result == 'success' &&
       needs.check-hyperhle-release.outputs.should_release == 'true' &&
       needs.plan-macos.result == 'success' &&
@@ -731,6 +762,7 @@ jobs:
       needs.test-macos.result == 'success' &&
       needs.build-linux.result == 'success' &&
       needs.build-android.result == 'success' &&
+      needs.sign-android-release.result == 'success' &&
       needs.build-win.result == 'success' &&
       needs.build-ios.result == 'success'
     runs-on: ubuntu-latest
@@ -738,7 +770,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           fetch-depth: 0
@@ -747,7 +779,7 @@ jobs:
       # script leaves the zip out rather than failing.
       - name: Download macOS Intel artifact
         if: ${{ needs.plan-macos.outputs.build_x86_64 == 'true' }}
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE_macOS_x86_64
           path: artifacts/macos-x86_64
@@ -759,44 +791,44 @@ jobs:
           echo "::warning::no macOS Intel (x86_64) DMG in this release; start a run with 'Build the macOS Intel (x86_64) DMG too' ticked if it is needed"
 
       - name: Download macOS Apple Silicon artifact
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE_macOS_AArch64
           path: artifacts/macos-aarch64
       - name: Download Android artifact
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE_Android_AArch64
           path: artifacts/android
       - name: Download Windows artifact
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE_Windows_x86_64
           path: artifacts/windows
       - name: Download Windows installer
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE_Windows_x86_64_Setup.exe
           path: artifacts/windows-installer
       - name: Download Linux artifact
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE_Linux_x86_64
           path: artifacts/linux
       # Unzipped artifacts (upload-artifact archive: false) are documented to
       # download by their exact file name, so fetch each IPA by name.
       - name: Download iOS unsigned IPA
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE-iOS-unsigned.ipa
           path: artifacts/ios
       - name: Download iOS TrollStore IPA
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE-iOS-trollstore.ipa
           path: artifacts/ios
       - name: Download iOS TrollStore permanent-JIT IPA
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: HyperHLE-iOS-trollstore-permanent-jit.ipa
           path: artifacts/ios
@@ -813,7 +845,7 @@ jobs:
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
         run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
       - name: Publish HyperHLE release
-        uses: softprops/action-gh-release@master
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
           # Tag the commit that was built, not whatever trunk points at by now.
