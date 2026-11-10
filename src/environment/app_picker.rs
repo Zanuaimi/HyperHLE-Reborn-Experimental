@@ -435,6 +435,7 @@ struct AppPickerDelegateHostObject {
     network: Option<bool>,
     game_center_authenticated: Option<bool>,
     show_fps: Option<bool>,
+    trace_gl_errors: Option<bool>,
     overlay_mode: Option<PerformanceOverlayMode>,
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
@@ -485,6 +486,7 @@ struct PickerSettings {
     show_lock_screen: bool,
     force_composition: bool,
     show_fps: bool,
+    trace_gl_errors: bool,
     overlay_mode: PerformanceOverlayMode,
     overlay_corner: PerformanceOverlayCorner,
     /// `None` leaves these compatibility fixes to the command line and the
@@ -715,6 +717,7 @@ impl PickerSettings {
             show_lock_screen: true,
             force_composition: options.force_composition,
             show_fps: options.performance_overlay_enabled,
+            trace_gl_errors: options.trace_gl_errors,
             overlay_mode: options.performance_overlay_mode.for_current_platform(),
             overlay_corner: options.performance_overlay_corner,
             // A flag passed on the command line is already an explicit choice;
@@ -766,6 +769,7 @@ impl PickerSettings {
                 "show_lock_screen" => set_bool(value, &mut settings.show_lock_screen),
                 "force_composition" => set_bool(value, &mut settings.force_composition),
                 "show_fps" => set_bool(value, &mut settings.show_fps),
+                "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
                 "overlay_mode" => {
                     if let Some(mode) = PerformanceOverlayMode::from_short_name(value) {
                         settings.overlay_mode = mode;
@@ -836,6 +840,7 @@ impl PickerSettings {
              show_lock_screen={}\n\
              force_composition={}\n\
              show_fps={}\n\
+             trace_gl_errors={}\n\
              overlay_mode={}\n\
              overlay_corner={}\n\
              rotation_fix={}\n\
@@ -858,6 +863,7 @@ impl PickerSettings {
             self.show_lock_screen,
             self.force_composition,
             self.show_fps,
+            self.trace_gl_errors,
             self.overlay_mode.short_name(),
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
@@ -1105,6 +1111,12 @@ const CLASSES: ClassExports = objc_classes! {
 - (())gameCenterAuthenticated:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_authenticated = Some(switch_state);
+}
+- (())traceGLErrors:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .trace_gl_errors = Some(switch_state);
 }
 - (())rotationFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1512,6 +1524,7 @@ fn app_picker_inner(
     let mut quick_options_analog_stick_tilt_controls = picker_settings.analog_stick_tilt_controls;
     let mut quick_options_network = picker_settings.network;
     let mut quick_options_show_fps = initial_quick_options_show_fps;
+    let mut quick_options_trace_gl_errors = picker_settings.trace_gl_errors;
     let mut quick_options_overlay_mode = picker_settings.overlay_mode;
     let mut quick_options_overlay_corner = picker_settings.overlay_corner;
     let mut quick_options_rotation_fix = picker_settings.rotation_fix;
@@ -2109,6 +2122,9 @@ fn app_picker_inner(
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
             picker_settings.show_fps = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_errors) {
+            quick_options_trace_gl_errors = enabled;
+            picker_settings.trace_gl_errors = enabled;
         } else if let Some(mode) = std::mem::take(&mut host_obj.overlay_mode) {
             quick_options_overlay_mode = mode;
             update_performance_overlay_buttons(
@@ -2250,6 +2266,7 @@ fn app_picker_inner(
         picker_settings.gles2_mode = quick_options_gles2_mode;
         picker_settings.cheat_engine = quick_options_cheat_engine;
         picker_settings.network = quick_options_network;
+        picker_settings.trace_gl_errors = quick_options_trace_gl_errors;
         picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
         picker_settings.device_model_tag = device_state.selected;
         picker_settings.language_tag = language_state.selected;
@@ -2325,6 +2342,10 @@ fn app_picker_inner(
         option_args.push("--no-network-access".to_string());
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
+    // The saved switch must override command-line and options-file tracing.
+    option_args.push(
+        quick_options_trace_gl_errors_argument(quick_options_trace_gl_errors).to_string(),
+    );
     option_args.push(
         if picker_settings.game_center_authenticated {
             "--game-center-authenticated"
@@ -4710,6 +4731,13 @@ fn setup_settings(
             show_fps,
             true,
         ),
+        SettingsRow::Toggle(
+            "Trace GL errors",
+            "Logs where OpenGL errors occur. Diagnostic only: checking errors changes what the game receives from glGetError().",
+            "traceGLErrors:",
+            picker_settings.trace_gl_errors,
+            true,
+        ),
         SettingsRow::Segmented(
             "Display mode",
             "Choose how much performance information appears on screen. Title bar is only useful on desktop.",
@@ -5849,6 +5877,14 @@ fn quick_options_trainer_argument(enabled: bool) -> &'static str {
     }
 }
 
+fn quick_options_trace_gl_errors_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--trace-gl-errors"
+    } else {
+        "--no-trace-gl-errors"
+    }
+}
+
 fn quick_options_force_composition_argument(enabled: bool) -> &'static str {
     if enabled {
         "--force-composition"
@@ -6075,6 +6111,23 @@ mod quick_options_renderer_mode_tests {
         assert_eq!(
             quick_options_renderer_mode_argument(mode),
             "--renderer-mode=angle"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_trace_gl_errors_tests {
+    use super::*;
+
+    #[test]
+    fn switch_emits_explicit_arguments_both_ways() {
+        assert_eq!(
+            quick_options_trace_gl_errors_argument(true),
+            "--trace-gl-errors"
+        );
+        assert_eq!(
+            quick_options_trace_gl_errors_argument(false),
+            "--no-trace-gl-errors"
         );
     }
 }
