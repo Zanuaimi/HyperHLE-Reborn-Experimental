@@ -443,7 +443,7 @@ impl Default for Options {
             preferred_languages: None,
             headless: false,
             print_fps: false,
-            performance_overlay_enabled: true,
+            performance_overlay_enabled: false,
             performance_overlay_mode: if cfg!(any(target_os = "android", target_os = "ios")) {
                 PerformanceOverlayMode::Minimal
             } else {
@@ -1392,7 +1392,7 @@ mod option_parsing_tests {
     #[test]
     fn performance_overlay_options_parse_and_validate() {
         let mut options = Options::default();
-        assert!(options.performance_overlay_enabled);
+        assert!(!options.performance_overlay_enabled);
         let default_mode = if cfg!(any(target_os = "android", target_os = "ios")) {
             PerformanceOverlayMode::Minimal
         } else {

@@ -1508,6 +1508,11 @@ fn app_picker_inner(
     let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
     let overlay_hidden_by_environment = crate::gles::perf_overlay::hidden_by_environment();
     let initial_quick_options_show_fps = picker_settings.show_fps && !overlay_hidden_by_environment;
+    env.window_mut().set_performance_overlay_settings(
+        initial_quick_options_show_fps,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
+    );
     let settings = setup_settings(
         env,
         delegate,

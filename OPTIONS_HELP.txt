@@ -329,7 +329,7 @@ Other options:
         via touchHLE_options.txt or touchHLE_default_options.txt.
 
     --overlay=on|off
-        Start the performance display enabled or hidden. It is enabled by
+        Start the performance display enabled or hidden. It is disabled by
         default. The mode defaults to Title bar on desktop and Minimal on
         mobile. F1 toggles it for the current run; F2 moves the on-screen panel
         clockwise through the four corners. TOUCHHLE_OVERLAY=0 starts hidden,
