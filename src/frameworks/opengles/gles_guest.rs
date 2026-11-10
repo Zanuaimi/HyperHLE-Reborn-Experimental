@@ -73,11 +73,44 @@ fn texture_binding_pname(target: GLenum) -> Option<GLenum> {
     }
 }
 
+fn texture_binding_query_supported(is_native_es1: bool, pname: GLenum) -> bool {
+    !(is_native_es1 && pname == TEXTURE_BINDING_CUBE_MAP)
+}
+
 unsafe fn current_bound_texture(gles: &mut dyn GLES, target: GLenum) -> Option<GLuint> {
     let pname = texture_binding_pname(target)?;
+    // The guest GLES 1.1 extension list does not advertise cube maps. This
+    // bookkeeping query can enqueue GL_INVALID_ENUM on strict native ES 1.1
+    // drivers, so skip it there; the guest texture call still goes through.
+    // shortcut: omit cube-map allocation accounting on native ES 1.1 until
+    // cube-map extension support is added.
+    if !texture_binding_query_supported(gles.is_native_es1(), pname) {
+        return None;
+    }
     let mut texture = 0;
     gles.GetIntegerv(pname, &mut texture);
     GLuint::try_from(texture).ok()
+}
+
+#[cfg(test)]
+mod texture_binding_query_tests {
+    use super::{gles11, texture_binding_query_supported, TEXTURE_BINDING_CUBE_MAP};
+
+    #[test]
+    fn native_es1_skips_optional_cube_map_binding_query() {
+        assert!(!texture_binding_query_supported(
+            true,
+            TEXTURE_BINDING_CUBE_MAP
+        ));
+        assert!(texture_binding_query_supported(
+            true,
+            gles11::TEXTURE_BINDING_2D
+        ));
+        assert!(texture_binding_query_supported(
+            false,
+            TEXTURE_BINDING_CUBE_MAP
+        ));
+    }
 }
 
 fn pvrtc_subimage_matches_level(
