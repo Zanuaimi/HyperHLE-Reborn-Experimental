@@ -3418,6 +3418,7 @@ fn glTexImage2D(
     }
     let guest_pixels = pixels;
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    let parameter_target = crate::gles::util::tex_parameter_target(target);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
         let storage_size = texture_level_bytes(width, height, format, type_);
@@ -3491,7 +3492,7 @@ fn glTexImage2D(
                     "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
                 );
             }
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
         }
     })
 }
@@ -3546,6 +3547,7 @@ fn glCompressedTexImage2D(
         );
     }
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    let parameter_target = crate::gles::util::tex_parameter_target(target);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
         if let Some(texture) = bound_texture {
@@ -3653,7 +3655,7 @@ fn glCompressedTexImage2D(
                 }
             }
             if fix_filter {
-                gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
             }
             return;
         }
@@ -3698,7 +3700,7 @@ fn glCompressedTexImage2D(
                     }
                 }
                 if fix_filter {
-                    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                    gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
                 }
                 return;
             }
@@ -3781,7 +3783,7 @@ fn glCompressedTexImage2D(
         }
 
         if fix_filter {
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
         }
     })
 }
