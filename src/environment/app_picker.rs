@@ -6335,6 +6335,7 @@ fn setup_settings(
                     () = msg![env; field setText:value];
                     release(env, value);
                     () = msg![env; field setTextColor:black];
+                    () = msg![env; field setTextAlignment:UITextAlignmentCenter];
                     () = msg![env; field setBackgroundColor:manual_value_background];
                     let field_font_size: CGFloat =
                         if tag == MANUAL_CORRUPTION_SEED { 10.5 } else { 13.0 };
@@ -6351,6 +6352,8 @@ fn setup_settings(
                         }
                     )];
                     () = msg![env; field setReturnKeyType:UIReturnKeyDone];
+                    // The field's internal label otherwise starts at zero size.
+                    () = msg![env; field layoutSubviews];
                     () = msg![env; group addSubview:field];
                     manual_value_fields.push((tag, field, description_view));
                 }
