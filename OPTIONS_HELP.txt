@@ -551,10 +551,8 @@ Other options:
         (GL_INVALID_VALUE) noise can be traced back to a specific call.
         This option exists for debugging black-screen / wrong-render bugs
         and adds a glGetError() round-trip per call, so it should not be
-        left on for normal use. Diagnostic only: it is not exposed in the
-        app picker's Settings screen, so use the command line or an
-        app-specific options file. The picker no longer overrides it with
-        --no-trace-gl-errors.
+        left on for normal use. Diagnostic only. Also available as "Trace GL
+        errors" in the app picker's Settings screen.
 
         It also saves a handful of presented frames as PNG files in
         touchHLE_dumps/ beside the log (frames 0, 60, 300, 600, 1200 and
@@ -563,6 +561,16 @@ Other options:
         compared with a screenshot: a file that looks right while the screen
         does not is a presentation bug, and a file that already looks wrong
         is a rendering one.
+
+    --trace-gl-draws
+    --no-trace-gl-draws
+        Log the active texture unit's 2D binding and available shader,
+        blend/depth, and vertex-attribute state for the first 12 draws and
+        up to 128 larger draws of each kind per GL context. Use this when
+        `--trace-gl-errors` shows no errors but geometry still looks wrong.
+        Diagnostic only; logs can be large and the vertex-buffer mirror is
+        capped at 16 MiB. Also available as "Trace GL draws" in the app
+        picker's Settings screen.
 
     --fix-texture-min-filter
         Workaround for apps that rely on the default ES 1.1

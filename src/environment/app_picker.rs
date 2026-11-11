@@ -436,6 +436,7 @@ struct AppPickerDelegateHostObject {
     game_center_authenticated: Option<bool>,
     show_fps: Option<bool>,
     trace_gl_errors: Option<bool>,
+    trace_gl_draws: Option<bool>,
     overlay_mode: Option<PerformanceOverlayMode>,
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
@@ -487,6 +488,7 @@ struct PickerSettings {
     force_composition: bool,
     show_fps: bool,
     trace_gl_errors: bool,
+    trace_gl_draws: bool,
     overlay_mode: PerformanceOverlayMode,
     overlay_corner: PerformanceOverlayCorner,
     /// `None` leaves these compatibility fixes to the command line and the
@@ -718,6 +720,7 @@ impl PickerSettings {
             force_composition: options.force_composition,
             show_fps: options.performance_overlay_enabled,
             trace_gl_errors: options.trace_gl_errors,
+            trace_gl_draws: options.trace_gl_draws,
             overlay_mode: options.performance_overlay_mode.for_current_platform(),
             overlay_corner: options.performance_overlay_corner,
             // A flag passed on the command line is already an explicit choice;
@@ -770,6 +773,7 @@ impl PickerSettings {
                 "force_composition" => set_bool(value, &mut settings.force_composition),
                 "show_fps" => set_bool(value, &mut settings.show_fps),
                 "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
+                "trace_gl_draws" => set_bool(value, &mut settings.trace_gl_draws),
                 "overlay_mode" => {
                     if let Some(mode) = PerformanceOverlayMode::from_short_name(value) {
                         settings.overlay_mode = mode;
@@ -841,6 +845,7 @@ impl PickerSettings {
              force_composition={}\n\
              show_fps={}\n\
              trace_gl_errors={}\n\
+             trace_gl_draws={}\n\
              overlay_mode={}\n\
              overlay_corner={}\n\
              rotation_fix={}\n\
@@ -864,6 +869,7 @@ impl PickerSettings {
             self.force_composition,
             self.show_fps,
             self.trace_gl_errors,
+            self.trace_gl_draws,
             self.overlay_mode.short_name(),
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
@@ -1117,6 +1123,12 @@ const CLASSES: ClassExports = objc_classes! {
     env.objc
         .borrow_mut::<AppPickerDelegateHostObject>(this)
         .trace_gl_errors = Some(switch_state);
+}
+- (())traceGLDraws:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .trace_gl_draws = Some(switch_state);
 }
 - (())rotationFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1530,6 +1542,7 @@ fn app_picker_inner(
     let mut quick_options_network = picker_settings.network;
     let mut quick_options_show_fps = initial_quick_options_show_fps;
     let mut quick_options_trace_gl_errors = picker_settings.trace_gl_errors;
+    let mut quick_options_trace_gl_draws = picker_settings.trace_gl_draws;
     let mut quick_options_overlay_mode = picker_settings.overlay_mode;
     let mut quick_options_overlay_corner = picker_settings.overlay_corner;
     let mut quick_options_rotation_fix = picker_settings.rotation_fix;
@@ -2130,6 +2143,9 @@ fn app_picker_inner(
         } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_errors) {
             quick_options_trace_gl_errors = enabled;
             picker_settings.trace_gl_errors = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_draws) {
+            quick_options_trace_gl_draws = enabled;
+            picker_settings.trace_gl_draws = enabled;
         } else if let Some(mode) = std::mem::take(&mut host_obj.overlay_mode) {
             quick_options_overlay_mode = mode;
             update_performance_overlay_buttons(
@@ -2272,6 +2288,7 @@ fn app_picker_inner(
         picker_settings.cheat_engine = quick_options_cheat_engine;
         picker_settings.network = quick_options_network;
         picker_settings.trace_gl_errors = quick_options_trace_gl_errors;
+        picker_settings.trace_gl_draws = quick_options_trace_gl_draws;
         picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
         picker_settings.device_model_tag = device_state.selected;
         picker_settings.language_tag = language_state.selected;
@@ -2347,9 +2364,12 @@ fn app_picker_inner(
         option_args.push("--no-network-access".to_string());
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
-    // The saved switch must override command-line and options-file tracing.
+    // Saved diagnostic switches override command-line and options-file values.
     option_args.push(
         quick_options_trace_gl_errors_argument(quick_options_trace_gl_errors).to_string(),
+    );
+    option_args.push(
+        quick_options_trace_gl_draws_argument(quick_options_trace_gl_draws).to_string(),
     );
     option_args.push(
         if picker_settings.game_center_authenticated {
@@ -4743,6 +4763,13 @@ fn setup_settings(
             picker_settings.trace_gl_errors,
             true,
         ),
+        SettingsRow::Toggle(
+            "Trace GL draws",
+            "Logs draw state for debugging. May create large logs and cache up to 16 MiB.",
+            "traceGLDraws:",
+            picker_settings.trace_gl_draws,
+            true,
+        ),
         SettingsRow::Segmented(
             "Display mode",
             "Choose how much performance information appears on screen. Title bar is only useful on desktop.",
@@ -5890,6 +5917,14 @@ fn quick_options_trace_gl_errors_argument(enabled: bool) -> &'static str {
     }
 }
 
+fn quick_options_trace_gl_draws_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--trace-gl-draws"
+    } else {
+        "--no-trace-gl-draws"
+    }
+}
+
 fn quick_options_force_composition_argument(enabled: bool) -> &'static str {
     if enabled {
         "--force-composition"
@@ -6133,6 +6168,23 @@ mod quick_options_trace_gl_errors_tests {
         assert_eq!(
             quick_options_trace_gl_errors_argument(false),
             "--no-trace-gl-errors"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_trace_gl_draws_tests {
+    use super::*;
+
+    #[test]
+    fn switch_emits_explicit_arguments_both_ways() {
+        assert_eq!(
+            quick_options_trace_gl_draws_argument(true),
+            "--trace-gl-draws"
+        );
+        assert_eq!(
+            quick_options_trace_gl_draws_argument(false),
+            "--no-trace-gl-draws"
         );
     }
 }

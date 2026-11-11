@@ -174,6 +174,12 @@ pub(super) struct GLShadowState {
     /// Draw-call guards for generic vertex attributes are skipped entirely
     /// for the (very common) fixed-function-only apps that never use them.
     pub(super) generic_attribs_used: bool,
+    /// Per-context budgets for opt-in draw diagnostics. New contexts start
+    /// with fresh budgets so reopening an app can produce another trace.
+    pub(super) draw_arrays_trace_count: u32,
+    pub(super) draw_arrays_trace_large_count: u32,
+    pub(super) draw_elements_trace_count: u32,
+    pub(super) draw_elements_trace_large_count: u32,
     /// Programs for which the guest app explicitly bound attribute locations
     /// via `glBindAttribLocation` before linking. For these, `glLinkProgram`
     /// must not force-rebind canonical attribute names, because that would
@@ -210,6 +216,10 @@ impl Default for GLShadowState {
             fog_start: 0.0,
             fog_end: 1.0,
             generic_attribs_used: false,
+            draw_arrays_trace_count: 0,
+            draw_arrays_trace_large_count: 0,
+            draw_elements_trace_count: 0,
+            draw_elements_trace_large_count: 0,
             guest_bound_attribs: HashMap::new(),
             pvrtc_texture_levels: HashMap::new(),
             pvrtc_unallocated_levels: HashSet::new(),

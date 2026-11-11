@@ -1195,9 +1195,12 @@ fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>)
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(buffers + i)).collect();
+        let mut cache = diag_buffer_cache().lock().unwrap();
         for buffer in &deleted {
             shadow.on_buffers_deleted(*buffer);
+            cache.remove(&(shadow.resource_group_token, *buffer));
         }
+        drop(cache);
         unsafe { gles.DeleteBuffers(n, deleted.as_ptr()) };
         crate::gles::perf_overlay::delete_gl_buffers(shadow.resource_group_token, &deleted);
     })
@@ -1229,12 +1232,21 @@ fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
         gles.BindBuffer(target, buffer)
     })
 }
-/// DIAG: host-side cache of ARRAY_BUFFER contents keyed by buffer name, so
-/// TOUCHHLE_TRACE_DRAW can read actual vertex (texcoord) values at draw time.
-fn diag_buffer_cache() -> &'static std::sync::Mutex<HashMap<GLuint, Vec<u8>>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<GLuint, Vec<u8>>>> =
+// shortcut: cap diagnostic VBO cache at 16 MiB; raise if traces miss needed data.
+const DIAG_BUFFER_CACHE_ENTRIES: usize = 16;
+const DIAG_BUFFER_CACHE_BYTES: usize = 1_048_576;
+/// DIAG: cache ARRAY_BUFFER contents by resource group and name so IDs reused
+/// by independent contexts cannot produce another context's texcoords.
+fn diag_buffer_cache() -> &'static std::sync::Mutex<HashMap<(usize, GLuint), Vec<u8>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(usize, GLuint), Vec<u8>>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+fn diag_buffer_cache_has_room(entry_count: usize, already_cached: bool) -> bool {
+    already_cached || entry_count < DIAG_BUFFER_CACHE_ENTRIES
+}
+fn trace_gl_draws_enabled(env: &Environment) -> bool {
+    env.options.trace_gl_draws || crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
 }
 unsafe fn debug_log_buffer_upload(
     gles: &mut dyn GLES,
@@ -1292,18 +1304,28 @@ fn glBufferData(
     data: ConstPtr<GLvoid>,
     usage: GLenum,
 ) {
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
-        {
+        if trace_draws && target == ARRAY_BUFFER {
             let mut bound: GLint = 0;
             gles.GetIntegerv(0x8894 /*ARRAY_BUFFER_BINDING*/, &mut bound);
-            if bound > 0 && (1..=1_048_576).contains(&size) {
-                let bytes = mem.bytes_at(data.cast::<u8>(), size as GuestUSize).to_vec();
-                diag_buffer_cache().lock().unwrap().insert(bound as GLuint, bytes);
+            if bound > 0 {
+                let mut cache = diag_buffer_cache().lock().unwrap();
+                let buffer = bound as GLuint;
+                let key = (shadow.resource_group_token, buffer);
+                if !data.is_null()
+                    && (1..=DIAG_BUFFER_CACHE_BYTES as GuestGLsizeiptr).contains(&size)
+                    && diag_buffer_cache_has_room(cache.len(), cache.contains_key(&key))
+                {
+                    let bytes = mem.bytes_at(data.cast::<u8>(), size as GuestUSize).to_vec();
+                    cache.insert(key, bytes);
+                } else {
+                    cache.remove(&key);
+                }
             }
         }
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+        if trace_draws
             && target == ARRAY_BUFFER
             && !data.is_null()
             && (1..=256).contains(&size)
@@ -1362,22 +1384,30 @@ fn glBufferSubData(
     size: GuestGLsizeiptr,
     data: ConstPtr<GLvoid>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    let trace_draws = trace_gl_draws_enabled(env);
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         debug_log_buffer_upload(gles, mem, "BufferSubData", target, offset, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
-        {
+        if trace_draws && target == ARRAY_BUFFER && !data.is_null() {
             let mut bound: GLint = 0;
             gles.GetIntegerv(0x8894 /*ARRAY_BUFFER_BINDING*/, &mut bound);
             if bound > 0 && offset >= 0 && size > 0 {
                 let src = mem.bytes_at(data.cast::<u8>(), size as GuestUSize);
                 let mut cache = diag_buffer_cache().lock().unwrap();
-                let buf = cache.entry(bound as GLuint).or_default();
+                let buffer = bound as GLuint;
+                let key = (shadow.resource_group_token, buffer);
                 let start = offset as usize;
-                if let Some(end) = start.checked_add(size as usize).filter(|end| *end <= 4_194_304) {
-                    if buf.len() < end {
-                        buf.resize(end, 0);
+                let end = start
+                    .checked_add(size as usize)
+                    .filter(|end| *end <= DIAG_BUFFER_CACHE_BYTES);
+                if let Some(end) = end {
+                    if let Some(buf) = cache.get_mut(&key) {
+                        if buf.len() < end {
+                            buf.resize(end, 0);
+                        }
+                        buf[start..end].copy_from_slice(src);
                     }
-                    buf[start..end].copy_from_slice(src);
+                } else {
+                    cache.remove(&key);
                 }
             }
         }
@@ -2222,34 +2252,84 @@ unsafe fn guard_client_vertex_arrays(
     disabled
 }
 
-/// Valid primitive modes for GLES1/2 draw calls. A guest passing anything else
-/// would raise GL_INVALID_ENUM (0x500) on the host driver; we filter those
-/// draws out with a one-time warning instead of feeding the driver garbage.
-const VALID_DRAW_MODES: [GLenum; 7] = [
-    0x0000, // GL_POINTS
-    0x0001, // GL_LINES
-    0x0002, // GL_LINE_LOOP
-    0x0003, // GL_LINE_STRIP
-    0x0004, // GL_TRIANGLES
-    0x0005, // GL_TRIANGLE_STRIP
-    0x0006, // GL_TRIANGLE_FAN
-];
+// Keep the opt-in draw diagnostics bounded for long-running games.
+const DRAW_TRACE_INITIAL_LIMIT: u32 = 12;
+const DRAW_TRACE_LARGE_LIMIT: u32 = 128;
 
-fn draw_mode_is_valid(mode: GLenum) -> bool {
-    VALID_DRAW_MODES.contains(&mode)
+fn should_trace_draw(draw_index: u32, count: GLsizei, large_draw_index: Option<u32>) -> bool {
+    draw_index < DRAW_TRACE_INITIAL_LIMIT
+        || (count > DRAW_TRACE_INITIAL_LIMIT as GLsizei
+            && large_draw_index.is_some_and(|index| index < DRAW_TRACE_LARGE_LIMIT))
 }
 
-/// Warn once per (call site, bad mode) about an invalid draw mode.
-fn warn_invalid_draw_mode(what: &str, mode: GLenum) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log!(
-            "Warning: guest issued a draw call with invalid mode 0x{:x} ({}); \
-             skipping the draw instead of feeding the host driver an invalid \
-             enum (avoids GL_INVALID_ENUM spam and driver-side stalls)",
-            mode,
-            what
+fn next_draw_trace_indices(
+    draw_index: &mut u32,
+    large_draw_index: &mut u32,
+    count: GLsizei,
+) -> (u32, Option<u32>) {
+    let index = *draw_index;
+    *draw_index = index.saturating_add(1);
+    let large_index = (count > DRAW_TRACE_INITIAL_LIMIT as GLsizei).then(|| {
+        let index = *large_draw_index;
+        *large_draw_index = index.saturating_add(1);
+        index
+    });
+    (index, large_index)
+}
+
+#[cfg(test)]
+mod draw_trace_selection_tests {
+    use super::{
+        diag_buffer_cache_has_room, next_draw_trace_indices, should_trace_draw,
+        DIAG_BUFFER_CACHE_ENTRIES,
+    };
+
+    #[test]
+    fn captures_startup_and_bounded_large_draws() {
+        assert!(should_trace_draw(0, 3, None));
+        assert!(!should_trace_draw(12, 12, None));
+        assert!(should_trace_draw(12, 13, Some(0)));
+        assert!(should_trace_draw(12, 13, Some(127)));
+        assert!(!should_trace_draw(12, 13, Some(128)));
+    }
+
+    #[test]
+    fn diagnostic_buffer_cache_is_bounded_but_refreshes_existing_buffers() {
+        assert!(diag_buffer_cache_has_room(DIAG_BUFFER_CACHE_ENTRIES - 1, false));
+        assert!(!diag_buffer_cache_has_room(DIAG_BUFFER_CACHE_ENTRIES, false));
+        assert!(diag_buffer_cache_has_room(DIAG_BUFFER_CACHE_ENTRIES, true));
+    }
+
+    #[test]
+    fn draw_trace_budget_is_independent_for_each_context() {
+        let mut first_context_draws = 0;
+        let mut first_context_large_draws = 0;
+        let mut second_context_draws = 0;
+        let mut second_context_large_draws = 0;
+
+        assert_eq!(
+            next_draw_trace_indices(
+                &mut first_context_draws,
+                &mut first_context_large_draws,
+                20,
+            ),
+            (0, Some(0))
+        );
+        assert_eq!(
+            next_draw_trace_indices(
+                &mut first_context_draws,
+                &mut first_context_large_draws,
+                20,
+            ),
+            (1, Some(1))
+        );
+        assert_eq!(
+            next_draw_trace_indices(
+                &mut second_context_draws,
+                &mut second_context_large_draws,
+                20,
+            ),
+            (0, Some(0))
         );
     }
 }
@@ -2285,25 +2365,30 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
             }
         }
     }
-    if !draw_mode_is_valid(mode) {
-        warn_invalid_draw_mode("glDrawArrays", mode);
-        return;
-    }
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
-        // DIAG (TOUCHHLE_TRACE_DRAW=1): dump the vertex-attribute + texture
-        // state for the first several draws, to see whether the texcoord
-        // attribute (A1 / loc 1) is actually fed and a texture is bound.
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static DN: AtomicU32 = AtomicU32::new(0);
-            let dn = DN.fetch_add(1, Ordering::Relaxed);
-            if dn < 12 {
+        // Capture startup draws plus larger draws, which are more likely to
+        // include the model rather than only UI quads.
+        if trace_draws {
+            let native_es1 = gles.is_native_es1();
+            let (dn, large_draw_index) = next_draw_trace_indices(
+                &mut shadow.draw_arrays_trace_count,
+                &mut shadow.draw_arrays_trace_large_count,
+                count,
+            );
+            if should_trace_draw(dn, count, large_draw_index) {
                 let mut prog: GLint = 0;
-                gles.GetIntegerv(0x8B8D /*CURRENT_PROGRAM*/, &mut prog);
+                if !native_es1 {
+                    gles.GetIntegerv(0x8B8D /*CURRENT_PROGRAM*/, &mut prog);
+                }
                 let mut tex: GLint = 0;
+                let mut active_texture: GLint = 0;
+                gles.GetIntegerv(0x84E0 /*ACTIVE_TEXTURE*/, &mut active_texture);
                 gles.GetIntegerv(0x8069 /*TEXTURE_BINDING_2D*/, &mut tex);
                 let mut maxa: GLint = 0;
-                gles.GetIntegerv(0x8869 /*MAX_VERTEX_ATTRIBS*/, &mut maxa);
+                if !native_es1 {
+                    gles.GetIntegerv(0x8869 /*MAX_VERTEX_ATTRIBS*/, &mut maxa);
+                }
                 // Blend / depth / scissor state (layering suspects).
                 let blend_on = gles.IsEnabled(0x0BE2 /*BLEND*/);
                 let depth_on = gles.IsEnabled(0x0B71 /*DEPTH_TEST*/);
@@ -2320,12 +2405,14 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                 let mut minf: GLint = 0;
                 let mut magf: GLint = 0;
                 let mut wraps: GLint = 0;
-                gles.GetTexParameteriv(0x0DE1, 0x2801 /*MIN_FILTER*/, &mut minf);
-                gles.GetTexParameteriv(0x0DE1, 0x2800 /*MAG_FILTER*/, &mut magf);
-                gles.GetTexParameteriv(0x0DE1, 0x2802 /*WRAP_S*/, &mut wraps);
+                if tex != 0 {
+                    gles.GetTexParameteriv(0x0DE1, 0x2801 /*MIN_FILTER*/, &mut minf);
+                    gles.GetTexParameteriv(0x0DE1, 0x2800 /*MAG_FILTER*/, &mut magf);
+                    gles.GetTexParameteriv(0x0DE1, 0x2802 /*WRAP_S*/, &mut wraps);
+                }
                 let mut line = format!(
-                    "DRAW-DIAG #{} mode={:#x} count={} program={} tex2d={} minf={:#x} magf={:#x} wrapS={:#x} blend={} src={:#x} dst={:#x} depth={} dfunc={:#x} scissor={} vp={:?} attribs:",
-                    dn, mode, count, prog, tex, minf, magf, wraps, blend_on, bsrc, bdst, depth_on, dfunc, scissor_on, vp
+                    "DRAW-DIAG #{} mode={:#x} count={} nativeES1={} program={} activeTex={:#x} tex2d={} minf={:#x} magf={:#x} wrapS={:#x} blend={} src={:#x} dst={:#x} depth={} dfunc={:#x} scissor={} vp={:?} attribs:",
+                    dn, mode, count, native_es1, prog, active_texture, tex, minf, magf, wraps, blend_on, bsrc, bdst, depth_on, dfunc, scissor_on, vp
                 );
                 for i in 0..(maxa.clamp(0, 16) as GLuint) {
                     let mut en: GLint = 0;
@@ -2351,9 +2438,8 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                     ));
                 }
                 log!("{}", line);
-                // Read the ACTUAL texcoord values for attr #1 from the cached
-                // VBO content, for `first..first+count` vertices.
-                {
+                // Shader attribute state is unavailable to a native ES1 driver.
+                if !native_es1 {
                     let mut en: GLint = 0;
                     gles.GetVertexAttribiv(1, 0x8622, &mut en);
                     let mut vbo: GLint = 0;
@@ -2362,15 +2448,22 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                     gles.GetVertexAttribiv(1, 0x8624, &mut strd);
                     let mut p: *mut GLvoid = std::ptr::null_mut();
                     gles.GetVertexAttribPointerv(1, 0x8645, &mut p);
-                    if en != 0 && vbo > 0 {
+                    if en != 0 && vbo > 0 && first >= 0 {
                         let off = p as usize;
                         let stride = if strd > 0 { strd as usize } else { 16 };
                         let cache = diag_buffer_cache().lock().unwrap();
-                        if let Some(bytes) = cache.get(&(vbo as GLuint)) {
+                        if let Some(bytes) =
+                            cache.get(&(shadow.resource_group_token, vbo as GLuint))
+                        {
                             let mut tc = String::new();
-                            for v in 0..(count.min(6) as usize) {
-                                let base = off + (first as usize + v) * stride;
-                                if base + 8 <= bytes.len() {
+                            for v in 0..count.clamp(0, 6) as usize {
+                                let base = (first as usize)
+                                    .checked_add(v)
+                                    .and_then(|vertex| vertex.checked_mul(stride))
+                                    .and_then(|offset| off.checked_add(offset));
+                                if let Some(base) = base.filter(|base| {
+                                    base.checked_add(8).is_some_and(|end| end <= bytes.len())
+                                }) {
                                     let rd = |o: usize| {
                                         f32::from_le_bytes([
                                             bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
@@ -2589,6 +2682,73 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
     );
 }
 
+unsafe fn log_indexed_draw_trace(
+    gles: &mut dyn GLES,
+    draw_index: u32,
+    native_es1: bool,
+    mode: GLenum,
+    count: GLsizei,
+    type_: GLenum,
+    indices: ConstVoidPtr,
+) {
+    let mut active_texture: GLint = 0;
+    let mut texture: GLint = 0;
+    let mut program: GLint = 0;
+    let mut max_attributes: GLint = 0;
+    gles.GetIntegerv(0x84E0 /* GL_ACTIVE_TEXTURE */, &mut active_texture);
+    gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut texture);
+    if !native_es1 {
+        gles.GetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &mut program);
+        gles.GetIntegerv(0x8869 /* GL_MAX_VERTEX_ATTRIBS */, &mut max_attributes);
+    }
+
+    let mut min_filter: GLint = 0;
+    let mut mag_filter: GLint = 0;
+    if texture != 0 {
+        gles.GetTexParameteriv(0x0DE1 /* GL_TEXTURE_2D */, 0x2801, &mut min_filter);
+        gles.GetTexParameteriv(0x0DE1 /* GL_TEXTURE_2D */, 0x2800, &mut mag_filter);
+    }
+    let blend = gles.IsEnabled(0x0BE2 /* GL_BLEND */) != 0;
+    let depth = gles.IsEnabled(0x0B71 /* GL_DEPTH_TEST */) != 0;
+
+    let mut attributes = Vec::new();
+    for index in 0..max_attributes.clamp(0, 16) as GLuint {
+        let mut enabled: GLint = 0;
+        gles.GetVertexAttribiv(index, 0x8622 /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */, &mut enabled);
+        if enabled == 0 {
+            continue;
+        }
+        let mut size: GLint = 0;
+        let mut type_: GLint = 0;
+        let mut stride: GLint = 0;
+        let mut buffer: GLint = 0;
+        let mut pointer: *mut GLvoid = std::ptr::null_mut();
+        gles.GetVertexAttribiv(index, 0x8623 /* GL_VERTEX_ATTRIB_ARRAY_SIZE */, &mut size);
+        gles.GetVertexAttribiv(index, 0x8625 /* GL_VERTEX_ATTRIB_ARRAY_TYPE */, &mut type_);
+        gles.GetVertexAttribiv(index, 0x8624 /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */, &mut stride);
+        gles.GetVertexAttribiv(index, 0x889F /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */, &mut buffer);
+        gles.GetVertexAttribPointerv(index, 0x8645 /* GL_VERTEX_ATTRIB_ARRAY_POINTER */, &mut pointer);
+        attributes.push((index, size, type_, stride, buffer, pointer as usize));
+    }
+    log!(
+        "DRAW-ELEMENTS-DIAG #{} mode={:#x} count={} type={:#x} indices={:#x} nativeES1={} program={} activeTex={:#x} tex2d={} minf={:#x} magf={:#x} blend={} depth={} attribs={:?}",
+        draw_index,
+        mode,
+        count,
+        type_,
+        indices.to_bits(),
+        native_es1,
+        program,
+        active_texture,
+        texture,
+        min_filter,
+        mag_filter,
+        blend,
+        depth,
+        attributes,
+    );
+}
+
 fn glDrawElements(
     env: &mut Environment,
     mode: GLenum,
@@ -2626,10 +2786,7 @@ fn glDrawElements(
             }
         }
     }
-    if !draw_mode_is_valid(mode) {
-        warn_invalid_draw_mode("glDrawElements", mode);
-        return;
-    }
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         if count > 0 && indices.is_null() && !buffer_is_bound(gles, shadow, ELEMENT_ARRAY_BUFFER) {
             log_once!(
@@ -2646,6 +2803,17 @@ fn glDrawElements(
                 indices.to_bits()
             );
             log_es2_draw_state_once(gles, shadow, mem);
+        }
+        if trace_draws {
+            let native_es1 = gles.is_native_es1();
+            let (draw_index, large_draw_index) = next_draw_trace_indices(
+                &mut shadow.draw_elements_trace_count,
+                &mut shadow.draw_elements_trace_large_count,
+                count,
+            );
+            if should_trace_draw(draw_index, count, large_draw_index) {
+                log_indexed_draw_trace(gles, draw_index, native_es1, mode, count, type_, indices);
+            }
         }
         let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
         let fog_state_backup = clamp_fog_state_values(gles, shadow);
@@ -4609,6 +4777,7 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
     guest_buffer
 }
 fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
+    let trace_draws = trace_gl_draws_enabled(env);
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
     let Some(current_ctx) = env
         .framework_state
@@ -4619,6 +4788,10 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
     else {
         return gles11::FALSE;
     };
+    let resource_group_token = env
+        .objc
+        .borrow::<EAGLContextHostObject>(current_ctx)
+        .resource_group_token;
     let mapping = env
         .objc
         .borrow_mut::<EAGLContextHostObject>(current_ctx)
@@ -4662,19 +4835,22 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
             });
         }
     }
-    // DIAG: cache the unmapped buffer content so TOUCHHLE_TRACE_DRAW can read
+    // DIAG: cache the unmapped buffer content so draw tracing can read
     // texcoords at draw time (the game streams its vertex data via map/unmap,
     // not glBufferData, so it was otherwise invisible to the cache).
-    if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER {
-        let bytes = env
-            .mem
-            .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-            .to_vec();
-        if bytes.len() <= 4_194_304 {
-            diag_buffer_cache()
-                .lock()
-                .unwrap()
-                .insert(buffer_object_name, bytes);
+    if trace_draws && target == ARRAY_BUFFER {
+        let mut cache = diag_buffer_cache().lock().unwrap();
+        let key = (resource_group_token, buffer_object_name);
+        if buffer_size <= DIAG_BUFFER_CACHE_BYTES
+            && diag_buffer_cache_has_room(cache.len(), cache.contains_key(&key))
+        {
+            let bytes = env
+                .mem
+                .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
+                .to_vec();
+            cache.insert(key, bytes);
+        } else {
+            cache.remove(&key);
         }
     }
     env.mem.free(guest_buffer);
@@ -6770,8 +6946,9 @@ fn glUniform4f(
     v2: GLfloat,
     v3: GLfloat,
 ) {
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && location >= 0 {
+        if trace_draws && location >= 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);
@@ -6832,10 +7009,11 @@ fn glUniform3fv(env: &mut Environment, location: GLint, count: GLsizei, value: C
     });
 }
 fn glUniform4fv(env: &mut Environment, location: GLint, count: GLsizei, value: ConstPtr<GLfloat>) {
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let n = (count as usize) * 4;
         let ptr = mem.ptr_at(value, n.try_into().unwrap_or(0));
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && location >= 0 {
+        if trace_draws && location >= 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);

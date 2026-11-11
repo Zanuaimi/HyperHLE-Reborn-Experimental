@@ -360,6 +360,9 @@ pub struct Options {
     /// `glGetError()` clears the error queue, so guest `glGetError()` calls
     /// will see 0 instead of the real error. Diagnostic only.
     pub trace_gl_errors: bool,
+    /// Log state for the first 12 draws and up to 128 larger draws of each
+    /// kind per GL context. Diagnostic only; useful for tracing geometry.
+    pub trace_gl_draws: bool,
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
@@ -484,6 +487,7 @@ impl Default for Options {
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
             trace_gl_errors: false,
+            trace_gl_draws: false,
             verbose_gles: false,
             renderer_mode: RendererMode::Angle,
             // On Android the host GLES driver is essentially always
@@ -863,6 +867,10 @@ impl Options {
             self.trace_gl_errors = true;
         } else if arg == "--no-trace-gl-errors" {
             self.trace_gl_errors = false;
+        } else if arg == "--trace-gl-draws" {
+            self.trace_gl_draws = true;
+        } else if arg == "--no-trace-gl-draws" {
+            self.trace_gl_draws = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
         } else if let Some(value) = arg.strip_prefix("--renderer-mode=") {
@@ -1295,6 +1303,17 @@ mod option_parsing_tests {
         assert!(options.trace_gl_errors);
         options.parse_argument("--no-trace-gl-errors").unwrap();
         assert!(!options.trace_gl_errors);
+    }
+
+    #[test]
+    fn gl_draw_tracing_can_be_enabled_and_disabled() {
+        let mut options = Options::default();
+        assert!(!options.trace_gl_draws);
+
+        options.parse_argument("--trace-gl-draws").unwrap();
+        assert!(options.trace_gl_draws);
+        options.parse_argument("--no-trace-gl-draws").unwrap();
+        assert!(!options.trace_gl_draws);
     }
 
     #[test]
