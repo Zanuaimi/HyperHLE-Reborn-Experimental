@@ -4791,6 +4791,7 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
     let resource_group_token = env
         .objc
         .borrow::<EAGLContextHostObject>(current_ctx)
+        .shadow
         .resource_group_token;
     let mapping = env
         .objc

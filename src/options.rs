@@ -786,7 +786,7 @@ impl Options {
                 self.fps_limit = None;
             } else {
                 let limit: f64 = value
-                    .parse()
+                    .parse::<f64>()
                     .ok()
                     .and_then(|v| (v.is_finite() && v > 0.0).then_some(v))
                     .ok_or_else(|| "Invalid value for --fps-limit=".to_string())?;
