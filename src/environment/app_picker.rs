@@ -27,6 +27,9 @@ use crate::frameworks::uikit::ui_gesture_recognizer::{
     UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
 };
 use crate::frameworks::uikit::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
+use crate::frameworks::uikit::ui_keyboard::{
+    UIKeyboardTypeDefault, UIKeyboardTypeNumbersAndPunctuation, UIReturnKeyDone,
+};
 use crate::frameworks::uikit::ui_view::ui_control::ui_button::UIButtonTypeCustom;
 use crate::frameworks::uikit::ui_view::ui_control::{
     UIControlEventTouchCancel, UIControlEventTouchDown, UIControlEventTouchDragExit,
@@ -37,13 +40,15 @@ use crate::fs::BundleData;
 use crate::image::Image;
 use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
-use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode, RendererMode};
+use crate::options::{
+    Button, Options, PerformanceOverlayCorner, PerformanceOverlayMode, PresentMode, RendererMode,
+    VsyncMode,
+};
 use crate::paths;
-use crate::window::DeviceOrientation;
+use crate::window::{DeviceFamily, DeviceOrientation};
 use crate::Environment;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
-use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicI8, Ordering};
@@ -90,50 +95,6 @@ fn remember_last_app_path(path: &Path) {
     if let Err(error) = std::fs::write(last_app_record_path(), path.to_string_lossy().as_bytes()) {
         log!("Warning: couldn't save last launched app path: {error}");
     }
-}
-
-fn inspect_profile_corruption_options(
-    built_in: &mut (impl Read + std::io::Seek),
-    user: &mut (impl Read + std::io::Seek),
-    app_id: &str,
-) -> (Option<bool>, bool, bool) {
-    let built_in = crate::options::get_options_from_file(built_in, app_id);
-    let user = crate::options::get_options_from_file(user, app_id);
-    crate::options::profile_corruption_settings_from_results([built_in, user])
-}
-
-fn profile_corruption_mode_for_app_id(
-    app_id: &str,
-    built_in: Result<Option<String>, String>,
-    user: Result<Option<String>, String>,
-) -> (Option<bool>, bool, bool) {
-    if app_id.is_empty() {
-        return (None, false, true);
-    }
-    crate::options::profile_corruption_settings_from_results([built_in, user])
-}
-
-fn inspect_app_profile_corruption_options(app_id: &str) -> (Option<bool>, bool, bool) {
-    if app_id.is_empty() {
-        log!("Warning: Couldn't inspect app corruption settings without a bundle identifier");
-        return (None, false, true);
-    }
-    let built_in_path = paths::default_options_file();
-    let built_in = paths::ResourceFile::open(&built_in_path)
-        .map_err(|error| format!("{}: {error}", built_in_path))
-        .and_then(|mut file| crate::options::get_options_from_file(file.get(), app_id));
-
-    let user_path = paths::user_data_base_path().join(paths::USER_OPTIONS_FILE);
-    let user = std::fs::File::open(&user_path)
-        .map_err(|error| format!("{}: {error}", user_path.display()))
-        .and_then(|mut file| crate::options::get_options_from_file(&mut file, app_id));
-
-    for result in [&built_in, &user] {
-        if let Err(error) = result {
-            log!("Warning: Couldn't inspect app corruption settings: {error}");
-        }
-    }
-    profile_corruption_mode_for_app_id(app_id, built_in, user)
 }
 
 pub fn app_picker(
@@ -437,6 +398,14 @@ struct AppPickerDelegateHostObject {
     show_fps: Option<bool>,
     trace_gl_errors: Option<bool>,
     trace_gl_draws: Option<bool>,
+    vsync: Option<VsyncMode>,
+    present_mode: Option<PresentMode>,
+    fix_texture_min_filter: Option<Option<bool>>,
+    present_rotate: Option<Option<u32>>,
+    print_fps: Option<bool>,
+    popup_errors: Option<bool>,
+    controller_to_touch: Option<Option<bool>>,
+    manual_value: Option<(NSInteger, String)>,
     overlay_mode: Option<PerformanceOverlayMode>,
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
@@ -489,6 +458,25 @@ struct PickerSettings {
     show_fps: bool,
     trace_gl_errors: bool,
     trace_gl_draws: bool,
+    vsync: VsyncMode,
+    present_mode: PresentMode,
+    fix_texture_min_filter: Option<bool>,
+    present_rotate: Option<u32>,
+    print_fps: bool,
+    popup_errors: bool,
+    deadzone: f32,
+    x_tilt_range: f32,
+    y_tilt_range: f32,
+    x_tilt_offset: f32,
+    y_tilt_offset: f32,
+    /// `None` lets per-app option profiles provide controller mappings.
+    controller_to_touch: Option<bool>,
+    /// Manual fields only override profiles after the user commits an edit.
+    manual_value_overrides: BTreeSet<NSInteger>,
+    button_to_touch: HashMap<Button, (f32, f32)>,
+    dpad_to_touch: Option<(f32, f32, f32, f32)>,
+    stick_to_touch: Option<(f32, f32, f32, f32)>,
+    fps_limit: Option<f64>,
     overlay_mode: PerformanceOverlayMode,
     overlay_corner: PerformanceOverlayCorner,
     /// `None` leaves these compatibility fixes to the command line and the
@@ -500,6 +488,9 @@ struct PickerSettings {
     corruption_mode: CorruptionMode,
     corruption_startup_delay: StartupDelayPreset,
     corruption_cooldown: CooldownPreset,
+    corruption_bytes_per_burst: u32,
+    corruption_max_offset: Option<u32>,
+    corruption_seed: u64,
     gles2_mode: Gles2Mode,
     cheat_engine: bool,
     network: bool,
@@ -708,37 +699,7 @@ fn saved_renderer_mode(contents: &str) -> Option<RendererMode> {
 
 impl PickerSettings {
     fn load(options: &Options, angle_backend_available: bool) -> Self {
-        let (renderer_mode, _) =
-            quick_options_renderer_mode_state(options.renderer_mode, angle_backend_available);
-        let mut settings = Self {
-            scale_hack: None,
-            orientation: None,
-            fullscreen: options.fullscreen,
-            preserve_aspect_ratio: options.preserve_aspect_ratio,
-            renderer_mode,
-            show_lock_screen: true,
-            force_composition: options.force_composition,
-            show_fps: options.performance_overlay_enabled,
-            trace_gl_errors: options.trace_gl_errors,
-            trace_gl_draws: options.trace_gl_draws,
-            overlay_mode: options.performance_overlay_mode.for_current_platform(),
-            overlay_corner: options.performance_overlay_corner,
-            // A flag passed on the command line is already an explicit choice;
-            // show it as such. Without one, the fixes stay "unset" so the
-            // app-specific defaults in the options files still apply.
-            rotation_fix: options.rotation_fix.then_some(true),
-            fix_movie_player: options.fix_movie_player.then_some(true),
-            corruption_mode: CorruptionMode::Off,
-            corruption_startup_delay: StartupDelayPreset::default(),
-            corruption_cooldown: CooldownPreset::default(),
-            gles2_mode: Gles2Mode::Off,
-            cheat_engine: quick_options_trainer_enabled(options),
-            network: options.network_access,
-            game_center_authenticated: options.game_center_authenticated,
-            analog_stick_tilt_controls: options.analog_stick_tilt_controls,
-            device_model_tag: None,
-            language_tag: None,
-        };
+        let mut settings = Self::from_options(options, angle_backend_available);
         let path = paths::user_data_base_path().join(paths::PICKER_SETTINGS_FILE);
         let Ok(contents) = std::fs::read_to_string(path) else {
             return settings;
@@ -774,6 +735,90 @@ impl PickerSettings {
                 "show_fps" => set_bool(value, &mut settings.show_fps),
                 "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
                 "trace_gl_draws" => set_bool(value, &mut settings.trace_gl_draws),
+                "vsync" => {
+                    if let Ok(mode) = VsyncMode::from_short_name(value) {
+                        settings.vsync = mode;
+                    }
+                }
+                "present_mode" => {
+                    if let Ok(mode) = PresentMode::from_short_name(value) {
+                        settings.present_mode = mode;
+                    }
+                }
+                "fix_texture_min_filter" => {
+                    set_bool_override(value, &mut settings.fix_texture_min_filter)
+                }
+                "present_rotate" => {
+                    settings.present_rotate = match value {
+                        "default" => None,
+                        _ => value
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|degree| matches!(degree, 0 | 90 | 180 | 270))
+                            .or(settings.present_rotate),
+                    }
+                }
+                "print_fps" => set_bool(value, &mut settings.print_fps),
+                "popup_errors" => set_bool(value, &mut settings.popup_errors),
+                "deadzone" => {
+                    settings.deadzone = parse_clamped_f32(value, 0.0, 0.95)
+                        .unwrap_or(settings.deadzone)
+                }
+                "x_tilt_range" => {
+                    settings.x_tilt_range = parse_clamped_f32(value, -360.0, 360.0)
+                        .unwrap_or(settings.x_tilt_range)
+                }
+                "y_tilt_range" => {
+                    settings.y_tilt_range = parse_clamped_f32(value, -360.0, 360.0)
+                        .unwrap_or(settings.y_tilt_range)
+                }
+                "x_tilt_offset" => {
+                    settings.x_tilt_offset = parse_clamped_f32(value, -360.0, 360.0)
+                        .unwrap_or(settings.x_tilt_offset)
+                }
+                "y_tilt_offset" => {
+                    settings.y_tilt_offset = parse_clamped_f32(value, -360.0, 360.0)
+                        .unwrap_or(settings.y_tilt_offset)
+                }
+                "controller_to_touch" => {
+                    set_bool_override(value, &mut settings.controller_to_touch)
+                }
+                "manual_value_overrides" => {
+                    settings.manual_value_overrides = parse_manual_value_overrides(value);
+                }
+                "button_to_touch" => {
+                    if let Some(mappings) = parse_button_mappings(value) {
+                        settings.button_to_touch = mappings;
+                    }
+                }
+                "dpad_to_touch" => {
+                    if let Some(mapping) = parse_touch_region(value) {
+                        settings.dpad_to_touch = mapping;
+                    }
+                }
+                "stick_to_touch" => {
+                    if let Some(mapping) = parse_touch_region(value) {
+                        settings.stick_to_touch = mapping;
+                    }
+                }
+                "fps_limit" => {
+                    if let Some(limit) = parse_fps_limit(value) {
+                        settings.fps_limit = limit;
+                    }
+                }
+                "corruption_bytes_per_burst" => {
+                    settings.corruption_bytes_per_burst = parse_clamped_u32(value, 1, 64)
+                        .unwrap_or(settings.corruption_bytes_per_burst)
+                }
+                "corruption_max_offset" => {
+                    if let Some(max_offset) = parse_max_offset(value) {
+                        settings.corruption_max_offset = max_offset;
+                    }
+                }
+                "corruption_seed" => {
+                    settings.corruption_seed =
+                        parse_clamped_u64(value, 0, u64::MAX).unwrap_or(settings.corruption_seed)
+                }
                 "overlay_mode" => {
                     if let Some(mode) = PerformanceOverlayMode::from_short_name(value) {
                         settings.overlay_mode = mode;
@@ -822,7 +867,65 @@ impl PickerSettings {
         settings.renderer_mode =
             quick_options_renderer_mode_state(settings.renderer_mode, angle_backend_available).0;
         settings.overlay_mode = settings.overlay_mode.for_current_platform();
+        let (width, height) = picker_touch_screen_size(options, &settings);
+        clamp_touch_mappings(&mut settings, width, height);
         settings
+    }
+
+    fn from_options(options: &Options, angle_backend_available: bool) -> Self {
+        let (renderer_mode, _) =
+            quick_options_renderer_mode_state(options.renderer_mode, angle_backend_available);
+        Self {
+            scale_hack: None,
+            orientation: None,
+            fullscreen: options.fullscreen,
+            preserve_aspect_ratio: options.preserve_aspect_ratio,
+            renderer_mode,
+            show_lock_screen: true,
+            force_composition: options.force_composition,
+            show_fps: options.performance_overlay_enabled,
+            trace_gl_errors: options.trace_gl_errors,
+            trace_gl_draws: options.trace_gl_draws,
+            vsync: options.vsync,
+            present_mode: options.present_mode,
+            fix_texture_min_filter: None,
+            present_rotate: options.present_rotate,
+            print_fps: options.print_fps,
+            popup_errors: options.popup_errors,
+            deadzone: options.deadzone.clamp(0.0, 0.95),
+            x_tilt_range: options.x_tilt_range.clamp(-360.0, 360.0),
+            y_tilt_range: options.y_tilt_range.clamp(-360.0, 360.0),
+            x_tilt_offset: options.x_tilt_offset.clamp(-360.0, 360.0),
+            y_tilt_offset: options.y_tilt_offset.clamp(-360.0, 360.0),
+            controller_to_touch: None,
+            manual_value_overrides: BTreeSet::new(),
+            button_to_touch: options.button_to_touch.clone(),
+            dpad_to_touch: options.dpad_to_touch,
+            stick_to_touch: options.stick_to_touch,
+            fps_limit: options.fps_limit,
+            overlay_mode: options.performance_overlay_mode.for_current_platform(),
+            overlay_corner: options.performance_overlay_corner,
+            // An explicit CLI choice is preserved; otherwise app profiles can
+            // continue to supply their compatibility defaults at launch.
+            rotation_fix: options.rotation_fix.then_some(true),
+            fix_movie_player: options.fix_movie_player.then_some(true),
+            corruption_mode: CorruptionMode::Off,
+            corruption_startup_delay: StartupDelayPreset::default(),
+            corruption_cooldown: CooldownPreset::default(),
+            corruption_bytes_per_burst: options.corruption.bytes_per_burst.clamp(1, 64),
+            corruption_max_offset: options
+                .corruption
+                .max_offset
+                .map(|value| value.clamp(1, 1_048_576)),
+            corruption_seed: options.corruption.seed,
+            gles2_mode: Gles2Mode::Off,
+            cheat_engine: quick_options_trainer_enabled(options),
+            network: options.network_access,
+            game_center_authenticated: options.game_center_authenticated,
+            analog_stick_tilt_controls: options.analog_stick_tilt_controls,
+            device_model_tag: None,
+            language_tag: None,
+        }
     }
 
     fn save(&self) {
@@ -846,6 +949,23 @@ impl PickerSettings {
              show_fps={}\n\
              trace_gl_errors={}\n\
              trace_gl_draws={}\n\
+             vsync={}\n\
+             present_mode={}\n\
+             fix_texture_min_filter={}\n\
+             present_rotate={}\n\
+             print_fps={}\n\
+             popup_errors={}\n\
+             deadzone={}\n\
+             x_tilt_range={}\n\
+             y_tilt_range={}\n\
+             x_tilt_offset={}\n\
+             y_tilt_offset={}\n\
+             controller_to_touch={}\n\
+             manual_value_overrides={}\n\
+             button_to_touch={}\n\
+             dpad_to_touch={}\n\
+             stick_to_touch={}\n\
+             fps_limit={}\n\
              overlay_mode={}\n\
              overlay_corner={}\n\
              rotation_fix={}\n\
@@ -853,6 +973,9 @@ impl PickerSettings {
              corruption_mode={}\n\
              corruption_startup_delay={}\n\
              corruption_cooldown={}\n\
+             corruption_bytes_per_burst={}\n\
+             corruption_max_offset={}\n\
+             corruption_seed={}\n\
              gles2_mode={}\n\
              cheat_engine={}\n\
              network={}\n\
@@ -870,6 +993,27 @@ impl PickerSettings {
             self.show_fps,
             self.trace_gl_errors,
             self.trace_gl_draws,
+            vsync_short_name(self.vsync),
+            present_mode_short_name(self.present_mode),
+            optional_bool(self.fix_texture_min_filter),
+            self.present_rotate.map_or_else(|| "default".to_string(), |value| value.to_string()),
+            self.print_fps,
+            self.popup_errors,
+            self.deadzone,
+            self.x_tilt_range,
+            self.y_tilt_range,
+            self.x_tilt_offset,
+            self.y_tilt_offset,
+            optional_bool(self.controller_to_touch),
+            self.manual_value_overrides
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            format_button_mappings(&self.button_to_touch),
+            format_touch_region(self.dpad_to_touch),
+            format_touch_region(self.stick_to_touch),
+            self.fps_limit.map_or_else(|| "off".to_string(), |value| value.to_string()),
             self.overlay_mode.short_name(),
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
@@ -877,6 +1021,9 @@ impl PickerSettings {
             self.corruption_mode.short_name(),
             self.corruption_startup_delay.short_name(),
             self.corruption_cooldown.short_name(),
+            self.corruption_bytes_per_burst,
+            self.corruption_max_offset.map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
+            self.corruption_seed,
             self.gles2_mode.short_name(),
             self.cheat_engine,
             self.network,
@@ -924,6 +1071,519 @@ fn parse_optional_tag(value: &str) -> Option<i32> {
         None
     } else {
         value.parse().ok()
+    }
+}
+
+fn vsync_short_name(mode: VsyncMode) -> &'static str {
+    match mode {
+        VsyncMode::Auto => "auto",
+        VsyncMode::On => "on",
+        VsyncMode::Off => "off",
+    }
+}
+
+fn present_mode_short_name(mode: PresentMode) -> &'static str {
+    match mode {
+        PresentMode::Auto => "auto",
+        PresentMode::Direct => "direct",
+        PresentMode::Readback => "readback",
+    }
+}
+
+fn vsync_selected_index(mode: VsyncMode) -> usize {
+    match mode {
+        VsyncMode::Auto => 0,
+        VsyncMode::On => 1,
+        VsyncMode::Off => 2,
+    }
+}
+
+fn present_mode_selected_index(mode: PresentMode) -> usize {
+    match mode {
+        PresentMode::Auto => 0,
+        PresentMode::Direct => 1,
+        PresentMode::Readback => 2,
+    }
+}
+
+fn texture_filter_selected_index(value: Option<bool>) -> usize {
+    match value {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    }
+}
+
+fn present_rotate_selected_index(value: Option<u32>) -> usize {
+    match value {
+        None => 0,
+        Some(0) => 1,
+        Some(90) => 2,
+        Some(180) => 3,
+        Some(270) => 4,
+        Some(_) => 0,
+    }
+}
+
+fn controller_to_touch_selected_index(value: Option<bool>) -> usize {
+    match value {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    }
+}
+
+fn parse_button(value: &str) -> Option<Button> {
+    match value.trim() {
+        "DPadLeft" => Some(Button::DPadLeft),
+        "DPadUp" => Some(Button::DPadUp),
+        "DPadRight" => Some(Button::DPadRight),
+        "DPadDown" => Some(Button::DPadDown),
+        "Start" => Some(Button::Start),
+        "A" => Some(Button::A),
+        "B" => Some(Button::B),
+        "X" => Some(Button::X),
+        "Y" => Some(Button::Y),
+        "LeftShoulder" => Some(Button::LeftShoulder),
+        _ => None,
+    }
+}
+
+fn button_name(button: Button) -> &'static str {
+    match button {
+        Button::DPadLeft => "DPadLeft",
+        Button::DPadUp => "DPadUp",
+        Button::DPadRight => "DPadRight",
+        Button::DPadDown => "DPadDown",
+        Button::Start => "Start",
+        Button::A => "A",
+        Button::B => "B",
+        Button::X => "X",
+        Button::Y => "Y",
+        Button::LeftShoulder => "LeftShoulder",
+    }
+}
+
+const CONTROLLER_BUTTONS: [Button; 10] = [
+    Button::DPadLeft,
+    Button::DPadUp,
+    Button::DPadRight,
+    Button::DPadDown,
+    Button::Start,
+    Button::A,
+    Button::B,
+    Button::X,
+    Button::Y,
+    Button::LeftShoulder,
+];
+
+fn format_button_mappings(mappings: &HashMap<Button, (f32, f32)>) -> String {
+    CONTROLLER_BUTTONS
+        .iter()
+        .filter_map(|button| {
+            mappings
+                .get(button)
+                .map(|(x, y)| format!("{},{x},{y}", button_name(*button)))
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn parse_button_mappings(value: &str) -> Option<HashMap<Button, (f32, f32)>> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Some(HashMap::new());
+    }
+    let mut mappings = HashMap::new();
+    for entry in value.split(';') {
+        let mut fields = entry.split(',');
+        let button = parse_button(fields.next()?)?;
+        let x = parse_finite_f32(fields.next()?)?;
+        let y = parse_finite_f32(fields.next()?)?;
+        if fields.next().is_some() {
+            return None;
+        }
+        mappings.insert(button, (x, y));
+    }
+    Some(mappings)
+}
+
+fn parse_touch_region(value: &str) -> Option<Option<(f32, f32, f32, f32)>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    let values: Vec<f32> = value
+        .split(',')
+        .map(parse_finite_f32)
+        .collect::<Option<_>>()?;
+    let [x, y, width, height]: [f32; 4] = values.try_into().ok()?;
+    Some(Some((x, y, width, height)))
+}
+
+fn format_touch_region(region: Option<(f32, f32, f32, f32)>) -> String {
+    region.map_or_else(
+        || "off".to_string(),
+        |(x, y, width, height)| format!("{x},{y},{width},{height}"),
+    )
+}
+
+fn parse_finite_f32(value: &str) -> Option<f32> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| !value.is_nan())
+        .map(|value| value.clamp(-(f32::MAX as f64), f32::MAX as f64) as f32)
+}
+
+fn parse_clamped_f32(value: &str, minimum: f32, maximum: f32) -> Option<f32> {
+    Some(parse_finite_f32(value)?.clamp(minimum, maximum))
+}
+
+fn parse_clamped_u32(value: &str, minimum: u32, maximum: u32) -> Option<u32> {
+    Some(parse_clamped_unsigned(value, u64::from(minimum), u64::from(maximum))? as u32)
+}
+
+fn parse_clamped_u64(value: &str, minimum: u64, maximum: u64) -> Option<u64> {
+    parse_clamped_unsigned(value, minimum, maximum)
+}
+
+fn parse_clamped_unsigned(value: &str, minimum: u64, maximum: u64) -> Option<u64> {
+    let value = value.trim();
+    if let Some(digits) = value.strip_prefix('-') {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        return Some(minimum);
+    }
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = digits.parse::<u128>().unwrap_or(u128::MAX);
+    Some(value.clamp(u128::from(minimum), u128::from(maximum)) as u64)
+}
+
+fn parse_fps_limit(value: &str) -> Option<Option<f64>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("unlimited") {
+        return Some(None);
+    }
+    let value = value.parse::<f64>().ok().filter(|value| !value.is_nan())?;
+    Some(Some(value.clamp(1.0, 240.0)))
+}
+
+fn parse_max_offset(value: &str) -> Option<Option<u32>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("unbounded") {
+        return Some(None);
+    }
+    Some(Some(parse_clamped_u32(value, 1, 1_048_576)?))
+}
+
+fn format_optional_float(value: Option<f64>) -> String {
+    value.map_or_else(|| "off".to_string(), |value| value.to_string())
+}
+
+fn picker_touch_screen_size(options: &Options, settings: &PickerSettings) -> (f32, f32) {
+    let family = settings
+        .device_model_tag
+        .filter(|tag| *tag != DEVICE_TAG_DEFAULT && *tag != DEVICE_TAG_AUTO)
+        .and_then(|tag| usize::try_from(tag).ok())
+        .and_then(DeviceFamily::for_tag)
+        .or(options.device_family)
+        .unwrap_or(DeviceFamily::iPhone);
+    let (mut width, mut height) = options.host_screen_size.unwrap_or_else(|| family.portrait_size());
+    let orientation = settings.orientation.unwrap_or(options.initial_orientation);
+    if matches!(orientation, DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight) {
+        std::mem::swap(&mut width, &mut height);
+    }
+    (width as f32, height as f32)
+}
+
+fn clamp_touch_mappings(settings: &mut PickerSettings, width: f32, height: f32) {
+    for (x, y) in settings.button_to_touch.values_mut() {
+        *x = clamp_screen_coordinate(*x, width);
+        *y = clamp_screen_coordinate(*y, height);
+    }
+    for mapping in [&mut settings.dpad_to_touch, &mut settings.stick_to_touch] {
+        if let Some((x, y, region_width, region_height)) = mapping {
+            *x = clamp_screen_coordinate(*x, width);
+            *y = clamp_screen_coordinate(*y, height);
+            *region_width = clamp_screen_coordinate(*region_width, width - *x);
+            *region_height = clamp_screen_coordinate(*region_height, height - *y);
+        }
+    }
+}
+
+fn clamp_screen_coordinate(value: f32, maximum: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, maximum)
+    } else {
+        0.0
+    }
+}
+
+fn manual_button_tag(button: Button) -> NSInteger {
+    MANUAL_BUTTON_TOUCH_BASE
+        + CONTROLLER_BUTTONS
+            .iter()
+            .position(|candidate| *candidate == button)
+            .unwrap() as NSInteger
+}
+
+fn manual_button_for_tag(tag: NSInteger) -> Option<Button> {
+    let index = usize::try_from(tag.checked_sub(MANUAL_BUTTON_TOUCH_BASE)?).ok()?;
+    CONTROLLER_BUTTONS.get(index).copied()
+}
+
+fn is_manual_value_tag(tag: NSInteger) -> bool {
+    matches!(
+        tag,
+        MANUAL_DEADZONE
+            | MANUAL_X_TILT_RANGE
+            | MANUAL_Y_TILT_RANGE
+            | MANUAL_X_TILT_OFFSET
+            | MANUAL_Y_TILT_OFFSET
+            | MANUAL_DPAD_TOUCH
+            | MANUAL_STICK_TOUCH
+            | MANUAL_FPS_LIMIT
+            | MANUAL_CORRUPTION_INTENSITY
+            | MANUAL_CORRUPTION_MAX_OFFSET
+            | MANUAL_CORRUPTION_SEED
+    ) || manual_button_for_tag(tag).is_some()
+}
+
+fn parse_manual_value_overrides(value: &str) -> BTreeSet<NSInteger> {
+    value
+        .split(',')
+        .filter_map(|tag| tag.parse::<NSInteger>().ok())
+        .filter(|tag| is_manual_value_tag(*tag))
+        .collect()
+}
+
+fn is_controller_mapping_tag(tag: NSInteger) -> bool {
+    matches!(tag, MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH)
+        || manual_button_for_tag(tag).is_some()
+}
+
+fn manual_value_text(settings: &PickerSettings, tag: NSInteger) -> Option<String> {
+    if is_controller_mapping_tag(tag) && settings.controller_to_touch.is_none() {
+        return Some("App default".to_string());
+    }
+    if matches!(
+        tag,
+        MANUAL_X_TILT_RANGE
+            | MANUAL_Y_TILT_RANGE
+            | MANUAL_X_TILT_OFFSET
+            | MANUAL_Y_TILT_OFFSET
+    ) && !settings.manual_value_overrides.contains(&tag)
+    {
+        return Some("App default".to_string());
+    }
+    Some(match tag {
+        MANUAL_DEADZONE => settings.deadzone.to_string(),
+        MANUAL_X_TILT_RANGE => settings.x_tilt_range.to_string(),
+        MANUAL_Y_TILT_RANGE => settings.y_tilt_range.to_string(),
+        MANUAL_X_TILT_OFFSET => settings.x_tilt_offset.to_string(),
+        MANUAL_Y_TILT_OFFSET => settings.y_tilt_offset.to_string(),
+        MANUAL_DPAD_TOUCH => format_touch_region(settings.dpad_to_touch),
+        MANUAL_STICK_TOUCH => format_touch_region(settings.stick_to_touch),
+        MANUAL_FPS_LIMIT => settings
+            .fps_limit
+            .map_or_else(|| "Unlimited".to_string(), |value| value.to_string()),
+        MANUAL_CORRUPTION_INTENSITY => settings.corruption_bytes_per_burst.to_string(),
+        MANUAL_CORRUPTION_MAX_OFFSET => settings
+            .corruption_max_offset
+            .map_or_else(|| "Unbounded".to_string(), |value| value.to_string()),
+        MANUAL_CORRUPTION_SEED => settings.corruption_seed.to_string(),
+        _ => {
+            let button = manual_button_for_tag(tag)?;
+            settings.button_to_touch.get(&button).map_or_else(
+                || "off".to_string(),
+                |(x, y)| format!("{x},{y}"),
+            )
+        }
+    })
+}
+
+fn manual_value_description(tag: NSInteger, width: f32, height: f32) -> String {
+    match tag {
+        MANUAL_DEADZONE => "Default: 0.10; range: 0–0.95.".to_string(),
+        MANUAL_X_TILT_RANGE | MANUAL_Y_TILT_RANGE => {
+            "Default: 60°; range: −360° to 360°. Type App default to use profile values.".to_string()
+        }
+        MANUAL_X_TILT_OFFSET | MANUAL_Y_TILT_OFFSET => {
+            "Default: 0°; range: −360° to 360°. Type App default to use profile values.".to_string()
+        }
+        MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH => format!(
+            "Default: App default; type off or x,y,w,h; region must stay inside 0–{width:.0} × 0–{height:.0} points."
+        ),
+        MANUAL_FPS_LIMIT => "Default: 60; enter 1–240 or Unlimited.".to_string(),
+        MANUAL_CORRUPTION_INTENSITY => "Default: 8 bytes per burst; range: 1–64.".to_string(),
+        MANUAL_CORRUPTION_MAX_OFFSET => {
+            "Default: Unbounded; enter 1–1,048,576 or Unbounded.".to_string()
+        }
+        MANUAL_CORRUPTION_SEED => format!("Default: 0; range: 0–{}.", u64::MAX),
+        _ => format!(
+            "Default: App default; type off or x,y in points (x 0–{width:.0}, y 0–{height:.0})."
+        ),
+    }
+}
+
+fn apply_manual_value(
+    settings: &mut PickerSettings,
+    tag: NSInteger,
+    text: &str,
+    screen_width: f32,
+    screen_height: f32,
+) -> Option<String> {
+    if text.trim().eq_ignore_ascii_case("app default") {
+        if !is_controller_mapping_tag(tag)
+            && !matches!(
+                tag,
+                MANUAL_X_TILT_RANGE
+                    | MANUAL_Y_TILT_RANGE
+                    | MANUAL_X_TILT_OFFSET
+                    | MANUAL_Y_TILT_OFFSET
+            )
+        {
+            return None;
+        }
+        settings.manual_value_overrides.remove(&tag);
+        if is_controller_mapping_tag(tag) {
+            for button in CONTROLLER_BUTTONS {
+                settings.manual_value_overrides.remove(&manual_button_tag(button));
+            }
+            settings.manual_value_overrides.remove(&MANUAL_DPAD_TOUCH);
+            settings.manual_value_overrides.remove(&MANUAL_STICK_TOUCH);
+            settings.controller_to_touch = None;
+        }
+        return manual_value_text(settings, tag);
+    }
+    match tag {
+        MANUAL_DEADZONE => settings.deadzone = parse_clamped_f32(text, 0.0, 0.95)?,
+        MANUAL_X_TILT_RANGE => {
+            settings.x_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?
+        }
+        MANUAL_Y_TILT_RANGE => {
+            settings.y_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?
+        }
+        MANUAL_X_TILT_OFFSET => {
+            settings.x_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?
+        }
+        MANUAL_Y_TILT_OFFSET => {
+            settings.y_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?
+        }
+        MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH => {
+            let mapping = parse_touch_region(text)?;
+            let target = if tag == MANUAL_DPAD_TOUCH {
+                &mut settings.dpad_to_touch
+            } else {
+                &mut settings.stick_to_touch
+            };
+            *target = mapping;
+            clamp_touch_mappings(settings, screen_width, screen_height);
+        }
+        MANUAL_FPS_LIMIT => settings.fps_limit = parse_fps_limit(text)?,
+        MANUAL_CORRUPTION_INTENSITY => {
+            settings.corruption_bytes_per_burst = parse_clamped_u32(text, 1, 64)?
+        }
+        MANUAL_CORRUPTION_MAX_OFFSET => settings.corruption_max_offset = parse_max_offset(text)?,
+        MANUAL_CORRUPTION_SEED => {
+            settings.corruption_seed = parse_clamped_u64(text, 0, u64::MAX)?
+        }
+        _ => {
+            let button = manual_button_for_tag(tag)?;
+            let value = text.trim();
+            if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+                settings.button_to_touch.remove(&button);
+            } else {
+                let mut values = value.split(',');
+                let x = parse_finite_f32(values.next()?)?.clamp(0.0, screen_width);
+                let y = parse_finite_f32(values.next()?)?.clamp(0.0, screen_height);
+                if values.next().is_some() {
+                    return None;
+                }
+                settings.button_to_touch.insert(button, (x, y));
+            }
+        }
+    }
+    settings.manual_value_overrides.insert(tag);
+    if is_controller_mapping_tag(tag) {
+        settings.controller_to_touch = Some(true);
+    }
+    manual_value_text(settings, tag)
+}
+
+fn manual_value_row(
+    settings: &PickerSettings,
+    tag: NSInteger,
+    title: String,
+    screen_width: f32,
+    screen_height: f32,
+    enabled: bool,
+    text_keyboard: bool,
+) -> SettingsRow {
+    SettingsRow::ManualValue {
+        title,
+        description: manual_value_description(tag, screen_width, screen_height),
+        tag,
+        value: manual_value_text(settings, tag).unwrap(),
+        enabled,
+        text_keyboard,
+    }
+}
+
+fn manual_value_enabled(tag: NSInteger, settings: &PickerSettings) -> bool {
+    if tag == MANUAL_DEADZONE {
+        settings.controller_to_touch.map_or(true, |enabled| {
+            enabled && settings.stick_to_touch.is_some()
+        })
+    } else if matches!(
+        tag,
+        MANUAL_X_TILT_RANGE
+            | MANUAL_Y_TILT_RANGE
+            | MANUAL_X_TILT_OFFSET
+            | MANUAL_Y_TILT_OFFSET
+    ) {
+        settings.analog_stick_tilt_controls
+    } else if matches!(tag, MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH)
+        || manual_button_for_tag(tag).is_some()
+    {
+        settings.controller_to_touch != Some(false)
+    } else if matches!(
+        tag,
+        MANUAL_CORRUPTION_INTENSITY | MANUAL_CORRUPTION_MAX_OFFSET | MANUAL_CORRUPTION_SEED
+    ) {
+        settings.corruption_mode == CorruptionMode::Corrupt
+    } else {
+        true
+    }
+}
+
+fn refresh_manual_value_fields(
+    env: &mut Environment,
+    fields: &[(NSInteger, id, id)],
+    width: f32,
+    height: f32,
+    settings: &mut PickerSettings,
+) {
+    clamp_touch_mappings(settings, width, height);
+    for &(tag, field, description_label) in fields {
+        if let Some(value) = manual_value_text(settings, tag) {
+            let value = ns_string::from_rust_string(env, value);
+            () = msg![env; field setText:value];
+            release(env, value);
+        }
+        () = msg![env; field setEnabled:(manual_value_enabled(tag, settings))];
+        let description = ns_string::from_rust_string(
+            env,
+            manual_value_description(tag, width, height),
+        );
+        () = msg![env; description_label setText:description];
+        release(env, description);
     }
 }
 
@@ -1025,11 +1685,21 @@ const CLASSES: ClassExports = objc_classes! {
     let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
     if tag == access_prompt::FIELD_TAG {
         host.access_prompt_submit = true;
-    } else {
+    } else if !is_manual_value_tag(tag) {
         host.archive_store_search = true;
     }
     drop(host);
     let _: bool = msg![env; sender resignFirstResponder];
+}
+- (())textFieldDidEndEditing:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    if is_manual_value_tag(tag) {
+        let text: id = msg![env; sender text];
+        let value = ns_string::to_rust_string(env, text).into_owned();
+        env.objc
+            .borrow_mut::<AppPickerDelegateHostObject>(this)
+            .manual_value = Some((tag, value));
+    }
 }
 
 - (())settingsShow {
@@ -1130,6 +1800,43 @@ const CLASSES: ClassExports = objc_classes! {
         .borrow_mut::<AppPickerDelegateHostObject>(this)
         .trace_gl_draws = Some(switch_state);
 }
+- (())controllerToTouchDefault {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .controller_to_touch = Some(None);
+}
+- (())controllerToTouchOn {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .controller_to_touch = Some(Some(true));
+}
+- (())controllerToTouchOff {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .controller_to_touch = Some(Some(false));
+}
+- (())printFPS:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).print_fps = Some(switch_state);
+}
+- (())popupErrors:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).popup_errors = Some(switch_state);
+}
+- (())vsyncAuto { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).vsync = Some(VsyncMode::Auto); }
+- (())vsyncOn { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).vsync = Some(VsyncMode::On); }
+- (())vsyncOff { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).vsync = Some(VsyncMode::Off); }
+- (())presentModeAuto { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_mode = Some(PresentMode::Auto); }
+- (())presentModeDirect { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_mode = Some(PresentMode::Direct); }
+- (())presentModeReadback { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_mode = Some(PresentMode::Readback); }
+- (())textureFilterDefault { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(None); }
+- (())textureFilterOn { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(Some(true)); }
+- (())textureFilterOff { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(Some(false)); }
+- (())presentRotateDefault { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(None); }
+- (())presentRotate0 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(0)); }
+- (())presentRotate90 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(90)); }
+- (())presentRotate180 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(180)); }
+- (())presentRotate270 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(270)); }
 - (())rotationFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).rotation_fix = Some(switch_state);
@@ -1601,6 +2308,36 @@ fn app_picker_inner(
         &settings.gles2_mode_buttons,
         quick_options_gles2_mode.selected_index() as usize,
     );
+    update_segment_buttons(env, &settings.vsync_buttons, vsync_selected_index(picker_settings.vsync));
+    update_segment_buttons(
+        env,
+        &settings.present_mode_buttons,
+        present_mode_selected_index(picker_settings.present_mode),
+    );
+    update_segment_buttons(
+        env,
+        &settings.texture_filter_buttons,
+        texture_filter_selected_index(picker_settings.fix_texture_min_filter),
+    );
+    update_segment_buttons(
+        env,
+        &settings.present_rotate_buttons,
+        present_rotate_selected_index(picker_settings.present_rotate),
+    );
+    update_segment_buttons(
+        env,
+        &settings.controller_to_touch_buttons,
+        controller_to_touch_selected_index(picker_settings.controller_to_touch),
+    );
+    let (touch_screen_width, touch_screen_height) =
+        picker_touch_screen_size(&env.options, &picker_settings);
+    refresh_manual_value_fields(
+        env,
+        &settings.manual_value_fields,
+        touch_screen_width,
+        touch_screen_height,
+        &mut picker_settings,
+    );
     refresh_dropdown(
         env,
         &settings.device_dropdown,
@@ -1923,7 +2660,7 @@ fn app_picker_inner(
                 let app_id = match app_id {
                     Ok(app_id) if !app_id.is_empty() => app_id,
                     Ok(_) | Err(_) => {
-                        log!("Warning: Couldn't inspect the last app's bundle identifier; its corruption profile will not be overridden");
+                        log!("Warning: Couldn't inspect the last app's bundle identifier; some app-specific options may not be applied");
                         String::new()
                     }
                 };
@@ -1948,6 +2685,26 @@ fn app_picker_inner(
         } else if std::mem::take(&mut host_obj.settings_show) {
             show_settings_screen(env, main_run_loop, delegate, &settings);
         } else if std::mem::take(&mut host_obj.settings_hide) {
+            // Commit an active manual field before leaving Settings; otherwise
+            // tapping Done could hide the field before UIKit ends editing.
+            drop(host_obj);
+            for &(_, field, _) in &settings.manual_value_fields {
+                let _: bool = msg![env; field resignFirstResponder];
+            }
+            if let Some((tag, text)) = {
+                let mut host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                std::mem::take(&mut host_obj.manual_value)
+            } {
+                let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+                apply_manual_value(&mut picker_settings, tag, &text, width, height);
+                refresh_manual_value_fields(
+                    env,
+                    &settings.manual_value_fields,
+                    width,
+                    height,
+                    &mut picker_settings,
+                );
+            }
             if renderer_state.open {
                 renderer_state.open = false;
                 refresh_dropdown(
@@ -1993,40 +2750,85 @@ fn app_picker_inner(
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
         } else if std::mem::take(&mut host_obj.orientation_default) {
             quick_options_orientation = None;
+            picker_settings.orientation = quick_options_orientation;
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
                 quick_options_orientation,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_left) {
             quick_options_orientation = Some(DeviceOrientation::LandscapeLeft);
+            picker_settings.orientation = quick_options_orientation;
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
                 quick_options_orientation,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_right) {
             quick_options_orientation = Some(DeviceOrientation::LandscapeRight);
+            picker_settings.orientation = quick_options_orientation;
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
                 quick_options_orientation,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_portrait_upside_down) {
             quick_options_orientation = Some(DeviceOrientation::PortraitUpsideDown);
+            picker_settings.orientation = quick_options_orientation;
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
                 quick_options_orientation,
             );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
         } else if let Some(tag) = std::mem::take(&mut host_obj.device_model_tag) {
             device_state.selected = Some(tag);
+            picker_settings.device_model_tag = device_state.selected;
             device_state.open = false;
             refresh_dropdown(
                 env,
                 &settings.device_dropdown,
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.device_model_toggle) {
             device_state.open = !device_state.open;
@@ -2129,8 +2931,70 @@ fn app_picker_inner(
                     Err(e) => echo!("Couldn't delete app: {}", e),
                 }
             }
+        } else if let Some(mode) = std::mem::take(&mut host_obj.vsync) {
+            picker_settings.vsync = mode;
+            update_segment_buttons(env, &settings.vsync_buttons, vsync_selected_index(mode));
+        } else if let Some(mode) = std::mem::take(&mut host_obj.present_mode) {
+            picker_settings.present_mode = mode;
+            update_segment_buttons(
+                env,
+                &settings.present_mode_buttons,
+                present_mode_selected_index(mode),
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.fix_texture_min_filter) {
+            picker_settings.fix_texture_min_filter = value;
+            update_segment_buttons(
+                env,
+                &settings.texture_filter_buttons,
+                texture_filter_selected_index(value),
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.present_rotate) {
+            picker_settings.present_rotate = value;
+            update_segment_buttons(
+                env,
+                &settings.present_rotate_buttons,
+                present_rotate_selected_index(value),
+            );
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.print_fps) {
+            picker_settings.print_fps = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.popup_errors) {
+            picker_settings.popup_errors = enabled;
+        } else if let Some(mode) = std::mem::take(&mut host_obj.controller_to_touch) {
+            picker_settings.controller_to_touch = mode;
+            update_segment_buttons(
+                env,
+                &settings.controller_to_touch_buttons,
+                controller_to_touch_selected_index(mode),
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
+        } else if let Some((tag, text)) = std::mem::take(&mut host_obj.manual_value) {
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            apply_manual_value(&mut picker_settings, tag, &text, width, height);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
         } else if let Some(enabled) = std::mem::take(&mut host_obj.analog_stick_tilt_controls) {
             quick_options_analog_stick_tilt_controls = enabled;
+            picker_settings.analog_stick_tilt_controls = enabled;
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
             quick_options_network = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.game_center_authenticated) {
@@ -2186,6 +3050,14 @@ fn app_picker_inner(
                 quick_options_corruption_mode.selected_index() as usize,
             );
             picker_settings.corruption_mode = quick_options_corruption_mode;
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
             if picker_settings != last_saved_picker_settings {
                 picker_settings.save();
                 last_saved_picker_settings = picker_settings.clone();
@@ -2322,7 +3194,6 @@ fn app_picker_inner(
         }
     };
 
-    let profile_corruption_settings = inspect_app_profile_corruption_options(&app_id);
     // Apply user-specified overrides
     if let Some(scale_hack) = quick_options_scale_hack {
         option_args.push(format!("--scale-hack={}", scale_hack.get()));
@@ -2427,12 +3298,7 @@ fn app_picker_inner(
         option_args.push(arg);
     }
 
-    option_args.extend(quick_options_corruption_arguments(
-        quick_options_corruption_mode,
-        picker_settings.corruption_startup_delay,
-        picker_settings.corruption_cooldown,
-        profile_corruption_settings,
-    ));
+    option_args.extend(quick_options_picker_settings_arguments(&picker_settings));
     option_args.extend(quick_options_gles2_mode.arguments());
 
     // Return the environment so some parts of it can be salvaged.
@@ -4332,7 +5198,7 @@ fn make_segment_buttons(
 }
 
 /// One row of the settings screen.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SettingsRow {
     /// A title, description, and row of segment buttons.
     Segmented(
@@ -4348,6 +5214,15 @@ enum SettingsRow {
     Toggle(&'static str, &'static str, &'static str, bool, bool),
     /// Renderer mode dropdown.
     RendererDropdown(&'static str, &'static str),
+    /// A single-line value committed when its text field resigns first responder.
+    ManualValue {
+        title: String,
+        description: String,
+        tag: NSInteger,
+        value: String,
+        enabled: bool,
+        text_keyboard: bool,
+    },
 }
 
 const SETTINGS_NAV_BAR_HEIGHT: CGFloat = 44.0;
@@ -4359,63 +5234,84 @@ const SETTINGS_HEADER_HEIGHT: CGFloat = 28.0;
 const SETTINGS_SECTION_GAP: CGFloat = 10.0;
 /// Width of the dropdown lists (list plus scrollbar).
 const SETTINGS_DROPDOWN_MENU_WIDTH: CGFloat = 280.0;
+const MANUAL_DEADZONE: NSInteger = 1001;
+const MANUAL_X_TILT_RANGE: NSInteger = 1002;
+const MANUAL_Y_TILT_RANGE: NSInteger = 1003;
+const MANUAL_X_TILT_OFFSET: NSInteger = 1004;
+const MANUAL_Y_TILT_OFFSET: NSInteger = 1005;
+const MANUAL_BUTTON_TOUCH_BASE: NSInteger = 1100;
+const MANUAL_DPAD_TOUCH: NSInteger = 1007;
+const MANUAL_STICK_TOUCH: NSInteger = 1008;
+const MANUAL_FPS_LIMIT: NSInteger = 1009;
+const MANUAL_CORRUPTION_INTENSITY: NSInteger = 1010;
+const MANUAL_CORRUPTION_MAX_OFFSET: NSInteger = 1011;
+const MANUAL_CORRUPTION_SEED: NSInteger = 1012;
 
 fn settings_text_height(
     env: &mut Environment,
-    text: &'static str,
+    text: &str,
     font_size: CGFloat,
     width: CGFloat,
 ) -> CGFloat {
-    let string = ns_string::get_static_str(env, text);
+    let string = ns_string::from_rust_string(env, text.to_string());
     let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
     let size: CGSize = msg![env; string sizeWithFont:font
                                       constrainedToSize:(CGSize { width, height: CGFloat::MAX })
                                           lineBreakMode:UILineBreakModeWordWrap];
+    release(env, string);
     size.height
 }
 
 fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CGFloat) -> CGFloat {
     let side = SETTINGS_ROW_SIDE_INSET;
-    match *row {
+    match row {
         SettingsRow::Segmented(title, description, _) => {
             let text_width = inner_width - 2.0 * side;
-            8.0 + settings_text_height(env, title, 15.0, text_width)
+            8.0 + settings_text_height(env, *title, 15.0, text_width)
                 + 4.0
-                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
                 + 8.0
                 + 24.0
                 + 8.0
         }
         SettingsRow::Toggle(title, description, _, _, _) => {
             let text_width = inner_width - 2.0 * side - 94.0 - 8.0;
-            (settings_text_height(env, title, 16.0, text_width)
-                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+            (settings_text_height(env, *title, 16.0, text_width)
+                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
                 + 12.0)
                 .max(27.0)
                 + 16.0
         }
         SettingsRow::DeviceDropdown(title, description) => {
             let text_width = inner_width - 2.0 * side - 190.0 - 8.0;
-            (settings_text_height(env, title, 14.0, text_width)
-                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+            (settings_text_height(env, *title, 14.0, text_width)
+                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
                 + 12.0)
                 .max(30.0)
                 + 16.0
         }
         SettingsRow::LanguageDropdown(title, description) => {
             let text_width = inner_width - 2.0 * side - 170.0 - 8.0;
-            (settings_text_height(env, title, 16.0, text_width)
-                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+            (settings_text_height(env, *title, 16.0, text_width)
+                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
                 + 12.0)
                 .max(30.0)
                 + 16.0
         }
         SettingsRow::RendererDropdown(title, description) => {
             let text_width = inner_width - 2.0 * side - 130.0 - 8.0;
-            (settings_text_height(env, title, 14.0, text_width)
-                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+            (settings_text_height(env, *title, 14.0, text_width)
+                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
                 + 12.0)
                 .max(30.0)
+                + 16.0
+        }
+        SettingsRow::ManualValue { title, description, .. } => {
+            let text_width = inner_width - 2.0 * side - 128.0 - 12.0;
+            (settings_text_height(env, title, 15.0, text_width)
+                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + 12.0)
+            .max(42.0)
                 + 16.0
         }
     }
@@ -4444,6 +5340,12 @@ struct SettingsStuff {
     corruption_startup_delay_buttons: Vec<id>,
     corruption_cooldown_buttons: Vec<id>,
     gles2_mode_buttons: Vec<id>,
+    vsync_buttons: Vec<id>,
+    present_mode_buttons: Vec<id>,
+    texture_filter_buttons: Vec<id>,
+    present_rotate_buttons: Vec<id>,
+    controller_to_touch_buttons: Vec<id>,
+    manual_value_fields: Vec<(NSInteger, id, id)>,
     /// The "Device model" dropdown.
     device_dropdown: SettingsDropdown,
     /// The "Language" dropdown.
@@ -4570,6 +5472,8 @@ fn setup_settings(
 ) -> SettingsStuff {
     let width = app_frame.size.width;
     let height = app_frame.size.height;
+    let (manual_screen_width, manual_screen_height) =
+        picker_touch_screen_size(&env.options, picker_settings);
     // The Settings screen covers the whole window, including the status bar
     // strip above the application frame. Nothing is clipped by the emulator,
     // so scrolled content must not be able to show up in that strip.
@@ -4601,6 +5505,7 @@ fn setup_settings(
     let clear: id = msg_class![env; UIColor clearColor];
     let black: id = msg_class![env; UIColor blackColor];
     let white: id = msg_class![env; UIColor whiteColor];
+    let manual_value_background = ui_color(env, 0.94, 0.94, 0.96, 1.0);
     let gray_text = ui_color(env, 0.43, 0.43, 0.45, 1.0);
     // Navigation bar with the title and a "Done" button.
     let nav_bar_bg = ui_color(env, 0.20, 0.34, 0.52, 1.0);
@@ -4704,6 +5609,11 @@ fn setup_settings(
                 ("↓", "orientationPortraitUpsideDown"),
             ],
         ),
+        SettingsRow::Segmented(
+            "VSync",
+            "Wait for the display before showing each frame. Default: Auto (platform default).",
+            &[("Auto", "vsyncAuto"), ("On", "vsyncOn"), ("Off", "vsyncOff")],
+        ),
     ];
     if show_fullscreen_row {
         display_rows.push(SettingsRow::Toggle(
@@ -4771,6 +5681,58 @@ fn setup_settings(
             true,
         ),
         SettingsRow::Segmented(
+            "Presentation mode",
+            "Auto chooses a compatible path; Direct is faster; Readback is slower but can help broken drivers. Default: Auto.",
+            &[
+                ("Auto", "presentModeAuto"),
+                ("Direct", "presentModeDirect"),
+                ("Readback", "presentModeReadback"),
+            ],
+        ),
+        SettingsRow::Segmented(
+            "Texture min-filter fix",
+            "Overrides incomplete mipmap filtering for level-zero textures. Default: App default.",
+            &[
+                ("App default", "textureFilterDefault"),
+                ("On", "textureFilterOn"),
+                ("Off", "textureFilterOff"),
+            ],
+        ),
+        SettingsRow::Segmented(
+            "Presentation rotation",
+            "Force the displayed image rotation. Default: App default.",
+            &[
+                ("App", "presentRotateDefault"),
+                ("0°", "presentRotate0"),
+                ("90°", "presentRotate90"),
+                ("180°", "presentRotate180"),
+                ("270°", "presentRotate270"),
+            ],
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_FPS_LIMIT,
+            "FPS limit".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            true,
+            false,
+        ),
+        SettingsRow::Toggle(
+            "Log FPS to console",
+            "Prints the current frame rate once per second. Default: Off.",
+            "printFPS:",
+            picker_settings.print_fps,
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Error popups",
+            "Show error dialogs or log errors only. Default: Show.",
+            "popupErrors:",
+            picker_settings.popup_errors,
+            true,
+        ),
+        SettingsRow::Segmented(
             "Display mode",
             "Choose how much performance information appears on screen. Title bar is only useful on desktop.",
             overlay_mode_options,
@@ -4820,9 +5782,96 @@ fn setup_settings(
         ));
     }
     sections.push(("GRAPHICS", graphics_rows));
+    let mut input_rows = vec![
+        SettingsRow::Segmented(
+            "Controller to touch",
+            "Default: App profile (off unless it defines mappings). On uses the settings below; Off disables profile mappings.",
+            &[
+                ("App\ndefault", "controllerToTouchDefault"),
+                ("On", "controllerToTouchOn"),
+                ("Off", "controllerToTouchOff"),
+            ],
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_DEADZONE,
+            "Controller deadzone".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            manual_value_enabled(MANUAL_DEADZONE, picker_settings),
+            true,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_X_TILT_RANGE,
+            "Tilt X range".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_Y_TILT_RANGE,
+            "Tilt Y range".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_X_TILT_OFFSET,
+            "Tilt X offset".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_Y_TILT_OFFSET,
+            "Tilt Y offset".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+    ];
+    for button in CONTROLLER_BUTTONS {
+        input_rows.push(manual_value_row(
+            picker_settings,
+            manual_button_tag(button),
+            format!("{} touch point", button_name(button)),
+            manual_screen_width,
+            manual_screen_height,
+            manual_value_enabled(manual_button_tag(button), picker_settings),
+            false,
+        ));
+    }
+    input_rows.push(manual_value_row(
+        picker_settings,
+        MANUAL_DPAD_TOUCH,
+        "D-pad touch area".to_string(),
+        manual_screen_width,
+        manual_screen_height,
+        manual_value_enabled(MANUAL_DPAD_TOUCH, picker_settings),
+        false,
+    ));
+    input_rows.push(manual_value_row(
+        picker_settings,
+        MANUAL_STICK_TOUCH,
+        "Stick touch area".to_string(),
+        manual_screen_width,
+        manual_screen_height,
+        manual_value_enabled(MANUAL_STICK_TOUCH, picker_settings),
+        false,
+    ));
+    sections.push(("INPUT", input_rows));
     sections.push((
         "CORRUPTION",
-        vec![
+        {
+            let mut rows = vec![
             SettingsRow::Segmented(
                 "Corruption engine",
                 "Intentionally changes a few bytes in the game’s live memory. This experimental effect can cause glitches or crashes; it is off by default.",
@@ -4838,7 +5887,39 @@ fn setup_settings(
                 "Wait this long between corruption bursts while the game is running.",
                 &[("0.5s", "corruptionCooldownHalf"), ("1s", "corruptionCooldown1"), ("5s", "corruptionCooldown5"), ("10s", "corruptionCooldown10")],
             ),
-        ],
+            ];
+            let enabled = picker_settings.corruption_mode == CorruptionMode::Corrupt;
+            rows.extend([
+                manual_value_row(
+                    picker_settings,
+                    MANUAL_CORRUPTION_INTENSITY,
+                    "Bytes per burst".to_string(),
+                    manual_screen_width,
+                    manual_screen_height,
+                    enabled,
+                    true,
+                ),
+                manual_value_row(
+                    picker_settings,
+                    MANUAL_CORRUPTION_MAX_OFFSET,
+                    "Maximum allocation offset".to_string(),
+                    manual_screen_width,
+                    manual_screen_height,
+                    enabled,
+                    false,
+                ),
+                manual_value_row(
+                    picker_settings,
+                    MANUAL_CORRUPTION_SEED,
+                    "Random seed".to_string(),
+                    manual_screen_width,
+                    manual_screen_height,
+                    enabled,
+                    true,
+                ),
+            ]);
+            rows
+        },
     ));
     sections.push((
         "DEVICE",
@@ -4900,6 +5981,12 @@ fn setup_settings(
     let mut corruption_startup_delay_buttons = Vec::new();
     let mut corruption_cooldown_buttons = Vec::new();
     let mut gles2_mode_buttons = Vec::new();
+    let mut vsync_buttons = Vec::new();
+    let mut present_mode_buttons = Vec::new();
+    let mut texture_filter_buttons = Vec::new();
+    let mut present_rotate_buttons = Vec::new();
+    let mut controller_to_touch_buttons = Vec::new();
+    let mut manual_value_fields = Vec::new();
     let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
     // Where dropdown menus open: just under the navigation bar.
     let menu_origin = CGPoint {
@@ -4955,7 +6042,7 @@ fn setup_settings(
         let mut row_y: CGFloat = 0.0;
         for (index, row) in rows.iter().enumerate() {
             let row_height = row_heights[index];
-            match *row {
+            match row.clone() {
                 SettingsRow::Segmented(title, description, buttons) => {
                     let text_width = inner_width - 2.0 * side;
                     let title_height = settings_text_height(env, title, 15.0, text_width);
@@ -5004,6 +6091,13 @@ fn setup_settings(
                         }
                         "corruptionCooldownHalf" => corruption_cooldown_buttons = seg_buttons,
                         "gles2Off" => gles2_mode_buttons = seg_buttons,
+                        "vsyncAuto" => vsync_buttons = seg_buttons,
+                        "presentModeAuto" => present_mode_buttons = seg_buttons,
+                        "textureFilterDefault" => texture_filter_buttons = seg_buttons,
+                        "presentRotateDefault" => present_rotate_buttons = seg_buttons,
+                        "controllerToTouchDefault" => {
+                            controller_to_touch_buttons = seg_buttons
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -5193,6 +6287,73 @@ fn setup_settings(
                                    forControlEvents:UIControlEventValueChanged];
                     () = msg![env; group addSubview:switch];
                 }
+                SettingsRow::ManualValue {
+                    title,
+                    description,
+                    tag,
+                    value,
+                    enabled,
+                    text_keyboard,
+                } => {
+                    let field_width: CGFloat = 120.0;
+            let text_width = inner_width - 2.0 * side - field_width - 20.0;
+                    let title_height = settings_text_height(env, &title, 15.0, text_width);
+                    let description_height = settings_text_height(
+                        env,
+                        &description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        text_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, text_width, title_height),
+                        &title,
+                        15.0,
+                        black,
+                    );
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + title_height + 4.0,
+                            text_width,
+                            description_height,
+                        ),
+                        &description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
+                    let field: id = msg_class![env; UITextField alloc];
+                    let field: id = msg![env; field initWithFrame:(rect(
+                        inner_width - side - field_width,
+                        row_y + (row_height - 32.0) / 2.0,
+                        field_width,
+                        32.0,
+                    ))];
+                    let value = ns_string::from_rust_string(env, value);
+                    () = msg![env; field setText:value];
+                    release(env, value);
+                    () = msg![env; field setTextColor:black];
+                    () = msg![env; field setBackgroundColor:manual_value_background];
+                    let field_font_size: CGFloat =
+                        if tag == MANUAL_CORRUPTION_SEED { 10.5 } else { 13.0 };
+                    let field_font: id = msg_class![env; UIFont systemFontOfSize:field_font_size];
+                    () = msg![env; field setFont:field_font];
+                    () = msg![env; field setTag:tag];
+                    () = msg![env; field setDelegate:delegate];
+                    () = msg![env; field setEnabled:enabled];
+                    () = msg![env; field setKeyboardType:(
+                        if text_keyboard {
+                            UIKeyboardTypeNumbersAndPunctuation
+                        } else {
+                            UIKeyboardTypeDefault
+                        }
+                    )];
+                    () = msg![env; field setReturnKeyType:UIReturnKeyDone];
+                    () = msg![env; group addSubview:field];
+                    manual_value_fields.push((tag, field, description_view));
+                }
             }
             row_y += row_height;
             // Hairline separator between rows, inset from the left like iOS.
@@ -5240,6 +6401,12 @@ fn setup_settings(
         corruption_startup_delay_buttons,
         corruption_cooldown_buttons,
         gles2_mode_buttons,
+        vsync_buttons,
+        present_mode_buttons,
+        texture_filter_buttons,
+        present_rotate_buttons,
+        controller_to_touch_buttons,
+        manual_value_fields,
         device_dropdown: device_dropdown
             .expect("the settings screen always has a device model row"),
         language_dropdown: language_dropdown
@@ -5980,29 +7147,96 @@ fn quick_options_fix_arguments(
     args
 }
 
+fn quick_options_picker_settings_arguments(settings: &PickerSettings) -> Vec<String> {
+    let mut args = vec![
+        format!("--vsync={}", vsync_short_name(settings.vsync)),
+        format!("--present-mode={}", present_mode_short_name(settings.present_mode)),
+        if settings.print_fps {
+            "--print-fps".to_string()
+        } else {
+            "--no-print-fps".to_string()
+        },
+        if settings.popup_errors {
+            "--error-popup".to_string()
+        } else {
+            "--no-error-popup".to_string()
+        },
+    ];
+    for (tag, name, value) in [
+        (MANUAL_DEADZONE, "deadzone", settings.deadzone),
+        (MANUAL_X_TILT_RANGE, "x-tilt-range", settings.x_tilt_range),
+        (MANUAL_Y_TILT_RANGE, "y-tilt-range", settings.y_tilt_range),
+        (MANUAL_X_TILT_OFFSET, "x-tilt-offset", settings.x_tilt_offset),
+        (MANUAL_Y_TILT_OFFSET, "y-tilt-offset", settings.y_tilt_offset),
+    ] {
+        if settings.manual_value_overrides.contains(&tag) {
+            args.push(format!("--{name}={value}"));
+        }
+    }
+    if settings.manual_value_overrides.contains(&MANUAL_FPS_LIMIT) {
+        args.push(format!(
+            "--fps-limit={}",
+            format_optional_float(settings.fps_limit)
+        ));
+    }
+    if let Some(enabled) = settings.fix_texture_min_filter {
+        args.push(if enabled {
+            "--fix-texture-min-filter".to_string()
+        } else {
+            "--no-fix-texture-min-filter".to_string()
+        });
+    }
+    if let Some(degrees) = settings.present_rotate {
+        args.push(format!("--present-rotate={degrees}"));
+    }
+    if let Some(enabled) = settings.controller_to_touch {
+        args.push("--no-controller-to-touch".to_string());
+        if enabled {
+            for button in CONTROLLER_BUTTONS {
+                if let Some((x, y)) = settings.button_to_touch.get(&button) {
+                    args.push(format!("--button-to-touch={},{x},{y}", button_name(button)));
+                }
+            }
+            if let Some((x, y, width, height)) = settings.dpad_to_touch {
+                args.push(format!("--dpad-to-touch={x},{y},{width},{height}"));
+            }
+            if let Some((x, y, width, height)) = settings.stick_to_touch {
+                args.push(format!("--stick-to-touch={x},{y},{width},{height}"));
+            }
+        }
+    }
+    args.extend(quick_options_corruption_arguments(
+        settings.corruption_mode,
+        settings.corruption_startup_delay,
+        settings.corruption_cooldown,
+        settings.corruption_bytes_per_burst,
+        settings.corruption_max_offset,
+        settings.corruption_seed,
+    ));
+    args
+}
+
 fn quick_options_corruption_arguments(
     mode: CorruptionMode,
     startup_delay: StartupDelayPreset,
     cooldown: CooldownPreset,
-    profile_settings: (Option<bool>, bool, bool),
+    bytes_per_burst: u32,
+    max_offset: Option<u32>,
+    seed: u64,
 ) -> Vec<String> {
-    let (profile_mode, _, profile_load_failed) = profile_settings;
-    if profile_load_failed {
-        return Vec::new();
+    if mode == CorruptionMode::Off {
+        return vec!["--no-corrupt-game".to_string()];
     }
-    match mode {
-        CorruptionMode::Off => Vec::new(),
-        CorruptionMode::Corrupt if profile_mode.is_none() => {
-            let mut args = vec!["--corrupt-game".to_string()];
-            args.push(format!("--corrupt-start-delay={}", startup_delay.duration().as_secs_f64()));
-            args.push(format!("--corrupt-cooldown={}", cooldown.duration().as_secs_f64()));
-            args
-        }
-        CorruptionMode::Corrupt if profile_mode == Some(false) => {
-            vec!["--corrupt-game".to_string()]
-        }
-        CorruptionMode::Corrupt => Vec::new(),
-    }
+    let mut args = vec!["--corrupt-game".to_string()];
+    args.push(format!("--corrupt-intensity={bytes_per_burst}"));
+    args.push(format!("--corrupt-start-delay={}", startup_delay.duration().as_secs_f64()));
+    args.push(format!("--corrupt-cooldown={}", cooldown.duration().as_secs_f64()));
+    args.push(format!("--corrupt-seed={seed}"));
+    args.push(max_offset.map_or_else(
+        || "--no-corrupt-max-offset".to_string(),
+        |offset| format!("--corrupt-max-offset={offset}"),
+    ));
+    args
 }
 
 /// Explicit launch argument so the picker choice overrides option-file values.
@@ -6242,39 +7476,6 @@ mod quick_options_fix_tests {
     }
 
     #[test]
-    fn profile_corruption_options_are_resolved_from_built_in_then_user_file() {
-        let built_in = b"com.example.game: --corrupt-game\n";
-        let user = b"com.example.game: --device-family=iphone-4 --no-corrupt-game\n";
-        let (mode, has_settings, failed) = inspect_profile_corruption_options(
-            &mut std::io::Cursor::new(built_in),
-            &mut std::io::Cursor::new(user),
-            "com.example.game",
-        );
-        assert_eq!(mode, Some(false));
-        assert!(has_settings);
-        assert!(!failed);
-    }
-
-    #[test]
-    fn missing_bundle_identifier_suppresses_picker_corruption_override() {
-        let (mode, has_settings, failed) = profile_corruption_mode_for_app_id(
-            "",
-            Ok(Some("--no-corrupt-game".to_owned())),
-            Ok(None),
-        );
-        assert_eq!(mode, None);
-        assert!(!has_settings);
-        assert!(failed);
-        assert!(quick_options_corruption_arguments(
-            CorruptionMode::Corrupt,
-            StartupDelayPreset::default(),
-            CooldownPreset::default(),
-            (mode, has_settings, failed),
-        )
-        .is_empty());
-    }
-
-    #[test]
     fn saved_gles2_and_corruption_modes_round_trip() {
         for mode in [CorruptionMode::Off, CorruptionMode::Corrupt] {
             assert_eq!(
@@ -6292,44 +7493,53 @@ mod quick_options_fix_tests {
     }
 
     #[test]
-    fn corruption_mode_arguments_preserve_profile_defaults_and_enable_on_request() {
-        assert!(quick_options_corruption_arguments(
-            CorruptionMode::Off,
-            StartupDelayPreset::default(),
-            CooldownPreset::default(),
-            (None, false, false)
-        )
-        .is_empty());
+    fn corruption_mode_arguments_override_profiles_and_include_manual_values() {
+        assert_eq!(
+            quick_options_corruption_arguments(
+                CorruptionMode::Off,
+                StartupDelayPreset::default(),
+                CooldownPreset::default(),
+                8,
+                None,
+                0,
+            ),
+            vec!["--no-corrupt-game"]
+        );
         assert_eq!(
             quick_options_corruption_arguments(
                 CorruptionMode::Corrupt,
                 StartupDelayPreset::FiveSeconds,
                 CooldownPreset::OneSecond,
-                (None, false, false)
+                12,
+                Some(4096),
+                23,
             ),
             vec![
                 "--corrupt-game",
+                "--corrupt-intensity=12",
                 "--corrupt-start-delay=5",
-                "--corrupt-cooldown=1"
+                "--corrupt-cooldown=1",
+                "--corrupt-seed=23",
+                "--corrupt-max-offset=4096",
             ]
         );
         assert_eq!(
             quick_options_corruption_arguments(
                 CorruptionMode::Corrupt,
-                StartupDelayPreset::FiveSeconds,
-                CooldownPreset::OneSecond,
-                (Some(false), true, false)
+                StartupDelayPreset::default(),
+                CooldownPreset::default(),
+                8,
+                None,
+                0,
             ),
-            vec!["--corrupt-game"]
-        );
-        assert_eq!(
-            quick_options_corruption_arguments(
-                CorruptionMode::Corrupt,
-                StartupDelayPreset::FiveSeconds,
-                CooldownPreset::OneSecond,
-                (Some(false), true, false)
-            ),
-            vec!["--corrupt-game"]
+            vec![
+                "--corrupt-game",
+                "--corrupt-intensity=8",
+                "--corrupt-start-delay=0",
+                "--corrupt-cooldown=0.5",
+                "--corrupt-seed=0",
+                "--no-corrupt-max-offset",
+            ]
         );
     }
 
@@ -6374,6 +7584,193 @@ mod quick_options_fix_tests {
         let args = Gles2Mode::Compatibility.arguments();
         assert!(args.contains(&"--gles2-compat".to_string()));
         assert!(!args.contains(&"--prefer-gles2-context".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod manual_settings_tests {
+    use super::*;
+
+    fn settings() -> PickerSettings {
+        PickerSettings::from_options(&Options::default(), true)
+    }
+
+    #[test]
+    fn manual_values_clamp_and_invalid_text_preserves_previous_value() {
+        let mut settings = settings();
+        let oversized_integer = "9".repeat(200);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_DEADZONE, "2", 320.0, 480.0),
+            Some("0.95".to_string())
+        );
+        assert_eq!(settings.deadzone, 0.95);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_DEADZONE, "not a number", 320.0, 480.0),
+            None
+        );
+        assert_eq!(settings.deadzone, 0.95);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_DEADZONE, "App default", 320.0, 480.0),
+            None
+        );
+        assert_eq!(settings.deadzone, 0.95);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_FPS_LIMIT, "999", 320.0, 480.0),
+            Some("240".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_FPS_LIMIT, "1e1000", 320.0, 480.0),
+            Some("240".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_FPS_LIMIT, "Unlimited", 320.0, 480.0),
+            Some("Unlimited".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_CORRUPTION_MAX_OFFSET, "unbounded", 320.0, 480.0),
+            Some("Unbounded".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                MANUAL_CORRUPTION_INTENSITY,
+                &oversized_integer,
+                320.0,
+                480.0,
+            ),
+            Some("64".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                MANUAL_CORRUPTION_SEED,
+                &oversized_integer,
+                320.0,
+                480.0,
+            ),
+            Some(u64::MAX.to_string())
+        );
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_CORRUPTION_SEED, "-1", 320.0, 480.0),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn touch_manual_values_stay_within_current_screen() {
+        let mut settings = settings();
+        let button_tag = manual_button_tag(Button::A);
+        assert_eq!(
+            apply_manual_value(&mut settings, button_tag, "999,-1", 320.0, 480.0),
+            Some("320,0".to_string())
+        );
+        assert_eq!(settings.button_to_touch[&Button::A], (320.0, 0.0));
+        assert_eq!(settings.controller_to_touch, Some(true));
+        assert!(settings.manual_value_overrides.contains(&button_tag));
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                button_tag,
+                "App default",
+                320.0,
+                480.0,
+            ),
+            Some("App default".to_string())
+        );
+        assert_eq!(settings.controller_to_touch, None);
+        assert!(!settings.manual_value_overrides.contains(&button_tag));
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_DPAD_TOUCH, "300,470,50,50", 320.0, 480.0),
+            Some("300,470,20,10".to_string())
+        );
+        assert_eq!(settings.dpad_to_touch, Some((300.0, 470.0, 20.0, 10.0)));
+    }
+
+    #[test]
+    fn controller_deadzone_enablement_tracks_stick_mapping_not_tilt() {
+        let mut settings = settings();
+        settings.analog_stick_tilt_controls = false;
+        settings.controller_to_touch = Some(true);
+        settings.stick_to_touch = Some((0.0, 0.0, 100.0, 100.0));
+        assert!(manual_value_enabled(MANUAL_DEADZONE, &settings));
+        settings.stick_to_touch = None;
+        assert!(!manual_value_enabled(MANUAL_DEADZONE, &settings));
+        assert!(!manual_value_enabled(MANUAL_X_TILT_RANGE, &settings));
+        settings.controller_to_touch = None;
+        assert!(manual_value_enabled(MANUAL_DEADZONE, &settings));
+    }
+
+    #[test]
+    fn manual_override_persistence_ignores_unknown_tags() {
+        let saved = format!("{MANUAL_DEADZONE},999999,{MANUAL_X_TILT_OFFSET}");
+        assert_eq!(
+            parse_manual_value_overrides(&saved),
+            BTreeSet::from([MANUAL_DEADZONE, MANUAL_X_TILT_OFFSET])
+        );
+    }
+
+    #[test]
+    fn picker_settings_emit_explicit_values_and_preserve_app_defaults() {
+        let mut settings = settings();
+        settings.fix_texture_min_filter = None;
+        settings.present_rotate = None;
+        let default_args = quick_options_picker_settings_arguments(&settings);
+        assert!(!default_args.iter().any(|arg| arg.starts_with("--present-rotate=")));
+        assert!(!default_args.iter().any(|arg| arg.contains("fix-texture-min-filter")));
+        assert!(!default_args.contains(&"--no-controller-to-touch".to_string()));
+        assert!(default_args.contains(&"--no-corrupt-game".to_string()));
+        assert!(!default_args.iter().any(|arg| arg.starts_with("--deadzone=")));
+        assert!(!default_args.iter().any(|arg| arg.starts_with("--x-tilt-offset=")));
+        assert!(!default_args.iter().any(|arg| arg.starts_with("--fps-limit=")));
+        assert_eq!(manual_value_text(&settings, MANUAL_X_TILT_OFFSET).as_deref(), Some("App default"));
+        assert_eq!(manual_value_text(&settings, manual_button_tag(Button::A)).as_deref(), Some("App default"));
+
+        settings.vsync = VsyncMode::On;
+        settings.present_mode = PresentMode::Readback;
+        settings.fix_texture_min_filter = Some(false);
+        settings.present_rotate = Some(90);
+        settings.deadzone = 0.25;
+        settings.x_tilt_range = 120.0;
+        settings.fps_limit = Some(120.0);
+        settings.print_fps = true;
+        settings.popup_errors = false;
+        settings.controller_to_touch = Some(true);
+        settings.button_to_touch.insert(Button::A, (12.0, 34.0));
+        settings.dpad_to_touch = Some((1.0, 2.0, 3.0, 4.0));
+        settings.manual_value_overrides.extend([
+            MANUAL_DEADZONE,
+            MANUAL_X_TILT_RANGE,
+            MANUAL_FPS_LIMIT,
+        ]);
+        let args = quick_options_picker_settings_arguments(&settings);
+        for expected in [
+            "--vsync=on",
+            "--present-mode=readback",
+            "--no-fix-texture-min-filter",
+            "--present-rotate=90",
+            "--deadzone=0.25",
+            "--x-tilt-range=120",
+            "--fps-limit=120",
+            "--print-fps",
+            "--no-error-popup",
+            "--button-to-touch=A,12,34",
+            "--dpad-to-touch=1,2,3,4",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
+        }
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "--no-controller-to-touch").count(),
+            1
+        );
+        settings.controller_to_touch = None;
+        let app_default_args = quick_options_picker_settings_arguments(&settings);
+        assert!(!app_default_args.contains(&"--no-controller-to-touch".to_string()));
+        assert!(!app_default_args.iter().any(|arg| arg.starts_with("--button-to-touch=")));
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_X_TILT_OFFSET, "App default", 320.0, 480.0),
+            Some("App default".to_string())
+        );
+        assert!(!settings.manual_value_overrides.contains(&MANUAL_X_TILT_OFFSET));
     }
 }
 

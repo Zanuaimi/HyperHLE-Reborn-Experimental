@@ -637,6 +637,10 @@ impl Options {
             self.x_tilt_offset = parse_degrees(value, "X tilt offset")?;
         } else if let Some(value) = arg.strip_prefix("--y-tilt-offset=") {
             self.y_tilt_offset = parse_degrees(value, "Y tilt offset")?;
+        } else if arg == "--no-controller-to-touch" {
+            self.button_to_touch.clear();
+            self.dpad_to_touch = None;
+            self.stick_to_touch = None;
         } else if let Some(values) = arg.strip_prefix("--button-to-touch=") {
             let (button, coords) = values
                 .split_once(',')
@@ -714,6 +718,8 @@ impl Options {
             self.corruption.enabled = true;
         } else if arg == "--no-corrupt-game" {
             self.corruption.enabled = false;
+        } else if arg == "--no-corrupt-max-offset" {
+            self.corruption.max_offset = None;
         } else if let Some(value) = arg.strip_prefix("--corrupt-start-delay=") {
             self.corruption.startup_delay =
                 parse_corruption_duration(value, "--corrupt-start-delay=")?;
@@ -782,7 +788,7 @@ impl Options {
                 let limit: f64 = value
                     .parse()
                     .ok()
-                    .and_then(|v| if v <= 0.0 { None } else { Some(v) })
+                    .and_then(|v| (v.is_finite() && v > 0.0).then_some(v))
                     .ok_or_else(|| "Invalid value for --fps-limit=".to_string())?;
                 self.fps_limit = Some(limit);
             }
@@ -855,6 +861,8 @@ impl Options {
             self.game_center_authenticated = false;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
+        } else if arg == "--error-popup" {
+            self.popup_errors = !self.headless;
         } else if let Some(values) = arg.strip_prefix("--dump=") {
             self.dumping_options = parse_dump_options(values)?;
         } else if let Some(path) = arg.strip_prefix("--dump-file=") {
@@ -951,92 +959,6 @@ pub fn get_options_from_file<F: Read>(file: F, app_id: &str) -> Result<Option<St
     Ok(None)
 }
 
-/// Finds the last corruption mode explicitly set by ordered app profiles.
-/// Profile contents must be supplied built-in first, then user options.
-pub(crate) fn profile_corruption_mode(profiles: &[&str]) -> Option<bool> {
-    profiles
-        .iter()
-        .flat_map(|profile| profile.split_ascii_whitespace())
-        .filter_map(|arg| match arg {
-            "--corrupt-game" => Some(true),
-            "--no-corrupt-game" => Some(false),
-            _ => None,
-        })
-        .last()
-}
-
-/// Whether an app profile contains any option that changes corruption behavior.
-pub(crate) fn profile_has_corruption_settings(profiles: &[&str]) -> bool {
-    profiles
-        .iter()
-        .flat_map(|profile| profile.split_ascii_whitespace())
-        .any(|arg| {
-            matches!(
-                arg.split_once('=').map_or(arg, |(name, _)| name),
-                "--corrupt-game"
-                    | "--no-corrupt-game"
-                    | "--corrupt-start-delay"
-                    | "--corrupt-cooldown"
-                    | "--corrupt-intensity"
-                    | "--corrupt-seed"
-                    | "--corrupt-max-offset"
-            )
-        })
-}
-
-/// Picker mode is safe to emit only when both profiles loaded and neither
-/// profile explicitly selected a corruption mode.
-pub(crate) fn should_emit_picker_corruption_mode(
-    profile_mode: Option<bool>,
-    profile_load_failed: bool,
-) -> bool {
-    profile_mode.is_none() && !profile_load_failed
-}
-
-/// Resolves ordered app-profile results, preserving the last explicit mode.
-/// A failed profile is reported separately so callers can suppress UI defaults.
-pub(crate) fn profile_corruption_mode_from_results<E>(
-    profiles: impl IntoIterator<Item = Result<Option<String>, E>>,
-) -> (Option<bool>, bool) {
-    let mut mode = None;
-    let mut failed = false;
-    for profile in profiles {
-        match profile {
-            Ok(Some(options)) => {
-                if let Some(profile_mode) = profile_corruption_mode(&[&options]) {
-                    mode = Some(profile_mode);
-                }
-            }
-            Ok(None) => (),
-            Err(_) => failed = true,
-        }
-    }
-    (mode, failed)
-}
-
-/// Resolves explicit corruption settings in profile order and reports whether
-/// any profile set them. Profile contents must be supplied built-in first.
-pub(crate) fn profile_corruption_settings_from_results<E>(
-    profiles: impl IntoIterator<Item = Result<Option<String>, E>>,
-) -> (Option<bool>, bool, bool) {
-    let mut mode = None;
-    let mut has_settings = false;
-    let mut failed = false;
-    for profile in profiles {
-        match profile {
-            Ok(Some(options)) => {
-                if let Some(profile_mode) = profile_corruption_mode(&[&options]) {
-                    mode = Some(profile_mode);
-                }
-                has_settings |= profile_has_corruption_settings(&[&options]);
-            }
-            Ok(None) => (),
-            Err(_) => failed = true,
-        }
-    }
-    (mode, has_settings, failed)
-}
-
 #[derive(Default, Clone)]
 pub struct DumpingOptions {
     pub linking_info: bool,
@@ -1081,75 +1003,6 @@ mod option_parsing_tests {
     use super::*;
 
     #[test]
-    fn app_profile_corruption_mode_uses_exact_tokens_and_last_profile_wins() {
-        assert_eq!(
-            profile_corruption_mode(&[
-                "--device-family=iphone-4 --corrupt-game-extra",
-                "--landscape-left --no-corrupt-game",
-            ]),
-            Some(false)
-        );
-        assert_eq!(
-            profile_corruption_mode(&["--corrupt-game", "--corrupt-game"]),
-            Some(true)
-        );
-        assert_eq!(
-            profile_corruption_mode(&["--corrupt-game --no-corrupt-game"]),
-            Some(false)
-        );
-        assert_eq!(profile_corruption_mode(&["--device-family=auto"]), None);
-        assert_eq!(
-            profile_corruption_mode(&["--device-family=iphone-4 --no-corrupt-game"]),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn failed_profile_read_suppresses_picker_mode() {
-        assert!(!should_emit_picker_corruption_mode(None, true));
-        assert!(should_emit_picker_corruption_mode(None, false));
-        assert!(!should_emit_picker_corruption_mode(Some(true), false));
-        assert!(!should_emit_picker_corruption_mode(Some(false), true));
-    }
-
-    #[test]
-    fn app_profile_mode_uses_the_same_parser_as_runtime_loading() {
-        let built_in = "com.example.game: --device-family=iphone-4 --corrupt-game\n";
-        let user = "com.example.game: --no-corrupt-game\n";
-        assert_eq!(
-            profile_corruption_mode_from_results([
-                get_options_from_file(built_in.as_bytes(), "com.example.game"),
-                get_options_from_file(user.as_bytes(), "com.example.game"),
-            ]),
-            (Some(false), false)
-        );
-    }
-
-    #[test]
-    fn malformed_profile_suppresses_generated_corruption_mode() {
-        let built_in = "this line has no separator\n";
-        let user = "com.example.game: --corrupt-game\n";
-        let (mode, failed) = profile_corruption_mode_from_results([
-            get_options_from_file(built_in.as_bytes(), "com.example.game"),
-            get_options_from_file(user.as_bytes(), "com.example.game"),
-        ]);
-        assert_eq!(mode, Some(true));
-        assert!(failed);
-        assert!(!should_emit_picker_corruption_mode(mode, failed));
-    }
-
-    #[test]
-    fn profile_open_failure_is_reported_as_failed() {
-        let (mode, failed) = profile_corruption_mode_from_results([
-            Ok(Some("--corrupt-game".to_string())),
-            Err("unreadable"),
-        ]);
-        assert_eq!(mode, Some(true));
-        assert!(failed);
-        assert!(!should_emit_picker_corruption_mode(mode, failed));
-    }
-
-    #[test]
     fn corruption_is_disabled_by_default_and_explicit_flag_wins() {
         let mut options = Options::default();
         assert!(!options.corruption.enabled);
@@ -1192,6 +1045,44 @@ mod option_parsing_tests {
         assert!(options.parse_argument("--corrupt-seed=nope").is_err());
         assert!(options.parse_argument("--corrupt-max-offset=nope").is_err());
         assert!(options.parse_argument("--corrupt-max-offset=0").is_err());
+    }
+
+    #[test]
+    fn picker_reset_options_clear_mappings_and_restore_defaults() {
+        let mut options = Options::default();
+        options.parse_argument("--button-to-touch=A,1,2").unwrap();
+        options.parse_argument("--dpad-to-touch=1,2,3,4").unwrap();
+        options.parse_argument("--stick-to-touch=5,6,7,8").unwrap();
+        options.parse_argument("--no-controller-to-touch").unwrap();
+        assert!(options.button_to_touch.is_empty());
+        assert_eq!(options.dpad_to_touch, None);
+        assert_eq!(options.stick_to_touch, None);
+
+        options.parse_argument("--corrupt-max-offset=16").unwrap();
+        options.parse_argument("--no-corrupt-max-offset").unwrap();
+        assert_eq!(options.corruption.max_offset, None);
+    }
+
+    #[test]
+    fn fps_limit_rejects_non_finite_values() {
+        for value in ["NaN", "inf", "-inf", "1e1000"] {
+            assert!(Options::default()
+                .parse_argument(&format!("--fps-limit={value}"))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn error_popup_can_be_restored_but_not_in_headless_mode() {
+        let mut options = Options::default();
+        options.parse_argument("--no-error-popup").unwrap();
+        assert!(!options.popup_errors);
+        options.parse_argument("--error-popup").unwrap();
+        assert!(options.popup_errors);
+
+        options.parse_argument("--headless").unwrap();
+        options.parse_argument("--error-popup").unwrap();
+        assert!(!options.popup_errors);
     }
 
     #[test]

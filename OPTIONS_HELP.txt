@@ -111,6 +111,9 @@ Game controller options:
 
         This is a floating-point (decimal) number between 0 and 1.
 
+    --no-controller-to-touch
+        Clear button, D-pad and stick-to-touch mappings.
+
     --disable-analog-stick-tilt-controls
     --enable-analog-stick-tilt-controls
         Disables mapping of analog stick input to simulated rotation of the
@@ -293,6 +296,10 @@ Debugging options:
     --no-error-popup
         Disables the graphical error message box (outputs to terminal/log file
         only).
+
+    --error-popup
+        Enables graphical error message boxes. This has no effect in headless
+        mode.
 
     --dump=...
         Dumps some information about app/emulator to dump file. Check
@@ -526,6 +533,10 @@ Other options:
 
     --corrupt-max-offset=<bytes>
         Limit corruption to the first <bytes> of each allocation. Implies
+        --corrupt-game.
+
+    --no-corrupt-max-offset
+        Remove the allocation-size limit for corruption. Does not enable
         --corrupt-game.
 
     --allow-network-access

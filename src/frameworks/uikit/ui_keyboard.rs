@@ -35,10 +35,10 @@ pub const UIKeyboardCenterEndUserInfoKey: &str = "UIKeyboardCenterEndUserInfoKey
 
 // MARK: - Keyboard type / appearance / return key
 
-type UIKeyboardType = NSInteger;
-const UIKeyboardTypeDefault: UIKeyboardType = 0;
+pub type UIKeyboardType = NSInteger;
+pub const UIKeyboardTypeDefault: UIKeyboardType = 0;
 const UIKeyboardTypeASCIICapable: UIKeyboardType = 1;
-const UIKeyboardTypeNumbersAndPunctuation: UIKeyboardType = 2;
+pub const UIKeyboardTypeNumbersAndPunctuation: UIKeyboardType = 2;
 const UIKeyboardTypeURL: UIKeyboardType = 3;
 const UIKeyboardTypeNumberPad: UIKeyboardType = 4;
 const UIKeyboardTypePhonePad: UIKeyboardType = 5;
@@ -54,7 +54,7 @@ const UIKeyboardAppearanceDark: UIKeyboardAppearance = 1;
 const UIKeyboardAppearanceLight: UIKeyboardAppearance = 2;
 const UIKeyboardAppearanceAlert: UIKeyboardAppearance = UIKeyboardAppearanceDark;
 
-type UIReturnKeyType = NSInteger;
+pub type UIReturnKeyType = NSInteger;
 const UIReturnKeyDefault: UIReturnKeyType = 0;
 const UIReturnKeyGo: UIReturnKeyType = 1;
 const UIReturnKeyGoogle: UIReturnKeyType = 2;
@@ -64,7 +64,7 @@ const UIReturnKeyRoute: UIReturnKeyType = 5;
 const UIReturnKeySearch: UIReturnKeyType = 6;
 const UIReturnKeySend: UIReturnKeyType = 7;
 const UIReturnKeyYahoo: UIReturnKeyType = 8;
-const UIReturnKeyDone: UIReturnKeyType = 9;
+pub const UIReturnKeyDone: UIReturnKeyType = 9;
 const UIReturnKeyEmergencyCall: UIReturnKeyType = 10;
 const UIReturnKeyContinue: UIReturnKeyType = 11;
 
