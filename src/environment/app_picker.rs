@@ -426,6 +426,8 @@ struct AppPickerDelegateHostObject {
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
     device_model_scroll_to: Option<CGFloat>,
+    /// Progress along the settings scrollbar track while it is being dragged.
+    settings_scroll_to: Option<CGFloat>,
     language_tag: Option<i32>,
     language_toggle: bool,
     language_scroll_to: Option<CGFloat>,
@@ -442,6 +444,8 @@ struct AppPickerDelegateHostObject {
     settings_reset: bool,
     /// Set when the user confirms resetting the settings to their defaults.
     reset_confirm: bool,
+    /// Set when the user backs out of resetting the settings to their defaults.
+    reset_cancel: bool,
     /// Set when the "settings couldn't be saved" notice is dismissed.
     save_error_dismiss: bool,
     /// Set when the horizontal swipe recognizers fire (old-iOS page change).
@@ -1976,11 +1980,26 @@ const CLASSES: ClassExports = objc_classes! {
 - (())resetSettingsTapped {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_reset = true;
 }
+- (())settingsScroll:(id)sender forEvent:(id)event {
+    // The settings screen keeps its track while it is closed, so ignore drags
+    // on the hidden one.
+    let hidden: bool = msg![env; sender isHidden];
+    if !hidden {
+        if let Some(position) = dropdown_scroll_position(env, sender, event) {
+            let bounds: CGRect = msg![env; sender bounds];
+            let progress = (position / bounds.size.height).clamp(0.0, 1.0);
+            env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_scroll_to = Some(progress);
+        }
+    }
+}
 - (())deleteConfirm {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).delete_confirm = true;
 }
 - (())resetSettingsConfirm {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).reset_confirm = true;
+}
+- (())resetSettingsCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).reset_cancel = true;
 }
 - (())saveErrorDismiss {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).save_error_dismiss = true;
@@ -2403,14 +2422,6 @@ fn app_picker_inner(
         "deleteCancel",
         "deleteConfirm",
     );
-    let reset_dialog = make_delete_dialog(
-        env,
-        delegate,
-        main_view,
-        app_frame.size,
-        "deleteCancel",
-        "resetSettingsConfirm",
-    );
     let save_error_dialog = make_delete_dialog(
         env,
         delegate,
@@ -2420,6 +2431,16 @@ fn app_picker_inner(
         "saveErrorDismiss",
     );
 
+    // Same shape as `reset_dialog`, but built after it: the two look alike, and
+    // the one sharing its layout must be on top of its twin's dimmer.
+    let reset_dialog = make_delete_dialog(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        "resetSettingsCancel",
+        "resetSettingsConfirm",
+    );
     () = msg![env; window makeKeyAndVisible];
 
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
@@ -2724,7 +2745,9 @@ fn app_picker_inner(
         let recent_app_tapped = std::mem::take(&mut host_obj.recent_app_tapped);
         let add_ipa = std::mem::take(&mut host_obj.add_ipa);
         // Read every flag the settings screen set here, in one go.
-        let reset_request = if std::mem::take(&mut host_obj.settings_reset) {
+        let reset_request = if std::mem::take(&mut host_obj.reset_cancel) {
+            ResetSettingsRequest::Cancel
+        } else if std::mem::take(&mut host_obj.settings_reset) {
             ResetSettingsRequest::Ask
         } else if std::mem::take(&mut host_obj.reset_confirm) {
             ResetSettingsRequest::Confirm
@@ -2939,6 +2962,11 @@ fn app_picker_inner(
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
             );
+        } else if let Some(progress) = std::mem::take(&mut host_obj.settings_scroll_to) {
+            let scroll = settings.scroll_view;
+            let offset: CGPoint = msg![env; scroll contentOffset];
+            let new_y = settings_scroll_offset_at(env, &settings, progress);
+            () = msg![env; scroll setContentOffset:(CGPoint { x: offset.x, y: new_y })];
         } else if let Some(position) = std::mem::take(&mut host_obj.device_model_scroll_to) {
             device_state.scroll =
                 dropdown_scroll_at(position, settings.device_dropdown.items.len());
@@ -5060,6 +5088,49 @@ fn set_offscreen_scroll_items_hidden(
     }
 }
 
+/// The scroll offset the settings list would have at `progress` from the top
+/// of its scrollbar track (`0.0` at the top, `1.0` at the bottom).
+fn settings_scroll_offset_at(
+    env: &mut Environment,
+    settings: &SettingsStuff,
+    progress: CGFloat,
+) -> CGFloat {
+    let scroll = settings.scroll_view;
+    let bounds: CGRect = msg![env; scroll bounds];
+    let content_size: CGSize = msg![env; scroll contentSize];
+    let (thumb_height, _) = settings_scrollbar_thumb_metrics(settings, bounds, content_size);
+    let travel = (settings.list_height - thumb_height).max(0.0);
+    let max_y = (content_size.height - bounds.size.height).max(0.0);
+    // Keep the thumb under the finger: the finger's position along the track
+    // is read as the position of the middle of the thumb.
+    let finger = progress * settings.list_height;
+    let thumb_top = (finger - thumb_height / 2.0).clamp(0.0, travel);
+    let scrolled = if travel > 0.0 {
+        thumb_top / travel
+    } else {
+        0.0
+    };
+    (scrolled * max_y).clamp(0.0, max_y)
+}
+/// How tall the settings scrollbar thumb is, and whether the list is long
+/// enough to need one.
+fn settings_scrollbar_thumb_metrics(
+    settings: &SettingsStuff,
+    bounds: CGRect,
+    content_size: CGSize,
+) -> (CGFloat, bool) {
+    let list_height = settings.list_height;
+    let content_height = content_size.height.max(bounds.size.height);
+    // A list that fits needs no thumb: the track alone says there is nothing
+    // more to scroll.
+    if content_height - list_height < 1.0 {
+        return (0.0, false);
+    }
+    (
+        (list_height * list_height / content_height).max(48.0),
+        true,
+    )
+}
 /// Puts the settings scrollbar in step with `scroll_view`: the thumb spans the
 /// part of the list that is on screen and moves down the track as it scrolls.
 fn update_settings_scrollbar(env: &mut Environment, settings: &SettingsStuff) {
@@ -5073,17 +5144,16 @@ fn update_settings_scrollbar(env: &mut Environment, settings: &SettingsStuff) {
     let content_size: CGSize = msg![env; scroll contentSize];
     let offset: CGPoint = msg![env; scroll contentOffset];
     let list_height = settings.list_height;
-    let content_height = content_size.height.max(bounds.size.height);
-    // A list that fits needs no thumb: the track alone says there is nothing
-    // more to scroll.
-    if content_height - list_height < 1.0 {
+    let (thumb_height, scrolled_available) =
+        settings_scrollbar_thumb_metrics(settings, bounds, content_size);
+    if !scrolled_available {
         () = msg![env; (settings.scrollbar_thumb) setHidden:true];
         return;
     }
     () = msg![env; (settings.scrollbar_thumb) setHidden:false];
-    let thumb_height = (list_height * list_height / content_height).max(48.0);
     let travel = (list_height - thumb_height).max(0.0);
-    let scrolled = (offset.y / (content_height - list_height)).clamp(0.0, 1.0);
+    let max_y = (content_size.height - bounds.size.height).max(0.0);
+    let scrolled = (offset.y / max_y).clamp(0.0, 1.0);
     let thumb_frame = CGRect {
         origin: CGPoint {
             x: settings.scrollbar_x,
@@ -5750,28 +5820,46 @@ fn setup_settings(
 
     // Scrollable content below the navigation bar.
     let scroll: id = msg_class![env; UIScrollView alloc];
-    let scroll: id = msg![env; scroll initWithFrame:(rect(
-        0.0,
-        SETTINGS_NAV_BAR_HEIGHT + status_offset,
-        width,
-        height - SETTINGS_NAV_BAR_HEIGHT,
-    ))];
-    () = msg![env; scroll setBackgroundColor:clear];
-    // Clip the scrolled content so it never slides up over the navigation bar.
-    // The list also stops short of the scrollbar, so rows never draw over it.
-    () = msg![env; scroll setClipsToBounds:true];
-    () = msg![env; scroll setFrame:(rect(
-        0.0,
-        SETTINGS_NAV_BAR_HEIGHT + status_offset,
-        width - SETTINGS_SCROLLBAR_WIDTH,
-        height - SETTINGS_NAV_BAR_HEIGHT,
-    ))];
-    () = msg![env; settings_view addSubview:scroll];
-    // A scrollbar down the right edge, like the ones beside the dropdown
-    // lists, so a long list of settings shows where you are in it.
     let list_top = SETTINGS_NAV_BAR_HEIGHT + status_offset;
     let list_height = height - SETTINGS_NAV_BAR_HEIGHT;
     let scrollbar_x = width - SETTINGS_SCROLLBAR_WIDTH;
+    // The list stops short of the scrollbar, so rows never draw over it.
+    let scroll: id = msg![env; scroll initWithFrame:(rect(
+        0.0,
+        list_top,
+        width - SETTINGS_SCROLLBAR_WIDTH,
+        list_height,
+    ))];
+    () = msg![env; scroll setBackgroundColor:clear];
+    // Clip the scrolled content so it never slides up over the navigation bar.
+    () = msg![env; scroll setClipsToBounds:true];
+    // Rows are laid out for the list's width, so sideways scrolling only
+    // wobbles the list under a diagonal drag.
+    () = msg![env; scroll setAlwaysBounceHorizontal:false];
+    () = msg![env; scroll setShowsHorizontalScrollIndicator:false];
+    () = msg![env; settings_view addSubview:scroll];
+    // A scrollbar down the right edge, like the ones beside the dropdown
+    // lists, so a long list of settings shows where you are in it. Dragging
+    // it scrolls the list; `settingsScroll:forEvent:` reports the drag.
+    let track_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; track_button setFrame:(rect(
+        scrollbar_x,
+        list_top,
+        SETTINGS_SCROLLBAR_WIDTH,
+        list_height,
+    ))];
+    () = msg![env; track_button setBackgroundColor:clear];
+    let scroll_selector = env.objc
+        .lookup_selector("settingsScroll:forEvent:")
+        .unwrap();
+    let scroll_events = UIControlEventTouchDown
+        | UIControlEventTouchDragInside
+        | UIControlEventTouchDragExit
+        | UIControlEventTouchDragOutside;
+    () = msg![env; track_button addTarget:delegate
+                              action:scroll_selector
+                    forControlEvents:scroll_events];
+    () = msg![env; settings_view addSubview:track_button];
     // Built in locals: `new_view` borrows `env`, so `ui_color` can't be called
     // in its argument list.
     let track_color = ui_color(env, 0.55, 0.58, 0.62, 0.18);
@@ -5789,6 +5877,7 @@ fn setup_settings(
     );
     () = msg![env; settings_view addSubview:scrollbar_thumb];
     () = msg![env; settings_view bringSubviewToFront:scrollbar_thumb];
+    () = msg![env; settings_view bringSubviewToFront:track_button];
     // The navigation bar must stay on top of the scrolled content.
     () = msg![env; settings_view bringSubviewToFront:nav_bar];
     () = msg![env; settings_view bringSubviewToFront:nav_separator];
@@ -6146,10 +6235,6 @@ fn setup_settings(
     sections.push((
         "EMULATION",
         vec![
-        SettingsRow::Button {
-            title: "Reset all settings",
-            selector: "resetSettingsTapped",
-        },
             SettingsRow::Toggle(
                 "Cheat Engine",
                 "Enables the built-in cheat interface for supported games. It does not add cheats to every game.",
@@ -6179,6 +6264,14 @@ fn setup_settings(
                 true,
             ),
         ],
+    ));
+    // The actions that undo something sit last, on their own, in red.
+    sections.push((
+        "RESET",
+        vec![SettingsRow::Button {
+            title: "Reset all settings",
+            selector: "resetSettingsTapped",
+        }],
     ));
 
     let inner_width = width - 2.0 * SETTINGS_GROUP_INSET;
@@ -7577,6 +7670,9 @@ fn handle_reset_settings_request(
                 }
             }
         }
+        ResetSettingsRequest::Cancel => {
+            hide_delete_dialog(env, main_run_loop, delegate, reset_dialog);
+        }
         ResetSettingsRequest::DismissError => {
             hide_delete_dialog(env, main_run_loop, delegate, save_error_dialog);
         }
@@ -7589,6 +7685,7 @@ enum ResetSettingsRequest {
     None,
     Ask,
     Confirm,
+    Cancel,
     DismissError,
 }
 
