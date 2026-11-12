@@ -438,6 +438,12 @@ struct AppPickerDelegateHostObject {
     icon_touch_cancelled: bool,
     delete_cancel: bool,
     delete_confirm: bool,
+    /// Set when the user taps the reset row in Settings.
+    settings_reset: bool,
+    /// Set when the user confirms resetting the settings to their defaults.
+    reset_confirm: bool,
+    /// Set when the "settings couldn't be saved" notice is dismissed.
+    save_error_dismiss: bool,
     /// Set when the horizontal swipe recognizers fire (old-iOS page change).
     swipe_left: bool,
     swipe_right: bool,
@@ -761,24 +767,24 @@ impl PickerSettings {
                 "print_fps" => set_bool(value, &mut settings.print_fps),
                 "popup_errors" => set_bool(value, &mut settings.popup_errors),
                 "deadzone" => {
-                    settings.deadzone = parse_clamped_f32(value, 0.0, 0.95)
-                        .unwrap_or(settings.deadzone)
+                    settings.deadzone =
+                        parse_clamped_f32(value, 0.0, 0.95).unwrap_or(settings.deadzone)
                 }
                 "x_tilt_range" => {
-                    settings.x_tilt_range = parse_clamped_f32(value, -360.0, 360.0)
-                        .unwrap_or(settings.x_tilt_range)
+                    settings.x_tilt_range =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.x_tilt_range)
                 }
                 "y_tilt_range" => {
-                    settings.y_tilt_range = parse_clamped_f32(value, -360.0, 360.0)
-                        .unwrap_or(settings.y_tilt_range)
+                    settings.y_tilt_range =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.y_tilt_range)
                 }
                 "x_tilt_offset" => {
-                    settings.x_tilt_offset = parse_clamped_f32(value, -360.0, 360.0)
-                        .unwrap_or(settings.x_tilt_offset)
+                    settings.x_tilt_offset =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.x_tilt_offset)
                 }
                 "y_tilt_offset" => {
-                    settings.y_tilt_offset = parse_clamped_f32(value, -360.0, 360.0)
-                        .unwrap_or(settings.y_tilt_offset)
+                    settings.y_tilt_offset =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.y_tilt_offset)
                 }
                 "controller_to_touch" => {
                     set_bool_override(value, &mut settings.controller_to_touch)
@@ -872,6 +878,17 @@ impl PickerSettings {
         settings
     }
 
+    /// The settings a fresh install starts with, and the settings that
+    /// "Reset all settings" restores. Both must match, or a reset would leave
+    /// the picker looking different from a first launch.
+    ///
+    /// Only the emulator's own factory values are used; command-line flags and
+    /// app-specific options files are deliberately ignored here, because the
+    /// picker's saved values are layered on top of them at launch.
+    fn factory_defaults(angle_backend_available: bool) -> Self {
+        Self::from_options(&Options::default(), angle_backend_available)
+    }
+
     fn from_options(options: &Options, angle_backend_available: bool) -> Self {
         let (renderer_mode, _) =
             quick_options_renderer_mode_state(options.renderer_mode, angle_backend_available);
@@ -928,7 +945,7 @@ impl PickerSettings {
         }
     }
 
-    fn save(&self) {
+    fn save(&self) -> std::io::Result<()> {
         let path = paths::user_data_base_path().join(paths::PICKER_SETTINGS_FILE);
         let orientation = match self.orientation {
             None => "default",
@@ -996,7 +1013,8 @@ impl PickerSettings {
             vsync_short_name(self.vsync),
             present_mode_short_name(self.present_mode),
             optional_bool(self.fix_texture_min_filter),
-            self.present_rotate.map_or_else(|| "default".to_string(), |value| value.to_string()),
+            self.present_rotate
+                .map_or_else(|| "default".to_string(), |value| value.to_string()),
             self.print_fps,
             self.popup_errors,
             self.deadzone,
@@ -1013,7 +1031,8 @@ impl PickerSettings {
             format_button_mappings(&self.button_to_touch),
             format_touch_region(self.dpad_to_touch),
             format_touch_region(self.stick_to_touch),
-            self.fps_limit.map_or_else(|| "off".to_string(), |value| value.to_string()),
+            self.fps_limit
+                .map_or_else(|| "off".to_string(), |value| value.to_string()),
             self.overlay_mode.short_name(),
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
@@ -1022,7 +1041,8 @@ impl PickerSettings {
             self.corruption_startup_delay.short_name(),
             self.corruption_cooldown.short_name(),
             self.corruption_bytes_per_burst,
-            self.corruption_max_offset.map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
+            self.corruption_max_offset
+                .map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
             self.corruption_seed,
             self.gles2_mode.short_name(),
             self.cheat_engine,
@@ -1032,9 +1052,38 @@ impl PickerSettings {
             optional_tag(self.device_model_tag),
             optional_tag(self.language_tag),
         );
-        if let Err(error) = std::fs::write(path, contents) {
-            log!("Warning: couldn't save app picker settings: {error}");
+        atomic_write_picker_settings(&path, contents.as_bytes())
+    }
+}
+
+fn atomic_write_picker_settings(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    loop {
+        let number = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".picker-settings-{}-{number}.tmp",
+            std::process::id()
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = file.write_all(contents).and_then(|()| file.sync_all());
+        drop(file);
+        let result = result.and_then(|()| std::fs::rename(&temp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(temp);
         }
+        return result;
     }
 }
 
@@ -1294,9 +1343,14 @@ fn picker_touch_screen_size(options: &Options, settings: &PickerSettings) -> (f3
         .and_then(DeviceFamily::for_tag)
         .or(options.device_family)
         .unwrap_or(DeviceFamily::iPhone);
-    let (mut width, mut height) = options.host_screen_size.unwrap_or_else(|| family.portrait_size());
+    let (mut width, mut height) = options
+        .host_screen_size
+        .unwrap_or_else(|| family.portrait_size());
     let orientation = settings.orientation.unwrap_or(options.initial_orientation);
-    if matches!(orientation, DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight) {
+    if matches!(
+        orientation,
+        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+    ) {
         std::mem::swap(&mut width, &mut height);
     }
     (width as f32, height as f32)
@@ -1364,8 +1418,7 @@ fn parse_manual_value_overrides(value: &str) -> BTreeSet<NSInteger> {
 }
 
 fn is_controller_mapping_tag(tag: NSInteger) -> bool {
-    matches!(tag, MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH)
-        || manual_button_for_tag(tag).is_some()
+    matches!(tag, MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH) || manual_button_for_tag(tag).is_some()
 }
 
 fn manual_value_text(settings: &PickerSettings, tag: NSInteger) -> Option<String> {
@@ -1374,10 +1427,7 @@ fn manual_value_text(settings: &PickerSettings, tag: NSInteger) -> Option<String
     }
     if matches!(
         tag,
-        MANUAL_X_TILT_RANGE
-            | MANUAL_Y_TILT_RANGE
-            | MANUAL_X_TILT_OFFSET
-            | MANUAL_Y_TILT_OFFSET
+        MANUAL_X_TILT_RANGE | MANUAL_Y_TILT_RANGE | MANUAL_X_TILT_OFFSET | MANUAL_Y_TILT_OFFSET
     ) && !settings.manual_value_overrides.contains(&tag)
     {
         return Some("App default".to_string());
@@ -1400,10 +1450,10 @@ fn manual_value_text(settings: &PickerSettings, tag: NSInteger) -> Option<String
         MANUAL_CORRUPTION_SEED => settings.corruption_seed.to_string(),
         _ => {
             let button = manual_button_for_tag(tag)?;
-            settings.button_to_touch.get(&button).map_or_else(
-                || "off".to_string(),
-                |(x, y)| format!("{x},{y}"),
-            )
+            settings
+                .button_to_touch
+                .get(&button)
+                .map_or_else(|| "off".to_string(), |(x, y)| format!("{x},{y}"))
         }
     })
 }
@@ -1454,7 +1504,9 @@ fn apply_manual_value(
         settings.manual_value_overrides.remove(&tag);
         if is_controller_mapping_tag(tag) {
             for button in CONTROLLER_BUTTONS {
-                settings.manual_value_overrides.remove(&manual_button_tag(button));
+                settings
+                    .manual_value_overrides
+                    .remove(&manual_button_tag(button));
             }
             settings.manual_value_overrides.remove(&MANUAL_DPAD_TOUCH);
             settings.manual_value_overrides.remove(&MANUAL_STICK_TOUCH);
@@ -1464,18 +1516,10 @@ fn apply_manual_value(
     }
     match tag {
         MANUAL_DEADZONE => settings.deadzone = parse_clamped_f32(text, 0.0, 0.95)?,
-        MANUAL_X_TILT_RANGE => {
-            settings.x_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?
-        }
-        MANUAL_Y_TILT_RANGE => {
-            settings.y_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?
-        }
-        MANUAL_X_TILT_OFFSET => {
-            settings.x_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?
-        }
-        MANUAL_Y_TILT_OFFSET => {
-            settings.y_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?
-        }
+        MANUAL_X_TILT_RANGE => settings.x_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?,
+        MANUAL_Y_TILT_RANGE => settings.y_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?,
+        MANUAL_X_TILT_OFFSET => settings.x_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?,
+        MANUAL_Y_TILT_OFFSET => settings.y_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?,
         MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH => {
             let mapping = parse_touch_region(text)?;
             let target = if tag == MANUAL_DPAD_TOUCH {
@@ -1491,9 +1535,7 @@ fn apply_manual_value(
             settings.corruption_bytes_per_burst = parse_clamped_u32(text, 1, 64)?
         }
         MANUAL_CORRUPTION_MAX_OFFSET => settings.corruption_max_offset = parse_max_offset(text)?,
-        MANUAL_CORRUPTION_SEED => {
-            settings.corruption_seed = parse_clamped_u64(text, 0, u64::MAX)?
-        }
+        MANUAL_CORRUPTION_SEED => settings.corruption_seed = parse_clamped_u64(text, 0, u64::MAX)?,
         _ => {
             let button = manual_button_for_tag(tag)?;
             let value = text.trim();
@@ -1538,15 +1580,12 @@ fn manual_value_row(
 
 fn manual_value_enabled(tag: NSInteger, settings: &PickerSettings) -> bool {
     if tag == MANUAL_DEADZONE {
-        settings.controller_to_touch.map_or(true, |enabled| {
-            enabled && settings.stick_to_touch.is_some()
-        })
+        settings
+            .controller_to_touch
+            .map_or(true, |enabled| enabled && settings.stick_to_touch.is_some())
     } else if matches!(
         tag,
-        MANUAL_X_TILT_RANGE
-            | MANUAL_Y_TILT_RANGE
-            | MANUAL_X_TILT_OFFSET
-            | MANUAL_Y_TILT_OFFSET
+        MANUAL_X_TILT_RANGE | MANUAL_Y_TILT_RANGE | MANUAL_X_TILT_OFFSET | MANUAL_Y_TILT_OFFSET
     ) {
         settings.analog_stick_tilt_controls
     } else if matches!(tag, MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH)
@@ -1578,10 +1617,8 @@ fn refresh_manual_value_fields(
             release(env, value);
         }
         () = msg![env; field setEnabled:(manual_value_enabled(tag, settings))];
-        let description = ns_string::from_rust_string(
-            env,
-            manual_value_description(tag, width, height),
-        );
+        let description =
+            ns_string::from_rust_string(env, manual_value_description(tag, width, height));
         () = msg![env; description_label setText:description];
         release(env, description);
     }
@@ -1936,8 +1973,17 @@ const CLASSES: ClassExports = objc_classes! {
 - (())deleteCancel {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).delete_cancel = true;
 }
+- (())resetSettingsTapped {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_reset = true;
+}
 - (())deleteConfirm {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).delete_confirm = true;
+}
+- (())resetSettingsConfirm {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).reset_confirm = true;
+}
+- (())saveErrorDismiss {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).save_error_dismiss = true;
 }
 - (())swipeLeft {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_left = true;
@@ -2223,7 +2269,7 @@ fn app_picker_inner(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     env.window_mut()
         .set_preserve_aspect_ratio(picker_settings.preserve_aspect_ratio);
-    let renderer_mode_dropdown_enabled = cfg!(target_os = "android") && angle_backend_available;
+    let renderer_mode_dropdown_enabled = renderer_mode_dropdown_enabled();
     let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
     let overlay_hidden_by_environment = crate::gles::perf_overlay::hidden_by_environment();
     let initial_quick_options_show_fps = picker_settings.show_fps && !overlay_hidden_by_environment;
@@ -2242,31 +2288,13 @@ fn app_picker_inner(
         initial_quick_options_show_fps,
         show_fullscreen_row,
     );
-    let mut quick_options_scale_hack = picker_settings.scale_hack;
-    let mut quick_options_fullscreen = picker_settings.fullscreen;
-    let mut quick_options_orientation = picker_settings.orientation;
-    let mut quick_options_analog_stick_tilt_controls = picker_settings.analog_stick_tilt_controls;
-    let mut quick_options_network = picker_settings.network;
     let mut quick_options_show_fps = initial_quick_options_show_fps;
-    let mut quick_options_trace_gl_errors = picker_settings.trace_gl_errors;
-    let mut quick_options_trace_gl_draws = picker_settings.trace_gl_draws;
-    let mut quick_options_overlay_mode = picker_settings.overlay_mode;
-    let mut quick_options_overlay_corner = picker_settings.overlay_corner;
-    let mut quick_options_rotation_fix = picker_settings.rotation_fix;
-    let mut quick_options_fix_movie_player = picker_settings.fix_movie_player;
-    let mut quick_options_corruption_mode = picker_settings.corruption_mode;
-    let mut quick_options_gles2_mode = picker_settings.gles2_mode;
-    let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
-    let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
-    let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
-    let mut quick_options_cheat_engine = picker_settings.cheat_engine;
-    let mut quick_options_renderer_mode = picker_settings.renderer_mode;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
         ..Default::default()
     };
     let mut renderer_state = DropdownState {
-        selected: Some(renderer_mode_tag(quick_options_renderer_mode)),
+        selected: Some(renderer_mode_tag(picker_settings.renderer_mode)),
         ..Default::default()
     };
     let mut language_state = DropdownState {
@@ -2274,24 +2302,29 @@ fn app_picker_inner(
         ..Default::default()
     };
     let mut last_saved_picker_settings = picker_settings.clone();
+    let mut next_settings_save = Instant::now();
 
-    update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+    update_scale_hack_buttons(
+        env,
+        &settings.scale_hack_buttons,
+        picker_settings.scale_hack,
+    );
     update_orientation_buttons(
         env,
         &settings.orientation_buttons,
-        quick_options_orientation,
+        picker_settings.orientation,
     );
     update_performance_overlay_buttons(
         env,
         &settings.overlay_mode_buttons,
         &settings.overlay_corner_buttons,
-        quick_options_overlay_mode,
-        quick_options_overlay_corner,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
     );
     update_segment_buttons(
         env,
         &settings.corruption_mode_buttons,
-        quick_options_corruption_mode.selected_index() as usize,
+        picker_settings.corruption_mode.selected_index() as usize,
     );
     update_segment_buttons(
         env,
@@ -2306,9 +2339,13 @@ fn app_picker_inner(
     update_segment_buttons(
         env,
         &settings.gles2_mode_buttons,
-        quick_options_gles2_mode.selected_index() as usize,
+        picker_settings.gles2_mode.selected_index() as usize,
     );
-    update_segment_buttons(env, &settings.vsync_buttons, vsync_selected_index(picker_settings.vsync));
+    update_segment_buttons(
+        env,
+        &settings.vsync_buttons,
+        vsync_selected_index(picker_settings.vsync),
+    );
     update_segment_buttons(
         env,
         &settings.present_mode_buttons,
@@ -2358,7 +2395,30 @@ fn app_picker_inner(
     );
 
     // Built after the settings screen, so that it is drawn on top of it.
-    let delete_dialog = make_delete_dialog(env, delegate, main_view, app_frame.size);
+    let delete_dialog = make_delete_dialog(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        "deleteCancel",
+        "deleteConfirm",
+    );
+    let reset_dialog = make_delete_dialog(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        "deleteCancel",
+        "resetSettingsConfirm",
+    );
+    let save_error_dialog = make_delete_dialog(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        "saveErrorDismiss",
+        "saveErrorDismiss",
+    );
 
     () = msg![env; window makeKeyAndVisible];
 
@@ -2424,6 +2484,7 @@ fn app_picker_inner(
     // process exits.
     let (app_path, app_id) = loop {
         run_run_loop_single_iteration(env, main_run_loop);
+        update_settings_scrollbar(env, &settings);
         sync_dropdown_scroll(env, &settings.device_dropdown, &mut device_state);
         sync_dropdown_scroll(env, &settings.language_dropdown, &mut language_state);
         sync_dropdown_scroll(env, &settings.renderer_dropdown, &mut renderer_state);
@@ -2510,20 +2571,22 @@ fn app_picker_inner(
                 } else {
                     current_page.saturating_sub(1)
                 };
-                if !settings_open && pending_delete.is_none() && new_page < grid.pages.len() {
-                    if new_page != current_page {
-                        slide_to_page(
-                            env,
-                            main_run_loop,
-                            delegate,
-                            grid,
-                            apps.as_mut().unwrap(),
-                            new_page,
-                            if swipe_left { 1.0 } else { -1.0 },
-                        );
-                        current_page = new_page;
-                        update_page_dots(env, &page_dots, current_page);
-                    }
+                if !settings_open
+                    && pending_delete.is_none()
+                    && new_page < grid.pages.len()
+                    && new_page != current_page
+                {
+                    slide_to_page(
+                        env,
+                        main_run_loop,
+                        delegate,
+                        grid,
+                        apps.as_mut().unwrap(),
+                        new_page,
+                        if swipe_left { 1.0 } else { -1.0 },
+                    );
+                    current_page = new_page;
+                    update_page_dots(env, &page_dots, current_page);
                 }
             }
             continue;
@@ -2561,7 +2624,14 @@ fn app_picker_inner(
                 if let (Some(app_idx), Some(name)) = (app_idx, name) {
                     long_pressed_icon = Some(button);
                     pending_delete = Some(app_idx);
-                    show_delete_dialog(env, main_run_loop, delegate, &delete_dialog, &name);
+                    set_dialog_content(
+                        env,
+                        &delete_dialog,
+                        &format!("Delete “{name}”?"),
+                        "This will delete the app and all of its saved data.",
+                        Some("Delete"),
+                    );
+                    show_delete_dialog(env, main_run_loop, delegate, &delete_dialog);
                 }
             }
         }
@@ -2651,7 +2721,22 @@ fn app_picker_inner(
         }
 
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
-        if std::mem::take(&mut host_obj.recent_app_tapped) {
+        let recent_app_tapped = std::mem::take(&mut host_obj.recent_app_tapped);
+        let add_ipa = std::mem::take(&mut host_obj.add_ipa);
+        // Read every flag the settings screen set here, in one go.
+        let reset_request = if std::mem::take(&mut host_obj.settings_reset) {
+            ResetSettingsRequest::Ask
+        } else if std::mem::take(&mut host_obj.reset_confirm) {
+            ResetSettingsRequest::Confirm
+        } else if std::mem::take(&mut host_obj.save_error_dismiss) {
+            ResetSettingsRequest::DismissError
+        } else {
+            ResetSettingsRequest::None
+        };
+        // The reset handlers below need `env`, so the borrow ends here and is
+        // taken again for the handlers that still need `host_obj`.
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        if recent_app_tapped {
             if let Some((path, _, _)) = recent_app.as_ref() {
                 echo!("Picked last launched app: {}", path.display());
                 let app_id = BundleData::open_any(path)
@@ -2667,7 +2752,7 @@ fn app_picker_inner(
                 break (path.clone(), app_id);
             }
         }
-        if std::mem::take(&mut host_obj.add_ipa) {
+        if add_ipa {
             // Snapshot the .ipa files that exist right now, so that when the
             // system file picker finishes, we can detect the new file and
             // refresh the app grid.
@@ -2692,7 +2777,7 @@ fn app_picker_inner(
                 let _: bool = msg![env; field resignFirstResponder];
             }
             if let Some((tag, text)) = {
-                let mut host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
                 std::mem::take(&mut host_obj.manual_value)
             } {
                 let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
@@ -2734,27 +2819,46 @@ fn app_picker_inner(
             }
             hide_settings_screen(env, main_run_loop, delegate, &settings);
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
-            quick_options_scale_hack = None;
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = None;
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack1) {
-            quick_options_scale_hack = NonZeroU32::new(1);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(1);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack2) {
-            quick_options_scale_hack = NonZeroU32::new(2);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(2);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack3) {
-            quick_options_scale_hack = NonZeroU32::new(3);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(3);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack4) {
-            quick_options_scale_hack = NonZeroU32::new(4);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(4);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.orientation_default) {
-            quick_options_orientation = None;
-            picker_settings.orientation = quick_options_orientation;
+            picker_settings.orientation = None;
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
             );
             let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
             refresh_manual_value_fields(
@@ -2765,12 +2869,11 @@ fn app_picker_inner(
                 &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_left) {
-            quick_options_orientation = Some(DeviceOrientation::LandscapeLeft);
-            picker_settings.orientation = quick_options_orientation;
+            picker_settings.orientation = Some(DeviceOrientation::LandscapeLeft);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
             );
             let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
             refresh_manual_value_fields(
@@ -2781,12 +2884,11 @@ fn app_picker_inner(
                 &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_right) {
-            quick_options_orientation = Some(DeviceOrientation::LandscapeRight);
-            picker_settings.orientation = quick_options_orientation;
+            picker_settings.orientation = Some(DeviceOrientation::LandscapeRight);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
             );
             let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
             refresh_manual_value_fields(
@@ -2797,12 +2899,11 @@ fn app_picker_inner(
                 &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_portrait_upside_down) {
-            quick_options_orientation = Some(DeviceOrientation::PortraitUpsideDown);
-            picker_settings.orientation = quick_options_orientation;
+            picker_settings.orientation = Some(DeviceOrientation::PortraitUpsideDown);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
             );
             let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
             refresh_manual_value_fields(
@@ -2850,7 +2951,7 @@ fn app_picker_inner(
         } else if let Some(tag) = std::mem::take(&mut host_obj.renderer_mode_tag) {
             renderer_state.selected = Some(tag);
             renderer_state.open = false;
-            quick_options_renderer_mode = renderer_mode_from_tag(Some(tag));
+            picker_settings.renderer_mode = renderer_mode_from_tag(Some(tag));
             refresh_dropdown(
                 env,
                 &settings.renderer_dropdown,
@@ -2985,7 +3086,6 @@ fn app_picker_inner(
                 &mut picker_settings,
             );
         } else if let Some(enabled) = std::mem::take(&mut host_obj.analog_stick_tilt_controls) {
-            quick_options_analog_stick_tilt_controls = enabled;
             picker_settings.analog_stick_tilt_controls = enabled;
             let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
             refresh_manual_value_fields(
@@ -2996,60 +3096,58 @@ fn app_picker_inner(
                 &mut picker_settings,
             );
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
-            quick_options_network = enabled;
+            picker_settings.network = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.game_center_authenticated) {
             picker_settings.game_center_authenticated = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
-            quick_options_cheat_engine = enabled;
+            picker_settings.cheat_engine = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
             picker_settings.show_fps = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_errors) {
-            quick_options_trace_gl_errors = enabled;
             picker_settings.trace_gl_errors = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_draws) {
-            quick_options_trace_gl_draws = enabled;
             picker_settings.trace_gl_draws = enabled;
         } else if let Some(mode) = std::mem::take(&mut host_obj.overlay_mode) {
-            quick_options_overlay_mode = mode;
+            picker_settings.overlay_mode = mode;
             update_performance_overlay_buttons(
                 env,
                 &settings.overlay_mode_buttons,
                 &settings.overlay_corner_buttons,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
             env.window_mut().set_performance_overlay_settings(
                 quick_options_show_fps,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
         } else if let Some(corner) = std::mem::take(&mut host_obj.overlay_corner) {
-            quick_options_overlay_corner = corner;
+            picker_settings.overlay_corner = corner;
             update_performance_overlay_buttons(
                 env,
                 &settings.overlay_mode_buttons,
                 &settings.overlay_corner_buttons,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
             env.window_mut().set_performance_overlay_settings(
                 quick_options_show_fps,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
         } else if let Some(rotation_fix) = std::mem::take(&mut host_obj.rotation_fix) {
-            quick_options_rotation_fix = Some(rotation_fix);
+            picker_settings.rotation_fix = Some(rotation_fix);
         } else if let Some(fix_movie_player) = std::mem::take(&mut host_obj.fix_movie_player) {
-            quick_options_fix_movie_player = Some(fix_movie_player);
+            picker_settings.fix_movie_player = Some(fix_movie_player);
         } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
-            quick_options_corruption_mode = host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
+            picker_settings.corruption_mode =
+                host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
             update_segment_buttons(
                 env,
                 &settings.corruption_mode_buttons,
-                quick_options_corruption_mode.selected_index() as usize,
+                picker_settings.corruption_mode.selected_index() as usize,
             );
-            picker_settings.corruption_mode = quick_options_corruption_mode;
             let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
             refresh_manual_value_fields(
                 env,
@@ -3058,10 +3156,6 @@ fn app_picker_inner(
                 height,
                 &mut picker_settings,
             );
-            if picker_settings != last_saved_picker_settings {
-                picker_settings.save();
-                last_saved_picker_settings = picker_settings.clone();
-            }
         } else if let Some(preset) = std::mem::take(&mut host_obj.corruption_startup_delay) {
             picker_settings.corruption_startup_delay = preset;
             update_segment_buttons(
@@ -3069,10 +3163,6 @@ fn app_picker_inner(
                 &settings.corruption_startup_delay_buttons,
                 preset.selected_index(),
             );
-            if picker_settings != last_saved_picker_settings {
-                picker_settings.save();
-                last_saved_picker_settings = picker_settings.clone();
-            }
         } else if let Some(preset) = std::mem::take(&mut host_obj.corruption_cooldown) {
             picker_settings.corruption_cooldown = preset;
             update_segment_buttons(
@@ -3080,35 +3170,26 @@ fn app_picker_inner(
                 &settings.corruption_cooldown_buttons,
                 preset.selected_index(),
             );
-            if picker_settings != last_saved_picker_settings {
-                picker_settings.save();
-                last_saved_picker_settings = picker_settings.clone();
-            }
         } else if let Some(mode) = std::mem::take(&mut host_obj.gles2_mode) {
-            quick_options_gles2_mode = mode;
+            picker_settings.gles2_mode = mode;
             update_segment_buttons(
                 env,
                 &settings.gles2_mode_buttons,
-                quick_options_gles2_mode.selected_index() as usize,
+                picker_settings.gles2_mode.selected_index() as usize,
             );
-            picker_settings.gles2_mode = mode;
-            if picker_settings != last_saved_picker_settings {
-                picker_settings.save();
-                last_saved_picker_settings = picker_settings.clone();
-            }
         } else if let Some(preserve_aspect_ratio) =
             std::mem::take(&mut host_obj.preserve_aspect_ratio)
         {
-            quick_options_preserve_aspect_ratio = preserve_aspect_ratio;
+            picker_settings.preserve_aspect_ratio = preserve_aspect_ratio;
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             env.window_mut()
                 .set_preserve_aspect_ratio(preserve_aspect_ratio);
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_lock_screen) {
-            quick_options_show_lock_screen = enabled;
+            picker_settings.show_lock_screen = enabled;
         } else if let Some(force_composition) = std::mem::take(&mut host_obj.force_composition) {
-            quick_options_force_composition_override = Some(force_composition);
+            picker_settings.force_composition = force_composition;
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
-            quick_options_fullscreen = fullscreen;
+            picker_settings.fullscreen = fullscreen;
         }
 
         let wheel = PENDING_MOUSE_WHEEL.swap(0, Ordering::Relaxed);
@@ -3143,30 +3224,42 @@ fn app_picker_inner(
             }
         }
 
-        picker_settings.scale_hack = quick_options_scale_hack;
-        picker_settings.orientation = quick_options_orientation;
-        picker_settings.fullscreen = quick_options_fullscreen;
-        picker_settings.preserve_aspect_ratio = quick_options_preserve_aspect_ratio;
-        picker_settings.renderer_mode = quick_options_renderer_mode;
-        picker_settings.show_lock_screen = quick_options_show_lock_screen;
-        picker_settings.force_composition =
-            quick_options_force_composition_override.unwrap_or(env.options.force_composition);
-        picker_settings.overlay_mode = quick_options_overlay_mode;
-        picker_settings.overlay_corner = quick_options_overlay_corner;
-        picker_settings.rotation_fix = quick_options_rotation_fix;
-        picker_settings.fix_movie_player = quick_options_fix_movie_player;
-        picker_settings.corruption_mode = quick_options_corruption_mode;
-        picker_settings.gles2_mode = quick_options_gles2_mode;
-        picker_settings.cheat_engine = quick_options_cheat_engine;
-        picker_settings.network = quick_options_network;
-        picker_settings.trace_gl_errors = quick_options_trace_gl_errors;
-        picker_settings.trace_gl_draws = quick_options_trace_gl_draws;
-        picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
         picker_settings.device_model_tag = device_state.selected;
         picker_settings.language_tag = language_state.selected;
-        if picker_settings != last_saved_picker_settings {
-            picker_settings.save();
-            last_saved_picker_settings = picker_settings.clone();
+
+        let mut drafts = SettingsDrafts {
+            picker_settings: picker_settings.clone(),
+            last_saved_picker_settings: last_saved_picker_settings.clone(),
+            device_state: device_state.clone(),
+            language_state: language_state.clone(),
+            renderer_state: renderer_state.clone(),
+        };
+        handle_reset_settings_request(
+            env,
+            reset_request,
+            main_run_loop,
+            delegate,
+            (&settings, &reset_dialog, &save_error_dialog, &mut drafts),
+        );
+        picker_settings = drafts.picker_settings;
+        last_saved_picker_settings = drafts.last_saved_picker_settings;
+        device_state = drafts.device_state;
+        language_state = drafts.language_state;
+        renderer_state = drafts.renderer_state;
+
+        if is_dialog_visible(env, &reset_dialog) || is_dialog_visible(env, &save_error_dialog) {
+            // While a confirmation or error dialog is up, only the dialog's
+            // own buttons may change the settings.
+        } else if picker_settings != last_saved_picker_settings
+            && Instant::now() >= next_settings_save
+        {
+            match picker_settings.save() {
+                Ok(()) => last_saved_picker_settings = picker_settings.clone(),
+                Err(error) => {
+                    log!("Warning: couldn't save app picker settings: {error}");
+                    next_settings_save = Instant::now() + Duration::from_secs(1);
+                }
+            }
         }
 
         // Detect .ipa files copied in by the "+" tile flow and refresh the
@@ -3195,10 +3288,10 @@ fn app_picker_inner(
     };
 
     // Apply user-specified overrides
-    if let Some(scale_hack) = quick_options_scale_hack {
+    if let Some(scale_hack) = picker_settings.scale_hack {
         option_args.push(format!("--scale-hack={}", scale_hack.get()));
     }
-    if let Some(orientation) = quick_options_orientation {
+    if let Some(orientation) = picker_settings.orientation {
         option_args.push(
             match orientation {
                 DeviceOrientation::LandscapeLeft => "--landscape-left",
@@ -3209,14 +3302,14 @@ fn app_picker_inner(
             .to_string(),
         );
     }
-    if quick_options_fullscreen {
+    if picker_settings.fullscreen {
         option_args.push("--fullscreen".to_string());
     } else {
         option_args.push("--no-fullscreen".to_string());
     }
     if show_fullscreen_row {
         option_args.push(
-            if quick_options_preserve_aspect_ratio {
+            if picker_settings.preserve_aspect_ratio {
                 "--preserve-aspect-ratio"
             } else {
                 "--no-preserve-aspect-ratio"
@@ -3224,24 +3317,22 @@ fn app_picker_inner(
             .to_string(),
         );
     }
-    if !quick_options_analog_stick_tilt_controls {
+    if !picker_settings.analog_stick_tilt_controls {
         option_args.push("--disable-analog-stick-tilt-controls".to_string());
     } else {
         option_args.push("--enable-analog-stick-tilt-controls".to_string());
     }
-    if quick_options_network {
+    if picker_settings.network {
         option_args.push("--allow-network-access".to_string());
     } else {
         option_args.push("--no-network-access".to_string());
     }
-    option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
+    option_args.push(quick_options_trainer_argument(picker_settings.cheat_engine).to_string());
     // Saved diagnostic switches override command-line and options-file values.
-    option_args.push(
-        quick_options_trace_gl_errors_argument(quick_options_trace_gl_errors).to_string(),
-    );
-    option_args.push(
-        quick_options_trace_gl_draws_argument(quick_options_trace_gl_draws).to_string(),
-    );
+    option_args
+        .push(quick_options_trace_gl_errors_argument(picker_settings.trace_gl_errors).to_string());
+    option_args
+        .push(quick_options_trace_gl_draws_argument(picker_settings.trace_gl_draws).to_string());
     option_args.push(
         if picker_settings.game_center_authenticated {
             "--game-center-authenticated"
@@ -3253,8 +3344,8 @@ fn app_picker_inner(
 
     env.window_mut().set_performance_overlay_settings(
         quick_options_show_fps,
-        quick_options_overlay_mode,
-        quick_options_overlay_corner,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
     );
     option_args.push(format!(
         "--overlay={}",
@@ -3262,25 +3353,26 @@ fn app_picker_inner(
     ));
     option_args.push(format!(
         "--overlay-mode={}",
-        quick_options_overlay_mode.short_name()
+        picker_settings.overlay_mode.short_name()
     ));
     option_args.push(format!(
         "--overlay-corner={}",
-        quick_options_overlay_corner.short_name()
+        picker_settings.overlay_corner.short_name()
     ));
 
-    if let Some(enabled) = quick_options_force_composition_override {
-        option_args.push(quick_options_force_composition_argument(enabled).to_string());
-    }
+    option_args.push(
+        quick_options_force_composition_argument(picker_settings.force_composition).to_string(),
+    );
 
     // Always passed explicitly so the picker's renderer choice wins over
     // options-file settings, including legacy --gles-native switches.
-    option_args.push(quick_options_renderer_mode_argument(quick_options_renderer_mode).to_string());
+    option_args
+        .push(quick_options_renderer_mode_argument(picker_settings.renderer_mode).to_string());
     // The two compatibility fixes are only emitted when the Settings screen
     // actually set them (see `quick_options_fix_arguments`).
     option_args.extend(quick_options_fix_arguments(
-        quick_options_rotation_fix,
-        quick_options_fix_movie_player,
+        picker_settings.rotation_fix,
+        picker_settings.fix_movie_player,
     ));
 
     if let Some(tag) = device_state.selected {
@@ -3299,7 +3391,7 @@ fn app_picker_inner(
     }
 
     option_args.extend(quick_options_picker_settings_arguments(&picker_settings));
-    option_args.extend(quick_options_gles2_mode.arguments());
+    option_args.extend(picker_settings.gles2_mode.arguments());
 
     // Return the environment so some parts of it can be salvaged.
     (app_path, option_args)
@@ -4968,6 +5060,42 @@ fn set_offscreen_scroll_items_hidden(
     }
 }
 
+/// Puts the settings scrollbar in step with `scroll_view`: the thumb spans the
+/// part of the list that is on screen and moves down the track as it scrolls.
+fn update_settings_scrollbar(env: &mut Environment, settings: &SettingsStuff) {
+    let settings_view = settings.main_view;
+    let hidden: bool = msg![env; settings_view isHidden];
+    if hidden {
+        return;
+    }
+    let scroll = settings.scroll_view;
+    let bounds: CGRect = msg![env; scroll bounds];
+    let content_size: CGSize = msg![env; scroll contentSize];
+    let offset: CGPoint = msg![env; scroll contentOffset];
+    let list_height = settings.list_height;
+    let content_height = content_size.height.max(bounds.size.height);
+    // A list that fits needs no thumb: the track alone says there is nothing
+    // more to scroll.
+    if content_height - list_height < 1.0 {
+        () = msg![env; (settings.scrollbar_thumb) setHidden:true];
+        return;
+    }
+    () = msg![env; (settings.scrollbar_thumb) setHidden:false];
+    let thumb_height = (list_height * list_height / content_height).max(48.0);
+    let travel = (list_height - thumb_height).max(0.0);
+    let scrolled = (offset.y / (content_height - list_height)).clamp(0.0, 1.0);
+    let thumb_frame = CGRect {
+        origin: CGPoint {
+            x: settings.scrollbar_x,
+            y: settings.list_top + scrolled * travel,
+        },
+        size: CGSize {
+            width: SETTINGS_SCROLLBAR_WIDTH,
+            height: thumb_height,
+        },
+    };
+    () = msg![env; (settings.scrollbar_thumb) setFrame:thumb_frame];
+}
 /// Opens the Settings screen with the same centered pop-in animation as
 /// [show_delete_dialog]: the screen dims while the view grows from the center
 /// and fades in over [DELETE_DIALOG_APPEAR_DURATION].
@@ -4999,6 +5127,7 @@ fn show_settings_screen(
     }
 
     set_offscreen_scroll_items_hidden(env, settings, true);
+    update_settings_scrollbar(env, settings);
     animate_for(
         env,
         run_loop,
@@ -5214,6 +5343,12 @@ enum SettingsRow {
     Toggle(&'static str, &'static str, &'static str, bool, bool),
     /// Renderer mode dropdown.
     RendererDropdown(&'static str, &'static str),
+    /// A full-width action row with centered red text, like the old-iOS
+    /// "Delete Account" cell.
+    Button {
+        title: &'static str,
+        selector: &'static str,
+    },
     /// A single-line value committed when its text field resigns first responder.
     ManualValue {
         title: String,
@@ -5269,7 +5404,12 @@ fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CG
             let text_width = inner_width - 2.0 * side;
             8.0 + settings_text_height(env, *title, 15.0, text_width)
                 + 4.0
-                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + settings_text_height(
+                    env,
+                    *description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
                 + 8.0
                 + 24.0
                 + 8.0
@@ -5277,7 +5417,12 @@ fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CG
         SettingsRow::Toggle(title, description, _, _, _) => {
             let text_width = inner_width - 2.0 * side - 94.0 - 8.0;
             (settings_text_height(env, *title, 16.0, text_width)
-                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + settings_text_height(
+                    env,
+                    *description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
                 + 12.0)
                 .max(27.0)
                 + 16.0
@@ -5285,7 +5430,12 @@ fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CG
         SettingsRow::DeviceDropdown(title, description) => {
             let text_width = inner_width - 2.0 * side - 190.0 - 8.0;
             (settings_text_height(env, *title, 14.0, text_width)
-                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + settings_text_height(
+                    env,
+                    *description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
                 + 12.0)
                 .max(30.0)
                 + 16.0
@@ -5293,7 +5443,12 @@ fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CG
         SettingsRow::LanguageDropdown(title, description) => {
             let text_width = inner_width - 2.0 * side - 170.0 - 8.0;
             (settings_text_height(env, *title, 16.0, text_width)
-                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + settings_text_height(
+                    env,
+                    *description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
                 + 12.0)
                 .max(30.0)
                 + 16.0
@@ -5301,17 +5456,32 @@ fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CG
         SettingsRow::RendererDropdown(title, description) => {
             let text_width = inner_width - 2.0 * side - 130.0 - 8.0;
             (settings_text_height(env, *title, 14.0, text_width)
-                + settings_text_height(env, *description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + settings_text_height(
+                    env,
+                    *description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
                 + 12.0)
                 .max(30.0)
                 + 16.0
         }
-        SettingsRow::ManualValue { title, description, .. } => {
+        SettingsRow::Button { title, .. } => {
+            settings_text_height(env, title, 16.0, inner_width - 2.0 * side) + 24.0
+        }
+        SettingsRow::ManualValue {
+            title, description, ..
+        } => {
             let text_width = inner_width - 2.0 * side - 128.0 - 12.0;
             (settings_text_height(env, title, 15.0, text_width)
-                + settings_text_height(env, description, SETTINGS_DESCRIPTION_FONT_SIZE, text_width)
+                + settings_text_height(
+                    env,
+                    description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
                 + 12.0)
-            .max(42.0)
+                .max(42.0)
                 + 16.0
         }
     }
@@ -5332,6 +5502,14 @@ struct SettingsStuff {
     full_height: CGFloat,
     /// Vertical origin of `scroll_view` inside `main_view`.
     scroll_origin_y: CGFloat,
+    /// The thumb of the scrollbar down the right edge of the settings list,
+    /// moved to follow `scroll_view`'s offset.
+    scrollbar_thumb: id,
+    /// Left edge of the scrollbar, which is in `main_view` coordinates.
+    scrollbar_x: CGFloat,
+    /// Top and height of `scroll_view` inside `main_view`.
+    list_top: CGFloat,
+    list_height: CGFloat,
     scale_hack_buttons: [id; 5],
     orientation_buttons: [id; 4],
     overlay_mode_buttons: Vec<id>,
@@ -5345,6 +5523,9 @@ struct SettingsStuff {
     texture_filter_buttons: Vec<id>,
     present_rotate_buttons: Vec<id>,
     controller_to_touch_buttons: Vec<id>,
+    /// `(selector, switch)` for each toggle row, so a reset can put every
+    /// switch back where the new settings say it should be.
+    toggle_switches: Vec<(&'static str, id)>,
     manual_value_fields: Vec<(NSInteger, id, id)>,
     /// The "Device model" dropdown.
     device_dropdown: SettingsDropdown,
@@ -5383,7 +5564,7 @@ struct DropdownSpec {
 }
 
 /// The state that the picker keeps for one settings dropdown.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DropdownState {
     /// The tag of the chosen entry, or `None` for the default.
     selected: Option<i32>,
@@ -5576,10 +5757,38 @@ fn setup_settings(
         height - SETTINGS_NAV_BAR_HEIGHT,
     ))];
     () = msg![env; scroll setBackgroundColor:clear];
-    // Clip the scrolled content to the scroll view, so it never slides up
-    // over the navigation bar.
+    // Clip the scrolled content so it never slides up over the navigation bar.
+    // The list also stops short of the scrollbar, so rows never draw over it.
     () = msg![env; scroll setClipsToBounds:true];
+    () = msg![env; scroll setFrame:(rect(
+        0.0,
+        SETTINGS_NAV_BAR_HEIGHT + status_offset,
+        width - SETTINGS_SCROLLBAR_WIDTH,
+        height - SETTINGS_NAV_BAR_HEIGHT,
+    ))];
     () = msg![env; settings_view addSubview:scroll];
+    // A scrollbar down the right edge, like the ones beside the dropdown
+    // lists, so a long list of settings shows where you are in it.
+    let list_top = SETTINGS_NAV_BAR_HEIGHT + status_offset;
+    let list_height = height - SETTINGS_NAV_BAR_HEIGHT;
+    let scrollbar_x = width - SETTINGS_SCROLLBAR_WIDTH;
+    // Built in locals: `new_view` borrows `env`, so `ui_color` can't be called
+    // in its argument list.
+    let track_color = ui_color(env, 0.55, 0.58, 0.62, 0.18);
+    let thumb_color = ui_color(env, 0.30, 0.32, 0.36, 0.75);
+    let track = new_view(
+        env,
+        rect(scrollbar_x, list_top, SETTINGS_SCROLLBAR_WIDTH, list_height),
+        track_color,
+    );
+    () = msg![env; settings_view addSubview:track];
+    let scrollbar_thumb = new_view(
+        env,
+        rect(scrollbar_x, list_top, SETTINGS_SCROLLBAR_WIDTH, 0.0),
+        thumb_color,
+    );
+    () = msg![env; settings_view addSubview:scrollbar_thumb];
+    () = msg![env; settings_view bringSubviewToFront:scrollbar_thumb];
     // The navigation bar must stay on top of the scrolled content.
     () = msg![env; settings_view bringSubviewToFront:nav_bar];
     () = msg![env; settings_view bringSubviewToFront:nav_separator];
@@ -5937,6 +6146,10 @@ fn setup_settings(
     sections.push((
         "EMULATION",
         vec![
+        SettingsRow::Button {
+            title: "Reset all settings",
+            selector: "resetSettingsTapped",
+        },
             SettingsRow::Toggle(
                 "Cheat Engine",
                 "Enables the built-in cheat interface for supported games. It does not add cheats to every game.",
@@ -5986,6 +6199,7 @@ fn setup_settings(
     let mut texture_filter_buttons = Vec::new();
     let mut present_rotate_buttons = Vec::new();
     let mut controller_to_touch_buttons = Vec::new();
+    let mut toggle_switches: Vec<(&'static str, id)> = Vec::new();
     let mut manual_value_fields = Vec::new();
     let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
     // Where dropdown menus open: just under the navigation bar.
@@ -6095,9 +6309,7 @@ fn setup_settings(
                         "presentModeAuto" => present_mode_buttons = seg_buttons,
                         "textureFilterDefault" => texture_filter_buttons = seg_buttons,
                         "presentRotateDefault" => present_rotate_buttons = seg_buttons,
-                        "controllerToTouchDefault" => {
-                            controller_to_touch_buttons = seg_buttons
-                        }
+                        "controllerToTouchDefault" => controller_to_touch_buttons = seg_buttons,
                         _ => unreachable!(),
                     }
                 }
@@ -6238,7 +6450,7 @@ fn setup_settings(
                     () = msg![env; (dropdown.button) setEnabled:renderer_mode_dropdown_enabled];
                     renderer_dropdown = Some(dropdown);
                 }
-                SettingsRow::Toggle(title, description, selector, default_state, enabled) => {
+                SettingsRow::Toggle(title, description, selector_name, default_state, enabled) => {
                     // Keep every switch the same size; let long labels wrap
                     // within the remaining row width instead of shrinking the
                     // control or drawing text underneath it.
@@ -6281,11 +6493,35 @@ fn setup_settings(
                     ))];
                     () = msg![env; switch setOn:default_state];
                     () = msg![env; switch setEnabled:enabled];
-                    let selector = env.objc.lookup_selector(selector).unwrap();
+                    let selector = env.objc.lookup_selector(selector_name).unwrap();
                     () = msg![env; switch addTarget:delegate
                                              action:selector
                                    forControlEvents:UIControlEventValueChanged];
                     () = msg![env; group addSubview:switch];
+                    toggle_switches.push((selector_name, switch));
+                }
+                SettingsRow::Button { title, selector } => {
+                    let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+                    () = msg![env; button setFrame:(rect(side, row_y, inner_width - 2.0 * side, row_height))];
+                    let clear: id = msg_class![env; UIColor clearColor];
+                    () = msg![env; button setBackgroundColor:clear];
+                    let text = ns_string::from_rust_string(env, title.to_string());
+                    () = msg![env; button setTitle:text forState:UIControlStateNormal];
+                    release(env, text);
+                    let red = ui_color(env, 0.88, 0.18, 0.20, 1.0);
+                    () = msg![env; button setTitleColor:red forState:UIControlStateNormal];
+                    // FIXME: manually calling layoutSubviews shouldn't be
+                    // needed?
+                    () = msg![env; button layoutSubviews];
+                    let label: id = msg![env; button titleLabel];
+                    let font: id = msg_class![env; UIFont systemFontOfSize:(16.0 as CGFloat)];
+                    () = msg![env; label setFont:font];
+                    () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+                    let selector = env.objc.lookup_selector(selector).unwrap();
+                    () = msg![env; button addTarget:delegate
+                action:selector
+                forControlEvents:UIControlEventTouchUpInside];
+                    () = msg![env; group addSubview:button];
                 }
                 SettingsRow::ManualValue {
                     title,
@@ -6296,7 +6532,7 @@ fn setup_settings(
                     text_keyboard,
                 } => {
                     let field_width: CGFloat = 120.0;
-            let text_width = inner_width - 2.0 * side - field_width - 20.0;
+                    let text_width = inner_width - 2.0 * side - field_width - 20.0;
                     let title_height = settings_text_height(env, &title, 15.0, text_width);
                     let description_height = settings_text_height(
                         env,
@@ -6337,8 +6573,11 @@ fn setup_settings(
                     () = msg![env; field setTextColor:black];
                     () = msg![env; field setTextAlignment:UITextAlignmentCenter];
                     () = msg![env; field setBackgroundColor:manual_value_background];
-                    let field_font_size: CGFloat =
-                        if tag == MANUAL_CORRUPTION_SEED { 10.5 } else { 13.0 };
+                    let field_font_size: CGFloat = if tag == MANUAL_CORRUPTION_SEED {
+                        10.5
+                    } else {
+                        13.0
+                    };
                     let field_font: id = msg_class![env; UIFont systemFontOfSize:field_font_size];
                     () = msg![env; field setFont:field_font];
                     () = msg![env; field setTag:tag];
@@ -6396,6 +6635,10 @@ fn setup_settings(
         scroll_items,
         full_height,
         scroll_origin_y: SETTINGS_NAV_BAR_HEIGHT + status_offset,
+        scrollbar_thumb,
+        scrollbar_x,
+        list_top,
+        list_height,
         scale_hack_buttons: scale_hack_buttons.try_into().unwrap(),
         orientation_buttons: orientation_buttons.try_into().unwrap(),
         overlay_mode_buttons,
@@ -6409,6 +6652,7 @@ fn setup_settings(
         texture_filter_buttons,
         present_rotate_buttons,
         controller_to_touch_buttons,
+        toggle_switches,
         manual_value_fields,
         device_dropdown: device_dropdown
             .expect("the settings screen always has a device model row"),
@@ -6430,6 +6674,8 @@ const DEVICE_TAG_AUTO: NSInteger = 1001;
 const DEVICE_MENU_VISIBLE_ITEMS: usize = 6;
 /// Height of a single row in the device-model dropdown.
 const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 30.0;
+/// Width of the scrollbar down the right edge of the settings list.
+const SETTINGS_SCROLLBAR_WIDTH: CGFloat = 10.0;
 
 /// The choices shown in the device-model dropdown, in display order, as
 /// `(title, tag)` pairs: "Default" (no override), "Auto" (match host screen),
@@ -6859,8 +7105,15 @@ struct DeleteDialog {
     dimmer: id,
     /// The alert box, with its title, message and buttons.
     panel: id,
-    /// Names the app being deleted.
+    /// The dialog's title, set each time it opens.
     title: id,
+    /// The explanatory line under the title.
+    message: id,
+    /// The action buttons.
+    cancel: id,
+    confirm: id,
+    /// The separator between the two buttons.
+    vertical_separator: id,
 }
 
 /// Builds one button of an alert box.
@@ -6897,20 +7150,24 @@ fn make_alert_button(
     button
 }
 
-/// Builds the delete dialog to match the old-iOS Settings screen: a white
+/// Builds an alert dialog matching the old-iOS Settings screen: a white
 /// grouped card with a soft gray outline, separators, and blue/red text actions.
-/// It is hidden until [show_delete_dialog].
+/// [set_dialog_content] fills in the text when it opens, so the title, message
+/// and confirm button are deliberately left empty here.
+#[allow(clippy::too_many_arguments)]
 fn make_delete_dialog(
     env: &mut Environment,
     delegate: id,
     main_view: id,
     screen_size: CGSize,
+    cancel_selector: &str,
+    confirm_selector: &str,
 ) -> DeleteDialog {
     let dimmer: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     () = msg![env; dimmer setFrame:(rect(0.0, 0.0, screen_size.width, screen_size.height))];
     let dim_color = ui_color(env, 0.0, 0.0, 0.0, 0.4);
     () = msg![env; dimmer setBackgroundColor:dim_color];
-    let cancel_sel = env.objc.lookup_selector("deleteCancel").unwrap();
+    let cancel_sel = env.objc.lookup_selector(cancel_selector).unwrap();
     () = msg![env; dimmer addTarget:delegate
                              action:cancel_sel
                    forControlEvents:UIControlEventTouchUpInside];
@@ -6951,7 +7208,7 @@ fn make_delete_dialog(
     let message = new_label(
         env,
         rect(12.0, 58.0, DELETE_DIALOG_WIDTH - 24.0, 52.0),
-        "This will delete the app and all of its saved data.",
+        "",
         14.0,
         false,
         message_color,
@@ -6985,24 +7242,28 @@ fn make_delete_dialog(
         "Cancel",
         blue,
         false,
-        "deleteCancel",
+        cancel_selector,
     );
     () = msg![env; panel addSubview:cancel];
-    let delete = make_alert_button(
+    let confirm = make_alert_button(
         env,
         delegate,
         rect(half, button_y, half, DELETE_DIALOG_BUTTON_HEIGHT),
-        "Delete",
+        "Action",
         red,
         true,
-        "deleteConfirm",
+        confirm_selector,
     );
-    () = msg![env; panel addSubview:delete];
+    () = msg![env; panel addSubview:confirm];
 
     DeleteDialog {
         dimmer,
         panel,
         title,
+        message,
+        cancel,
+        confirm,
+        vertical_separator: v_separator,
     }
 }
 
@@ -7011,18 +7272,10 @@ fn make_delete_dialog(
 const DELETE_DIALOG_APPEAR_DURATION: Duration = Duration::from_millis(200);
 const DELETE_DIALOG_START_SCALE: f64 = 0.8;
 
-/// Opens the delete dialog for the app called `app_name`, with the same
-/// pop-in as an old iOS alert: the screen dims and the box grows and fades in.
-fn show_delete_dialog(
-    env: &mut Environment,
-    run_loop: id,
-    delegate: id,
-    dialog: &DeleteDialog,
-    app_name: &str,
-) {
-    let title = ns_string::from_rust_string(env, format!("Delete “{app_name}”?"));
-    () = msg![env; (dialog.title) setText:title];
-    release(env, title);
+/// Opens `dialog` with the old iOS alert pop-in: the screen dims and the box
+/// grows and fades in. `title`, `message` and the buttons must be set first
+/// (see [set_dialog_content]).
+fn show_delete_dialog(env: &mut Environment, run_loop: id, delegate: id, dialog: &DeleteDialog) {
     () = msg![env; (dialog.dimmer) setAlpha:(0.0 as CGFloat)];
     () = msg![env; (dialog.dimmer) setHidden:false];
     () = msg![env; (dialog.panel) setAlpha:(0.0 as CGFloat)];
@@ -7041,6 +7294,46 @@ fn show_delete_dialog(
             () = msg![env; (dialog.dimmer) setAlpha:alpha];
         },
     );
+}
+
+/// Fills in a dialog's text and buttons. `confirm` is the title of the red
+/// action button, or `None` for a single-button notice.
+fn set_dialog_content(
+    env: &mut Environment,
+    dialog: &DeleteDialog,
+    title: &str,
+    message: &str,
+    confirm: Option<&str>,
+) {
+    let title_text = ns_string::from_rust_string(env, title.to_string());
+    () = msg![env; (dialog.title) setText:title_text];
+    release(env, title_text);
+    let message_text = ns_string::from_rust_string(env, message.to_string());
+    () = msg![env; (dialog.message) setText:message_text];
+    release(env, message_text);
+    let cancel_width = match confirm {
+        Some(confirm) => {
+            let text = ns_string::from_rust_string(env, confirm.to_string());
+            () = msg![env; (dialog.confirm) setTitle:text forState:UIControlStateNormal];
+            release(env, text);
+            () = msg![env; (dialog.confirm) setHidden:false];
+            () = msg![env; (dialog.vertical_separator) setHidden:false];
+            DELETE_DIALOG_WIDTH / 2.0
+        }
+        None => {
+            () = msg![env; (dialog.confirm) setHidden:true];
+            () = msg![env; (dialog.vertical_separator) setHidden:true];
+            DELETE_DIALOG_WIDTH
+        }
+    };
+    let frame: CGRect = msg![env; (dialog.cancel) frame];
+    () = msg![env; (dialog.cancel) setFrame:(CGRect {
+        origin: frame.origin,
+        size: CGSize {
+            width: cancel_width,
+            height: frame.size.height,
+        },
+    })];
 }
 
 /// How long the delete dialog takes to disappear. It is the reverse of
@@ -7065,6 +7358,238 @@ fn hide_delete_dialog(env: &mut Environment, run_loop: id, delegate: id, dialog:
     );
     () = msg![env; (dialog.dimmer) setHidden:true];
     () = msg![env; (dialog.panel) setHidden:true];
+}
+
+/// Whether `dialog` is currently on screen. Used to pause saving while a
+/// dialog is up, so only the dialog's own buttons change the settings.
+fn is_dialog_visible(env: &mut Environment, dialog: &DeleteDialog) -> bool {
+    !msg![env; (dialog.panel) isHidden]
+}
+
+/// The value a settings switch named `selector` must show for `settings`.
+/// Returns `None` for a name that no switch uses.
+fn toggle_value_for_selector(settings: &PickerSettings, selector: &str) -> Option<bool> {
+    Some(match selector {
+        "cheatEngine:" => settings.cheat_engine,
+        "network:" => settings.network,
+        "gameCenterAuthenticated:" => settings.game_center_authenticated,
+        "analogStickTiltControls:" => settings.analog_stick_tilt_controls,
+        "fullscreen:" => settings.fullscreen,
+        "preserveAspectRatio:" => settings.preserve_aspect_ratio,
+        "forceComposition:" => settings.force_composition,
+        "showFPS:" => settings.show_fps,
+        "traceGLErrors:" => settings.trace_gl_errors,
+        "traceGLDraws:" => settings.trace_gl_draws,
+        "printFPS:" => settings.print_fps,
+        "popupErrors:" => settings.popup_errors,
+        "rotationFix:" => settings.rotation_fix.unwrap_or(false),
+        "moviePlayerFix:" => settings.fix_movie_player.unwrap_or(false),
+        "showLockScreen:" => settings.show_lock_screen,
+        _ => return None,
+    })
+}
+
+/// Puts every control on the Settings screen back in step with `settings`.
+/// Needed after a reset, which replaces all the settings at once. The caller
+/// refreshes the device and language dropdowns, because it owns their scroll
+/// state.
+fn refresh_settings_controls(
+    env: &mut Environment,
+    settings: &SettingsStuff,
+    picker_settings: &PickerSettings,
+) {
+    update_scale_hack_buttons(
+        env,
+        &settings.scale_hack_buttons,
+        picker_settings.scale_hack,
+    );
+    update_orientation_buttons(
+        env,
+        &settings.orientation_buttons,
+        picker_settings.orientation,
+    );
+    update_performance_overlay_buttons(
+        env,
+        &settings.overlay_mode_buttons,
+        &settings.overlay_corner_buttons,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_mode_buttons,
+        picker_settings.corruption_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_startup_delay_buttons,
+        picker_settings.corruption_startup_delay.selected_index(),
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_cooldown_buttons,
+        picker_settings.corruption_cooldown.selected_index(),
+    );
+    update_segment_buttons(
+        env,
+        &settings.gles2_mode_buttons,
+        picker_settings.gles2_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.vsync_buttons,
+        vsync_selected_index(picker_settings.vsync),
+    );
+    update_segment_buttons(
+        env,
+        &settings.present_mode_buttons,
+        present_mode_selected_index(picker_settings.present_mode),
+    );
+    update_segment_buttons(
+        env,
+        &settings.texture_filter_buttons,
+        texture_filter_selected_index(picker_settings.fix_texture_min_filter),
+    );
+    update_segment_buttons(
+        env,
+        &settings.present_rotate_buttons,
+        present_rotate_selected_index(picker_settings.present_rotate),
+    );
+    update_segment_buttons(
+        env,
+        &settings.controller_to_touch_buttons,
+        controller_to_touch_selected_index(picker_settings.controller_to_touch),
+    );
+    for &(selector, switch) in &settings.toggle_switches {
+        if let Some(value) = toggle_value_for_selector(picker_settings, selector) {
+            () = msg![env; switch setOn:value];
+        }
+    }
+    let (width, height) = picker_touch_screen_size(&env.options, picker_settings);
+    refresh_manual_value_fields(
+        env,
+        &settings.manual_value_fields,
+        width,
+        height,
+        &mut picker_settings.clone(),
+    );
+    refresh_dropdown(
+        env,
+        &settings.renderer_dropdown,
+        &renderer_mode_label_for_tag(Some(renderer_mode_tag(picker_settings.renderer_mode))),
+        &DropdownState {
+            selected: Some(renderer_mode_tag(picker_settings.renderer_mode)),
+            open: false,
+            scroll: 0,
+        },
+    );
+}
+
+/// Whether the picker can offer a choice of renderer. The reset restores the
+/// default that `PickerSettings::load` starts from, so it needs the same flag.
+fn renderer_mode_dropdown_enabled() -> bool {
+    cfg!(target_os = "android") && crate::window::angle_backend_available()
+}
+/// The settings the reset handler may change. Bundled so that the handler
+/// takes few arguments; the caller copies them in and back out.
+struct SettingsDrafts {
+    picker_settings: PickerSettings,
+    last_saved_picker_settings: PickerSettings,
+    device_state: DropdownState,
+    language_state: DropdownState,
+    renderer_state: DropdownState,
+}
+/// Applies the reset settings screen request now that `env` and the
+/// delegate's host object are no longer borrowed at the same time.
+fn handle_reset_settings_request(
+    env: &mut Environment,
+    request: ResetSettingsRequest,
+    main_run_loop: id,
+    delegate: id,
+    screen: (
+        &SettingsStuff,
+        &DeleteDialog,
+        &DeleteDialog,
+        &mut SettingsDrafts,
+    ),
+) {
+    let (settings, reset_dialog, save_error_dialog, drafts) = screen;
+    let picker_settings = &mut drafts.picker_settings;
+    let last_saved_picker_settings = &mut drafts.last_saved_picker_settings;
+    let device_state = &mut drafts.device_state;
+    let language_state = &mut drafts.language_state;
+    let renderer_state = &mut drafts.renderer_state;
+    match request {
+        ResetSettingsRequest::None => {}
+        ResetSettingsRequest::Ask => {
+            set_dialog_content(
+                env,
+                reset_dialog,
+                "Reset all settings?",
+                "This resets every setting to its default. Apps and their saved data are kept.",
+                Some("Reset"),
+            );
+            show_delete_dialog(env, main_run_loop, delegate, reset_dialog);
+        }
+        ResetSettingsRequest::Confirm => {
+            hide_delete_dialog(env, main_run_loop, delegate, reset_dialog);
+            let defaults = PickerSettings::factory_defaults(renderer_mode_dropdown_enabled());
+            // Persist first: if the write fails, the live settings and the
+            // controls must keep showing what is actually on disk.
+            match defaults.save() {
+                Ok(()) => {
+                    *picker_settings = defaults;
+                    *last_saved_picker_settings = picker_settings.clone();
+                    refresh_settings_controls(env, settings, picker_settings);
+                    device_state.selected = picker_settings.device_model_tag;
+                    language_state.selected = picker_settings.language_tag;
+                    renderer_state.selected =
+                        Some(renderer_mode_tag(picker_settings.renderer_mode));
+                    refresh_dropdown(
+                        env,
+                        &settings.renderer_dropdown,
+                        &renderer_mode_label_for_tag(renderer_state.selected),
+                        renderer_state,
+                    );
+                    refresh_dropdown(
+                        env,
+                        &settings.device_dropdown,
+                        &device_model_label_for_tag(device_state.selected),
+                        device_state,
+                    );
+                    refresh_dropdown(
+                        env,
+                        &settings.language_dropdown,
+                        &language_label_for_tag(language_state.selected),
+                        language_state,
+                    );
+                }
+                Err(error) => {
+                    log!("Warning: couldn't save app picker settings: {error}");
+                    set_dialog_content(
+                        env,
+                        save_error_dialog,
+                        "Settings not saved",
+                        "The settings couldn't be saved to disk, so they were kept as they were.",
+                        None,
+                    );
+                    show_delete_dialog(env, main_run_loop, delegate, save_error_dialog);
+                }
+            }
+        }
+        ResetSettingsRequest::DismissError => {
+            hide_delete_dialog(env, main_run_loop, delegate, save_error_dialog);
+        }
+    }
+}
+
+/// What the settings screen asked for this frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetSettingsRequest {
+    None,
+    Ask,
+    Confirm,
+    DismissError,
 }
 
 fn quick_options_trainer_enabled(options: &Options) -> bool {
@@ -7153,7 +7678,10 @@ fn quick_options_fix_arguments(
 fn quick_options_picker_settings_arguments(settings: &PickerSettings) -> Vec<String> {
     let mut args = vec![
         format!("--vsync={}", vsync_short_name(settings.vsync)),
-        format!("--present-mode={}", present_mode_short_name(settings.present_mode)),
+        format!(
+            "--present-mode={}",
+            present_mode_short_name(settings.present_mode)
+        ),
         if settings.print_fps {
             "--print-fps".to_string()
         } else {
@@ -7169,8 +7697,16 @@ fn quick_options_picker_settings_arguments(settings: &PickerSettings) -> Vec<Str
         (MANUAL_DEADZONE, "deadzone", settings.deadzone),
         (MANUAL_X_TILT_RANGE, "x-tilt-range", settings.x_tilt_range),
         (MANUAL_Y_TILT_RANGE, "y-tilt-range", settings.y_tilt_range),
-        (MANUAL_X_TILT_OFFSET, "x-tilt-offset", settings.x_tilt_offset),
-        (MANUAL_Y_TILT_OFFSET, "y-tilt-offset", settings.y_tilt_offset),
+        (
+            MANUAL_X_TILT_OFFSET,
+            "x-tilt-offset",
+            settings.x_tilt_offset,
+        ),
+        (
+            MANUAL_Y_TILT_OFFSET,
+            "y-tilt-offset",
+            settings.y_tilt_offset,
+        ),
     ] {
         if settings.manual_value_overrides.contains(&tag) {
             args.push(format!("--{name}={value}"));
@@ -7232,8 +7768,14 @@ fn quick_options_corruption_arguments(
     }
     let mut args = vec!["--corrupt-game".to_string()];
     args.push(format!("--corrupt-intensity={bytes_per_burst}"));
-    args.push(format!("--corrupt-start-delay={}", startup_delay.duration().as_secs_f64()));
-    args.push(format!("--corrupt-cooldown={}", cooldown.duration().as_secs_f64()));
+    args.push(format!(
+        "--corrupt-start-delay={}",
+        startup_delay.duration().as_secs_f64()
+    ));
+    args.push(format!(
+        "--corrupt-cooldown={}",
+        cooldown.duration().as_secs_f64()
+    ));
     args.push(format!("--corrupt-seed={seed}"));
     args.push(max_offset.map_or_else(
         || "--no-corrupt-max-offset".to_string(),
@@ -7594,6 +8136,27 @@ mod quick_options_fix_tests {
 mod manual_settings_tests {
     use super::*;
 
+    #[test]
+    fn atomic_settings_write_keeps_other_data_and_cleans_up_after_failure() {
+        let dir = std::env::temp_dir().join(format!("picker-write-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.txt");
+        let app_data = dir.join("app-data.txt");
+        std::fs::write(&settings_path, "old").unwrap();
+        std::fs::write(&app_data, "saved game").unwrap();
+
+        atomic_write_picker_settings(&settings_path, b"new").unwrap();
+        assert_eq!(std::fs::read(&settings_path).unwrap(), b"new");
+        assert!(atomic_write_picker_settings(&dir, b"failure").is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), b"new");
+        assert_eq!(std::fs::read(&app_data).unwrap(), b"saved game");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+        std::fs::remove_file(settings_path).unwrap();
+        std::fs::remove_file(app_data).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     fn settings() -> PickerSettings {
         PickerSettings::from_options(&Options::default(), true)
     }
@@ -7630,7 +8193,13 @@ mod manual_settings_tests {
             Some("Unlimited".to_string())
         );
         assert_eq!(
-            apply_manual_value(&mut settings, MANUAL_CORRUPTION_MAX_OFFSET, "unbounded", 320.0, 480.0),
+            apply_manual_value(
+                &mut settings,
+                MANUAL_CORRUPTION_MAX_OFFSET,
+                "unbounded",
+                320.0,
+                480.0
+            ),
             Some("Unbounded".to_string())
         );
         assert_eq!(
@@ -7671,19 +8240,19 @@ mod manual_settings_tests {
         assert_eq!(settings.controller_to_touch, Some(true));
         assert!(settings.manual_value_overrides.contains(&button_tag));
         assert_eq!(
-            apply_manual_value(
-                &mut settings,
-                button_tag,
-                "App default",
-                320.0,
-                480.0,
-            ),
+            apply_manual_value(&mut settings, button_tag, "App default", 320.0, 480.0,),
             Some("App default".to_string())
         );
         assert_eq!(settings.controller_to_touch, None);
         assert!(!settings.manual_value_overrides.contains(&button_tag));
         assert_eq!(
-            apply_manual_value(&mut settings, MANUAL_DPAD_TOUCH, "300,470,50,50", 320.0, 480.0),
+            apply_manual_value(
+                &mut settings,
+                MANUAL_DPAD_TOUCH,
+                "300,470,50,50",
+                320.0,
+                480.0
+            ),
             Some("300,470,20,10".to_string())
         );
         assert_eq!(settings.dpad_to_touch, Some((300.0, 470.0, 20.0, 10.0)));
@@ -7713,20 +8282,48 @@ mod manual_settings_tests {
     }
 
     #[test]
+    fn reset_restores_factory_defaults_not_the_command_line() {
+        // "Reset all settings" must land on the same baseline as a first
+        // launch, whatever the command line said when this picker started.
+        let defaults = PickerSettings::factory_defaults(false);
+        assert_eq!(defaults.fps_limit, Some(60.0));
+        assert_eq!(defaults.scale_hack, None);
+        assert_eq!(defaults.orientation, None);
+        assert!(!defaults.fullscreen);
+        assert_eq!(defaults.renderer_mode, RendererMode::NativeGles);
+    }
+
+    #[test]
     fn picker_settings_emit_explicit_values_and_preserve_app_defaults() {
         let mut settings = settings();
         settings.fix_texture_min_filter = None;
         settings.present_rotate = None;
         let default_args = quick_options_picker_settings_arguments(&settings);
-        assert!(!default_args.iter().any(|arg| arg.starts_with("--present-rotate=")));
-        assert!(!default_args.iter().any(|arg| arg.contains("fix-texture-min-filter")));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--present-rotate=")));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.contains("fix-texture-min-filter")));
         assert!(!default_args.contains(&"--no-controller-to-touch".to_string()));
         assert!(default_args.contains(&"--no-corrupt-game".to_string()));
-        assert!(!default_args.iter().any(|arg| arg.starts_with("--deadzone=")));
-        assert!(!default_args.iter().any(|arg| arg.starts_with("--x-tilt-offset=")));
-        assert!(!default_args.iter().any(|arg| arg.starts_with("--fps-limit=")));
-        assert_eq!(manual_value_text(&settings, MANUAL_X_TILT_OFFSET).as_deref(), Some("App default"));
-        assert_eq!(manual_value_text(&settings, manual_button_tag(Button::A)).as_deref(), Some("App default"));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--deadzone=")));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--x-tilt-offset=")));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--fps-limit=")));
+        assert_eq!(
+            manual_value_text(&settings, MANUAL_X_TILT_OFFSET).as_deref(),
+            Some("App default")
+        );
+        assert_eq!(
+            manual_value_text(&settings, manual_button_tag(Button::A)).as_deref(),
+            Some("App default")
+        );
 
         settings.vsync = VsyncMode::On;
         settings.present_mode = PresentMode::Readback;
@@ -7762,18 +8359,30 @@ mod manual_settings_tests {
             assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
         }
         assert_eq!(
-            args.iter().filter(|arg| arg.as_str() == "--no-controller-to-touch").count(),
+            args.iter()
+                .filter(|arg| arg.as_str() == "--no-controller-to-touch")
+                .count(),
             1
         );
         settings.controller_to_touch = None;
         let app_default_args = quick_options_picker_settings_arguments(&settings);
         assert!(!app_default_args.contains(&"--no-controller-to-touch".to_string()));
-        assert!(!app_default_args.iter().any(|arg| arg.starts_with("--button-to-touch=")));
+        assert!(!app_default_args
+            .iter()
+            .any(|arg| arg.starts_with("--button-to-touch=")));
         assert_eq!(
-            apply_manual_value(&mut settings, MANUAL_X_TILT_OFFSET, "App default", 320.0, 480.0),
+            apply_manual_value(
+                &mut settings,
+                MANUAL_X_TILT_OFFSET,
+                "App default",
+                320.0,
+                480.0
+            ),
             Some("App default".to_string())
         );
-        assert!(!settings.manual_value_overrides.contains(&MANUAL_X_TILT_OFFSET));
+        assert!(!settings
+            .manual_value_overrides
+            .contains(&MANUAL_X_TILT_OFFSET));
     }
 }
 
