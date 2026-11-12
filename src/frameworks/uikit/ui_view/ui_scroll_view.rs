@@ -355,18 +355,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let offset:       CGPoint = msg![env; this contentOffset];
     let content_size: CGSize  = msg![env; this contentSize];
 
-    let mut new_offset = CGPoint {
-        x: offset.x - delta_x,
-        y: offset.y - delta_y,
-    };
-
-    new_offset.y = new_offset.y
-        .min(content_size.height - bounds.size.height)
-        .max(0.0);
-
-    new_offset.x = new_offset.x
-        .min(content_size.width - bounds.size.width)
-        .max(0.0);
+    let new_offset = offset_after_drag(offset, content_size, bounds.size, (delta_x, delta_y));
 
     log_dbg!("UIScrollView content offset: old {:?}, new {:?}", offset, new_offset);
 
@@ -421,3 +410,75 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+/// Where `offset` ends up after the finger moves by `delta`: content follows
+/// the finger, and stops at its edges. A content plate no bigger than the
+/// scroll view cannot move along that axis at all, so a diagonal drag on a
+/// list that only scrolls up and down does not wobble it sideways.
+fn offset_after_drag(
+    offset: CGPoint,
+    content_size: CGSize,
+    bounds_size: CGSize,
+    delta: (CGFloat, CGFloat),
+) -> CGPoint {
+    let (delta_x, delta_y) = delta;
+    let max_x = (content_size.width - bounds_size.width).max(0.0);
+    let max_y = (content_size.height - bounds_size.height).max(0.0);
+    CGPoint {
+        x: (offset.x - delta_x).clamp(0.0, max_x),
+        y: (offset.y - delta_y).clamp(0.0, max_y),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offset_after_drag;
+    use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGSize};
+
+    fn size(width: CGFloat, height: CGFloat) -> CGSize {
+        CGSize { width, height }
+    }
+
+    #[test]
+    fn diagonal_drag_does_not_move_a_list_that_fits_sideways() {
+        // The settings list: as wide as the scroll view, much taller.
+        let offset = CGPoint { x: 0.0, y: 100.0 };
+        let bounds = size(320.0, 480.0);
+        let moved = offset_after_drag(offset, size(320.0, 2000.0), bounds, (40.0, -30.0));
+        let (moved_x, moved_y) = (moved.x, moved.y);
+        assert_eq!(moved_x, 0.0);
+        assert_eq!(moved_y, 130.0);
+    }
+
+    #[test]
+    fn drag_stops_at_the_content_edges() {
+        let content = size(600.0, 2000.0);
+        let bounds = size(320.0, 480.0);
+        let at_bottom_right = offset_after_drag(
+            CGPoint { x: 280.0, y: 1520.0 },
+            content,
+            bounds,
+            (-100.0, -100.0),
+        );
+        let (at_bottom_right_x, at_bottom_right_y) = (at_bottom_right.x, at_bottom_right.y);
+        assert_eq!(at_bottom_right_x, 280.0);
+        assert_eq!(at_bottom_right_y, 1520.0);
+        let past_top_left =
+            offset_after_drag(CGPoint { x: 10.0, y: 10.0 }, content, bounds, (100.0, 100.0));
+        let (past_top_left_x, past_top_left_y) = (past_top_left.x, past_top_left.y);
+        assert_eq!(past_top_left_x, 0.0);
+        assert_eq!(past_top_left_y, 0.0);
+    }
+
+    #[test]
+    fn content_smaller_than_the_scroll_view_never_moves() {
+        let moved = offset_after_drag(
+            CGPoint { x: 0.0, y: 0.0 },
+            size(320.0, 400.0),
+            size(320.0, 480.0),
+            (-50.0, -50.0),
+        );
+        let (moved_x, moved_y) = (moved.x, moved.y);
+        assert_eq!(moved_x, 0.0);
+        assert_eq!(moved_y, 0.0);
+    }
+}
