@@ -553,11 +553,21 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.options.force_gles1_context,
     );
 
-    let mut gles_ins = match effective_api {
-        kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
-        kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
-        _ => create_gles1_ctx(env),
-    };
+// Context creation can fail (e.g. no usable GL driver); like the
+// unsupported-API path above, log it and return nil instead of aborting.
+let gles_ins = match effective_api {
+ kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
+ kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
+ _ => Ok(create_gles1_ctx(env)),
+};
+let mut gles_ins = match gles_ins {
+ Ok(ctx) => ctx,
+ Err(err) => {
+  log!("EAGLContext initWithAPI:{} failed: {}", api, err);
+  env.window.as_mut().unwrap().set_share_with_current_context(false);
+  return nil;
+ }
+};
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let drawable_framebuffer = {
@@ -611,11 +621,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.options.force_gles1_context,
     );
 
-    let mut gles_ins = match effective_api {
-        kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
-        kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
-        _ => create_gles1_ctx(env),
-    };
+// Context creation can fail (e.g. no usable GL driver); report it and
+// return nil, like the unsupported-API path above.
+let gles_ins = match effective_api {
+ kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
+ kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
+ _ => Ok(create_gles1_ctx(env)),
+};
+let mut gles_ins = match gles_ins {
+ Ok(ctx) => ctx,
+ Err(err) => {
+  log!("EAGLContext initWithAPI:{} failed: {}", api, err);
+  return nil;
+ }
+};
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let drawable_framebuffer = {

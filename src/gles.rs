@@ -1598,36 +1598,36 @@ enum GLES2Backend {
 /// only wastes a context-creation attempt and logs a misleading
 /// EGL_BAD_MATCH. Mirrors the check in `create_gles1_ctx_no_parent_stack`.
 fn using_angle_driver() -> bool {
-std::env::var("SDL_VIDEO_EGL_DRIVER")
-.map(|driver| driver.contains("angle"))
-.unwrap_or(false)
+ std::env::var("SDL_VIDEO_EGL_DRIVER")
+  .map(|driver| driver.contains("angle"))
+  .unwrap_or(false)
 }
 
 fn gles2_backend_order(force_compat: bool) -> &'static [GLES2Backend] {
-gles2_backend_order_opts(force_compat, using_angle_driver())
+ gles2_backend_order_opts(force_compat, using_angle_driver())
 }
 
 fn gles2_backend_order_opts(
-force_compat: bool,
-using_angle: bool,
+ force_compat: bool,
+ using_angle: bool,
 ) -> &'static [GLES2Backend] {
-if using_angle {
-if force_compat {
-// `--gles2-compat` is a desktop-only setting; under ANGLE its sole
-// backend cannot work, so fall back to native ES instead of
-// guaranteeing failure and a panic.
-log!("Ignoring --gles2-compat under ANGLE: desktop GL 2.1 is unavailable there");
-}
-&[GLES2Backend::Native]
-} else if force_compat {
-&[GLES2Backend::GL2Compat]
-} else {
-&[
-GLES2Backend::Native,
-GLES2Backend::GL3,
-GLES2Backend::GL2Compat,
-]
-}
+ if using_angle {
+  if force_compat {
+   // `--gles2-compat` is a desktop-only setting; under ANGLE its sole
+   // backend cannot work, so fall back to native ES instead of
+   // guaranteeing failure and a panic.
+   log!("Ignoring --gles2-compat under ANGLE: desktop GL 2.1 is unavailable there");
+  }
+  &[GLES2Backend::Native]
+ } else if force_compat {
+  &[GLES2Backend::GL2Compat]
+ } else {
+  &[
+   GLES2Backend::Native,
+   GLES2Backend::GL3,
+   GLES2Backend::GL2Compat,
+  ]
+ }
 }
 
 /// Try native ES 2.0, GL 3.3 Core, then legacy GL 2.1 compatibility.
@@ -1662,74 +1662,91 @@ assert_eq!(gles2_backend_order_opts(true, true), &[GLES2Backend::Native]);
 }
 
 
-pub fn create_gles2_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
-    env.on_parent_stack_in_coroutine(|window, options| {
-        assert!(window.on_main_stack());
-        log!("Creating an OpenGL ES 2.0 context:");
+/// Create an OpenGL ES 2.0 context for the guest.
+///
+/// Tries the backends from [gles2_backend_order]; under ANGLE only native ES
+/// 2.0 can work. Returns every attempt's error when none succeeds so callers
+/// can fail gracefully instead of aborting the app.
+pub fn create_gles2_ctx(env: &mut Environment) -> Result<Box<dyn GLESContext>, String> {
+ env.on_parent_stack_in_coroutine(|window, options| {
+  assert!(window.on_main_stack());
+  log!("Creating an OpenGL ES 2.0 context:");
 
-        let mut attempts = gles2_backend_order(options.gles2_compat).iter();
-        let forced_compat = options.gles2_compat;
-        let ctx = attempts
-            .find_map(|backend| match backend {
-                GLES2Backend::Native => {
-                    log!("Trying: {}", GLES2NativeContext::description());
-                    match GLES2NativeContext::new(window) {
-                        Ok(ctx) => {
-                            log!("=> Success!");
-                            Some(Box::new(ctx) as Box<dyn GLESContext>)
-                        }
-                        Err(err) => {
-                            log!("=> Failed: {}.", err);
-                            None
-                        }
-                    }
-                }
-                GLES2Backend::GL3 => {
-                    log!("Trying: {}", GLES2OnGL3Context::description());
-                    match GLES2OnGL3Context::new(window) {
-                        Ok(ctx) => {
-                            log!("=> Success!");
-                            Some(Box::new(ctx) as Box<dyn GLESContext>)
-                        }
-                        Err(err) => {
-                            log!("=> Failed: {}.", err);
-                            None
-                        }
-                    }
-                }
-                GLES2Backend::GL2Compat => {
-                    log!(
-                        "Trying: {}{}",
-                        GLES1OnGL2Context::description(),
-                        if forced_compat {
-                            " (forced by --gles2-compat)"
-                        } else {
-                            " (legacy GL 2.1 fallback)"
-                        }
-                    );
-                    match GLES1OnGL2Context::new(window) {
-                        Ok(ctx) => {
-                            log!("=> Success!");
-                            Some(Box::new(ctx) as Box<dyn GLESContext>)
-                        }
-                        Err(err) => {
-                            log!("=> Failed: {}.", err);
-                            None
-                        }
-                    }
-                }
-            })
-            .expect("Couldn't create OpenGL ES 2.0 context");
+  let forced_compat = options.gles2_compat;
+  let mut failures = Vec::new();
+  let ctx = gles2_backend_order(forced_compat)
+   .iter()
+   .find_map(|backend| match backend {
+    GLES2Backend::Native => {
+     let description = GLES2NativeContext::description();
+     log!("Trying: {}", description);
+     match GLES2NativeContext::new(window) {
+      Ok(ctx) => {
+       log!("=> Success!");
+       Some(Box::new(ctx) as Box<dyn GLESContext>)
+      }
+      Err(err) => {
+       log!("=> Failed: {}.", err);
+       failures.push(format!("{}: {}", description, err));
+       None
+      }
+     }
+    }
+    GLES2Backend::GL3 => {
+     let description = GLES2OnGL3Context::description();
+     log!("Trying: {}", description);
+     match GLES2OnGL3Context::new(window) {
+      Ok(ctx) => {
+       log!("=> Success!");
+       Some(Box::new(ctx) as Box<dyn GLESContext>)
+      }
+      Err(err) => {
+       log!("=> Failed: {}.", err);
+       failures.push(format!("{}: {}", description, err));
+       None
+      }
+     }
+    }
+    GLES2Backend::GL2Compat => {
+     let description = GLES1OnGL2Context::description();
+     log!(
+      "Trying: {}{}",
+      description,
+      if forced_compat {
+       " (forced by --gles2-compat)"
+      } else {
+       " (legacy GL 2.1 fallback)"
+      }
+     );
+     match GLES1OnGL2Context::new(window) {
+      Ok(ctx) => {
+       log!("=> Success!");
+       Some(Box::new(ctx) as Box<dyn GLESContext>)
+      }
+      Err(err) => {
+       log!("=> Failed: {}.", err);
+       failures.push(format!("{}: {}", description, err));
+       None
+      }
+     }
+    }
+   })
+   .ok_or_else(|| {
+    format!(
+     "Couldn't create OpenGL ES 2.0 context. Tried: {}",
+     failures.join("; ")
+    )
+   })?;
 
-        if options.trace_gl_errors {
-            Box::new(LoggingGLESContext {
-                inner: ctx,
-                verbose: options.trace_gl_errors || options.verbose_gles,
-            })
-        } else {
-            ctx
-        }
-    })
+  Ok(if options.trace_gl_errors {
+   Box::new(LoggingGLESContext {
+    inner: ctx,
+    verbose: options.trace_gl_errors || options.verbose_gles,
+   })
+  } else {
+   ctx
+  })
+ })
 }
 
 /// Try to create an OpenGL ES 3.0 context, panicking on failure.
@@ -1740,51 +1757,64 @@ pub fn create_gles2_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
 /// on Android and on desktop drivers configured for an ES context — and
 /// falls back to the desktop GL 3.3 Core translation backend on hosts
 /// without a native ES 3.0 driver (most x86 Linux/macOS desktops).
-pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
-    env.on_parent_stack_in_coroutine(|window, options| {
-        assert!(window.on_main_stack());
-        log!("Creating an OpenGL ES 3.0 context:");
+/// Create an OpenGL ES 3.0 context for the guest.
+///
+/// Tries the native ES 3.0 backend first — the only thing that works on
+/// Android and on desktop drivers configured for an ES context — then falls
+/// back to the desktop GL 3.3 Core translation backend on hosts without a
+/// native ES 3.0 driver (most x86 Linux/macOS desktops).
+pub fn create_gles3_ctx(env: &mut Environment) -> Result<Box<dyn GLESContext>, String> {
+ env.on_parent_stack_in_coroutine(|window, options| {
+  assert!(window.on_main_stack());
+  log!("Creating an OpenGL ES 3.0 context:");
 
-        let ctx = {
-            log!("Trying: {}", GLES3NativeContext::description());
-            match GLES3NativeContext::new(window) {
-                Ok(ctx) => {
-                    log!("=> Success!");
-                    Some(Box::new(ctx) as Box<dyn GLESContext>)
-                }
-                Err(err) => {
-                    log!("=> Failed: {}.", err);
-                    None
-                }
-            }
-            .or_else(|| {
-                log!(
-                    "Trying: {} (used for OpenGL ES 3.0)",
-                    GLES3OnGL3Context::description()
-                );
-                match GLES3OnGL3Context::new(window) {
-                    Ok(ctx) => {
-                        log!("=> Success!");
-                        Some(Box::new(ctx) as Box<dyn GLESContext>)
-                    }
-                    Err(err) => {
-                        log!("=> Failed: {}.", err);
-                        None
-                    }
-                }
-            })
-            .expect("Couldn't create OpenGL ES 3.0 context")
-        };
+  let mut failures = Vec::new();
+  let ctx = {
+   let description = GLES3NativeContext::description();
+   log!("Trying: {}", description);
+   match GLES3NativeContext::new(window) {
+    Ok(ctx) => {
+     log!("=> Success!");
+     Some(Box::new(ctx) as Box<dyn GLESContext>)
+    }
+    Err(err) => {
+     log!("=> Failed: {}.", err);
+     failures.push(format!("{}: {}", description, err));
+     None
+    }
+   }
+   .or_else(|| {
+    let description = GLES3OnGL3Context::description();
+    log!("Trying: {} (used for OpenGL ES 3.0)", description);
+    match GLES3OnGL3Context::new(window) {
+     Ok(ctx) => {
+      log!("=> Success!");
+      Some(Box::new(ctx) as Box<dyn GLESContext>)
+     }
+     Err(err) => {
+      log!("=> Failed: {}.", err);
+      failures.push(format!("{}: {}", description, err));
+      None
+     }
+    }
+   })
+   .ok_or_else(|| {
+    format!(
+     "Couldn't create OpenGL ES 3.0 context. Tried: {}",
+     failures.join("; ")
+    )
+   })?
+  };
 
-        if options.trace_gl_errors {
-            Box::new(LoggingGLESContext {
-                inner: ctx,
-                verbose: options.trace_gl_errors || options.verbose_gles,
-            })
-        } else {
-            ctx
-        }
-    })
+  Ok(if options.trace_gl_errors {
+   Box::new(LoggingGLESContext {
+    inner: ctx,
+    verbose: options.trace_gl_errors || options.verbose_gles,
+   })
+  } else {
+   ctx
+  })
+ })
 }
 
 /// Create an OpenGL ES 2.0 context from the window's main stack.

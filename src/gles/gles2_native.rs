@@ -16,7 +16,7 @@ use super::gles2_raw as gles2;
 use super::gles_generic::{GLchar, GLES};
 use super::util::{try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
-use crate::window::{GLContext, GLVersion, Window};
+use crate::window::{GLContext, Window};
 use std::ffi::CStr;
 use std::marker::PhantomData;
 
@@ -51,7 +51,7 @@ impl GLESContext for GLES2NativeContext {
 
     fn new(window: &mut Window) -> Result<Self, String> {
         Ok(Self {
-            gl_ctx: window.create_gl_context(GLVersion::GLES20)?,
+        gl_ctx: window.create_gles2_gl_context()?,
             is_loaded: false,
             pvrtc_native: false,
             pvrtc_native_checked: false,
@@ -85,11 +85,12 @@ impl GLESContext for GLES2NativeContext {
         gles11::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = unsafe { detect_pvrtc_support() };
-            self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support() };
-            self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
-            self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
-            self.pvrtc_native_checked = true;
+ let extensions = unsafe { detect_extensions() };
+  self.pvrtc_native = unsafe { detect_pvrtc_support(&extensions) };
+  self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support(&extensions) };
+  self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support(&extensions) };
+  self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support(&extensions) };
+  self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
             _gl_lifetime: PhantomData,
@@ -121,10 +122,11 @@ impl GLESContext for GLES2NativeContext {
         gles11::load_with(&mut *loader_fn);
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = detect_pvrtc_support();
-            self.texture_lod_ext_supported = detect_texture_lod_ext_support();
-            self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
-            self.texture_3d_ext_supported = detect_texture_3d_ext_support();
+            let extensions = detect_extensions();
+ self.pvrtc_native = detect_pvrtc_support(&extensions);
+            self.texture_lod_ext_supported = detect_texture_lod_ext_support(&extensions);
+            self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support(&extensions);
+            self.texture_3d_ext_supported = detect_texture_3d_ext_support(&extensions);
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
@@ -138,80 +140,44 @@ impl GLESContext for GLES2NativeContext {
     }
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 2.0 driver
-/// advertises `GL_IMG_texture_compression_pvrtc`. Must be called with a
-/// current GL context.
+/// Fetch `GL_EXTENSIONS` once for this GLES 2.0 context.
 ///
 /// On strict OpenGL ES 3.0+ contexts `glGetString(GL_EXTENSIONS)` is
 /// deprecated and may return an empty string. We can't use `glGetStringi`
-/// here because the touchHLE GLES 2.0 raw bindings (generated for Core
-/// ES 2.0 only) don't expose it. When the legacy string is unavailable we
-/// conservatively return `false`, which causes us to software-decode PVRTC.
-/// That's the safe choice: it produces correct output everywhere, at the
-/// cost of one extra in-memory pass per texture upload on hosts where
-/// PVRTC could otherwise be uploaded directly.
-unsafe fn detect_pvrtc_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(s) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    if s.is_empty() {
-        return false;
-    }
-    s.split(' ')
-        .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
+/// because the touchHLE GLES 2.0 raw bindings (generated for Core ES 2.0
+/// only) don't expose it. An empty set makes every query below return
+/// `false`, which conservatively forces software PVRTC decoding and shader
+/// patching: correct everywhere, at the cost of one extra in-memory pass.
+/// Must be called with a current GL context.
+unsafe fn detect_extensions() -> std::collections::HashSet<String> {
+ let mut set = std::collections::HashSet::new();
+ let legacy = gles2::GetString(gles11::EXTENSIONS);
+ if legacy.is_null() {
+  return set;
+ }
+ let Ok(s) = CStr::from_ptr(legacy as *const _).to_str() else {
+  return set;
+ };
+ for ext in s.split_whitespace() {
+  set.insert(ext.to_owned());
+ }
+ set
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 2.0 driver
-/// advertises `GL_EXT_shader_texture_lod`. When it does not, we must patch
-/// shaders that use `texture2DLodEXT` / `texture2DProjLodEXT` /
-/// `textureCubeLodEXT` because those functions won't exist in the driver's
-/// GLSL compiler.
-unsafe fn detect_texture_lod_ext_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(s) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    if s.is_empty() {
-        return false;
-    }
-    s.split(' ').any(|ext| ext == "GL_EXT_shader_texture_lod")
+unsafe fn detect_pvrtc_support(extensions: &std::collections::HashSet<String>) -> bool {
+ extensions.contains("GL_IMG_texture_compression_pvrtc")
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 2.0 driver
-/// advertises `GL_EXT_shadow_samplers`. Must be called with a current GL context.
-unsafe fn detect_shadow_samplers_ext_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(extensions) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    extensions
-        .split_whitespace()
-        .any(|extension| extension == "GL_EXT_shadow_samplers")
+unsafe fn detect_texture_lod_ext_support(extensions: &std::collections::HashSet<String>) -> bool {
+ extensions.contains("GL_EXT_shader_texture_lod")
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current driver supports 3D
-/// textures for OpenGL ES 2.0 shaders.
-unsafe fn detect_texture_3d_ext_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(extensions) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    extensions
-        .split_whitespace()
-        .any(|extension| extension == "GL_OES_texture_3D")
+unsafe fn detect_shadow_samplers_ext_support(extensions: &std::collections::HashSet<String>) -> bool {
+ extensions.contains("GL_EXT_shadow_samplers")
+}
+
+unsafe fn detect_texture_3d_ext_support(extensions: &std::collections::HashSet<String>) -> bool {
+ extensions.contains("GL_OES_texture_3D")
 }
 
 /// Returns `true` if the shader source contains a top-level default float

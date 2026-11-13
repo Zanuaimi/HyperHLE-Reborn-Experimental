@@ -758,6 +758,18 @@ pub enum GLVersion {
     GL33Core,
 }
 
+impl std::fmt::Display for GLVersion {
+ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+  f.write_str(match self {
+   GLVersion::GLES11 => "OpenGL ES 1.1",
+   GLVersion::GLES20 => "OpenGL ES 2.0",
+   GLVersion::GLES30 => "OpenGL ES 3.0",
+   GLVersion::GL21Compat => "OpenGL 2.1 compatibility",
+   GLVersion::GL33Core => "OpenGL 3.3 core",
+  })
+ }
+}
+
 pub struct GLContext(sdl2::video::GLContext);
 
 impl GLContext {
@@ -2629,35 +2641,97 @@ impl Window {
         (x, y, pressed)
     }
 
-    pub fn create_gl_context(&self, version: GLVersion) -> Result<GLContext, String> {
-        let attr = self.video_ctx.gl_attr();
-        match version {
-            GLVersion::GLES11 => {
-                attr.set_context_version(1, 1);
-                attr.set_context_profile(sdl2::video::GLProfile::GLES);
-            }
-            GLVersion::GLES20 => {
-                attr.set_context_version(2, 0);
-                attr.set_context_profile(sdl2::video::GLProfile::GLES);
-            }
-            GLVersion::GLES30 => {
-                attr.set_context_version(3, 0);
-                attr.set_context_profile(sdl2::video::GLProfile::GLES);
-            }
-            GLVersion::GL21Compat => {
-                attr.set_context_version(2, 1);
-                attr.set_context_profile(sdl2::video::GLProfile::Compatibility);
-            }
-            GLVersion::GL33Core => {
-                attr.set_context_version(3, 3);
-                attr.set_context_profile(sdl2::video::GLProfile::Core);
-            }
-        }
+ pub fn create_gl_context(&self, version: GLVersion) -> Result<GLContext, String> {
+  self.create_gl_context_with(version, |_attr| {})
+ }
 
-        let gl_ctx = self.window.gl_create_context()?;
+ /// Like [Window::create_gl_context], with a hook to adjust the requested
+ /// attributes first. Used for retry ladders that relax optional settings.
+ fn create_gl_context_with(
+  &self,
+  version: GLVersion,
+  tweak: impl FnOnce(&sdl2::video::gl_attr::GLAttr<'_>),
+ ) -> Result<GLContext, String> {
+  let version_name = version.to_string();
+  let attr = Self::set_gl_attr_version(self.video_ctx.gl_attr(), version);
+  tweak(&attr);
 
-        Ok(GLContext(gl_ctx))
-    }
+  // SDL reports eglCreateContext failures as typed EGL errors (e.g.
+  // EGL_BAD_MATCH when the display only offers another API); keep that
+  // detail so backend fallbacks can log why an attempt was rejected.
+  let mut errors = Vec::new();
+  let first = self.window.gl_create_context().map_err(|err| {
+   errors.push(err.to_string());
+  });
+  let attempt = match first {
+   Ok(gl_ctx) => Ok(gl_ctx),
+   Err(()) => {
+    // Retry without multisampling: some drivers (notably ANGLE and old
+    // Android GPUs) reject MSAA configs for the requested API.
+    attr.set_multisample_buffers(0);
+    attr.set_multisample_samples(0);
+    self
+     .window
+     .gl_create_context()
+     .map_err(|err| errors.push(err.to_string()))
+   }
+  };
+
+  attempt.map(GLContext).map_err(|_| {
+   format!(
+    "{} context creation failed: {}",
+    version_name,
+    errors.join("; ")
+   )
+  })
+ }
+
+ /// Request an ES 2.0 context, widening the profile only when the display
+ /// rejects an ES-only one.
+ ///
+ /// Some hosts (and ANGLE configurations) only expose a desktop-GL display,
+ /// so requesting `GLProfile::GLES` fails with EGL_BAD_MATCH even though
+ /// ES 2.0 entry points work through the desktop driver. Real iOS apps only
+ /// ask for ES 2.0, so this retry keeps the guest behavior unchanged.
+ pub fn create_gles2_gl_context(&self) -> Result<GLContext, String> {
+  self
+   .create_gl_context_with(GLVersion::GLES20, |_attr| {})
+   .or_else(|first_err| {
+    log!("ES 2.0 request failed ({}); retrying with a desktop-GL profile", first_err);
+    self.create_gl_context_with(GLVersion::GLES20, |attr| {
+     attr.set_context_profile(sdl2::video::GLProfile::Compatibility);
+    })
+   })
+ }
+
+ fn set_gl_attr_version(
+  attr: sdl2::video::gl_attr::GLAttr<'_>,
+  version: GLVersion,
+ ) -> sdl2::video::gl_attr::GLAttr<'_> {
+  match version {
+   GLVersion::GLES11 => {
+    attr.set_context_version(1, 1);
+    attr.set_context_profile(sdl2::video::GLProfile::GLES);
+   }
+   GLVersion::GLES20 => {
+    attr.set_context_version(2, 0);
+    attr.set_context_profile(sdl2::video::GLProfile::GLES);
+   }
+   GLVersion::GLES30 => {
+    attr.set_context_version(3, 0);
+    attr.set_context_profile(sdl2::video::GLProfile::GLES);
+   }
+   GLVersion::GL21Compat => {
+    attr.set_context_version(2, 1);
+    attr.set_context_profile(sdl2::video::GLProfile::Compatibility);
+   }
+   GLVersion::GL33Core => {
+    attr.set_context_version(3, 3);
+    attr.set_context_profile(sdl2::video::GLProfile::Core);
+   }
+  }
+  attr
+ }
 
     pub fn gl_get_proc_address(&self, procname: &str) -> *const std::ffi::c_void {
         // For some reason, rust-sdl2 uses *const (), but () is not meant to be
