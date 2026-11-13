@@ -5834,9 +5834,11 @@ fn setup_settings(
     // Clip the scrolled content so it never slides up over the navigation bar.
     () = msg![env; scroll setClipsToBounds:true];
     // Rows are laid out for the list's width, so sideways scrolling only
-    // wobbles the list under a diagonal drag.
+    // wobbles the list under a diagonal drag. Directional lock keeps a
+ // slightly sideways vertical drag on the vertical axis.
     () = msg![env; scroll setAlwaysBounceHorizontal:false];
     () = msg![env; scroll setShowsHorizontalScrollIndicator:false];
+ () = msg![env; scroll setDirectionalLockEnabled:true];
     () = msg![env; settings_view addSubview:scroll];
     // A scrollbar down the right edge, like the ones beside the dropdown
     // lists, so a long list of settings shows where you are in it. Dragging
@@ -6708,7 +6710,7 @@ fn setup_settings(
     // Footer with the build identifier.
     let footer = new_label(
         env,
-        rect(0.0, y, width, 18.0),
+        rect(0.0, y, width - SETTINGS_SCROLLBAR_WIDTH, 18.0),
         &format!("{} ({})", crate::DISPLAY_NAME, crate::COMMIT_HASH),
         12.0,
         false,
@@ -6719,7 +6721,9 @@ fn setup_settings(
     scroll_items.push((footer, y, y + 18.0));
     y += 30.0;
 
-    () = msg![env; scroll setContentSize:(CGSize { width, height: y + 24.0 })];
+    // Content width must match the scroll view's width: wider content
+ // would give the list a sideways scroll range.
+ () = msg![env; scroll setContentSize:(CGSize { width: width - SETTINGS_SCROLLBAR_WIDTH, height: y + 24.0 })];
 
     SettingsStuff {
         dimmer,
@@ -7075,6 +7079,9 @@ fn make_settings_dropdown(
         height: entries.len() as CGFloat * DEVICE_MENU_ITEM_HEIGHT,
     };
     () = msg![env; scroll_view setContentSize:content_size];
+ () = msg![env; scroll_view setAlwaysBounceHorizontal:false];
+ () = msg![env; scroll_view setShowsHorizontalScrollIndicator:false];
+ () = msg![env; scroll_view setDirectionalLockEnabled:true];
     () = msg![env; menu_view addSubview:scroll_view];
 
     // List items stay in content coordinates; UIScrollView moves them during
