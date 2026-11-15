@@ -450,6 +450,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 (env, this, _cmd);
 @implementation UIView: UIResponder
 
+
+
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::<UIViewHostObject>::default();
     let view = env.objc.alloc_object(this, host_object, &mut env.mem);
@@ -2231,6 +2233,13 @@ completion:(MutPtr<()>)completion {
     () = msg![env; this setBounds:(CGRect { origin: CGPoint::default(), size: new_size })];
 }
 
+// `- (void)setNeedsUpdateOfHomeIndicatorAutoHidden` (iOS 11+)
+//
+// Asks UIKit to re-evaluate whether the home indicator should be hidden. The
+// emulator draws no home indicator, so there is nothing to re-evaluate; the
+// call is accepted instead of hitting the "does not respond" path.
+- (())setNeedsUpdateOfHomeIndicatorAutoHidden {
+}
 @end
 
 };

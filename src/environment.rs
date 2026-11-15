@@ -199,6 +199,13 @@ pub struct Environment {
     /// pointer. See `debug_cpu_error`.
     cpu_error_bypass_last_lr: Option<u32>,
     cpu_error_bypass_lr_count: u32,
+    /// Tracks consecutive guest CPU-trap bypasses at the same faulting PC,
+    /// regardless of the return address. The `(pc, lr)` pair and the
+    /// "same LR" counters above both miss the case where one bogus PC is
+    /// reached from many different callers, which is what a wild jump into the
+    /// image header or a data blob looks like. See `debug_cpu_error`.
+    cpu_error_bypass_last_pc: Option<u32>,
+    cpu_error_bypass_pc_count: u32,
     /// Thread and stack pointer of the most recent deliberate guest trap
     /// (`udf`/`trap`/`bkpt`) that was bypassed.
     last_deliberate_trap_bypass: Option<(ThreadId, u32)>,
@@ -462,6 +469,29 @@ fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usiz
 static ENVIRONMENT_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Ceiling for the app's heap when the RAM limiter is left on "Default".
+///
+/// iOS does not let an app have the whole device: jetsam kills a foreground
+/// app somewhere around half of physical memory, which is why a game that
+/// grows its heap without collecting never gets past a few hundred megabytes
+/// on a real phone. Without a ceiling the same game takes all 4 GiB of the
+/// guest address space and, on an Android host, takes the phone down with it
+/// (a crowd of apps and the GPU share the same RAM, and the kernel kills the
+/// biggest process last).
+///
+/// So "Default" means half of the Device model's RAM, which makes the Device
+/// choice matter for real, with two practical clamps: at least 256 MiB, because
+/// the earliest device profiles only report 128-256 MiB and games that run
+/// today already use 150-200 MiB, and at most 2 GiB, because the app's own
+/// segments, thread stacks and the null segment share the same 4 GiB address
+/// space.
+fn default_guest_heap_cap(device_family: DeviceFamily) -> GuestUSize {
+    const FLOOR: u64 = 256 * 1024 * 1024;
+    const CEILING: u64 = 2 * 1024 * 1024 * 1024;
+    let half = device_family.physical_memory() / 2;
+    half.clamp(FLOOR, CEILING) as GuestUSize
+}
+
 impl Environment {
     /// Loads the binary and sets up the emulator.
     pub fn new(
@@ -696,6 +726,26 @@ impl Environment {
         };
 
         let mut mem = mem::Mem::new();
+        // The RAM limiter caps the app's heap (see `--memory-limit=` and the
+        // "RAM Limiter" row of the graphical settings screen). With no choice
+        // made, the ceiling still comes from the Device model, standing in for
+        // iOS's jetsam limit: see `default_guest_heap_cap`.
+        let heap_cap = match options.memory_limit_mb {
+            Some(mb) => mb.saturating_mul(1024 * 1024),
+            None => default_guest_heap_cap(device_family),
+        };
+        mem.set_memory_limit(Some(heap_cap));
+        match options.memory_limit_mb {
+            Some(mb) => log!(
+                "RAM limiter: the app's heap is capped at {} MiB; the overlay shows it as VMEM used/limit.",
+                mb
+            ),
+            None => log!(
+                "Guest heap: capped at {} MiB, half of the {:?} model's RAM (iOS would kill the app around there); the overlay shows it as VMEM used/limit. Set RAM Limiter to change it.",
+                heap_cap / (1024 * 1024),
+                device_family
+            ),
+        }
 
         let is_spore = bundle.bundle_identifier().starts_with("com.ea.spore");
         let is_critter_crunch = bundle
@@ -1057,6 +1107,8 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            cpu_error_bypass_last_pc: None,
+            cpu_error_bypass_pc_count: 0,
             last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
@@ -1192,6 +1244,15 @@ impl Environment {
         )?));
 
         let mut mem = mem::Mem::new();
+        let heap_cap = match options.memory_limit_mb {
+            Some(mb) => mb.saturating_mul(1024 * 1024),
+            None => default_guest_heap_cap(
+                window
+                    .as_ref()
+                    .map_or(DeviceFamily::iPhone3GS, |window| window.device_family()),
+            ),
+        };
+        mem.set_memory_limit(Some(heap_cap));
 
         let bins = Vec::new();
 
@@ -1246,6 +1307,8 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            cpu_error_bypass_last_pc: None,
+            cpu_error_bypass_pc_count: 0,
             last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
@@ -1319,6 +1382,8 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            cpu_error_bypass_last_pc: None,
+            cpu_error_bypass_pc_count: 0,
             last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
@@ -2827,6 +2892,8 @@ impl Environment {
                 self.cpu_error_bypass_count = 0;
                 self.cpu_error_bypass_last_lr = None;
                 self.cpu_error_bypass_lr_count = 0;
+                self.cpu_error_bypass_last_pc = None;
+                self.cpu_error_bypass_pc_count = 0;
             }
         }
     }
@@ -3259,6 +3326,37 @@ impl Environment {
                     1
                 };
 
+                // Count consecutive bypasses at the same faulting PC too. A
+                // guest that calls through one bad function pointer bounces
+                // back to the *same* bogus address from many different return
+                // sites: every `(pc, lr)` pair is new, so `count` stays 1, and
+                // LR differs each time, so `lr_count` stays 1 as well. Neither
+                // counter escalates and the guest keeps jumping until it
+                // wanders into data and dynarmic aborts the host process while
+                // compiling a block there (RetroArch, wild PC 0x4000 reached
+                // from eight different scripts, then 0x100000).
+                let pc_count = if self.cpu_error_bypass_last_pc == Some(pc) {
+                    self.cpu_error_bypass_pc_count = self.cpu_error_bypass_pc_count.saturating_add(1);
+                    self.cpu_error_bypass_pc_count
+                } else {
+                    self.cpu_error_bypass_last_pc = Some(pc);
+                    self.cpu_error_bypass_pc_count = 1;
+                    1
+                };
+                // Bypasses at one PC before the emulator stops trusting
+                // "return to LR" for it.
+                const PC_BYPASS_LIMIT: u32 = 4096;
+                if pc_count >= PC_BYPASS_LIMIT {
+                    panic!(
+                        "{error:?} bypass returned from PC={:#x} {} times in a row \
+                         (most recent LR {:#x}); giving up to avoid hanging. The \
+                         guest keeps jumping to one bogus address from many \
+                         different call sites — usually a function pointer that \
+                         points at an image header or a data blob.",
+                        pc, pc_count, lr
+                    );
+                }
+
                 if lr_count >= LR_BYPASS_LIMIT {
                     panic!(
                         "{error:?} bypass faked a return to LR={:#x} \
@@ -3351,7 +3449,7 @@ impl Environment {
                         }
                     }
                     GuestTrapKind::OutsideCode | GuestTrapKind::ExecutionInData { .. }
-                        if count >= UNWIND_AFTER_REPEATS =>
+                        if count.max(pc_count) >= UNWIND_AFTER_REPEATS =>
                     {
                         match self.validated_guest_frame_record() {
                             Some(frame) => GuestTrapRecovery::UnwindFrame {
