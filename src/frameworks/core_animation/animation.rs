@@ -687,66 +687,7 @@ fn interpolate_transform(
             from
         }
     });
-    let from_components = CATransform3D::from(from);
-    let to_components = CATransform3D::from(to);
-    let from_values = [
-        from_components.m11,
-        from_components.m12,
-        from_components.m13,
-        from_components.m14,
-        from_components.m21,
-        from_components.m22,
-        from_components.m23,
-        from_components.m24,
-        from_components.m31,
-        from_components.m32,
-        from_components.m33,
-        from_components.m34,
-        from_components.m41,
-        from_components.m42,
-        from_components.m43,
-        from_components.m44,
-    ];
-    let to_values = [
-        to_components.m11,
-        to_components.m12,
-        to_components.m13,
-        to_components.m14,
-        to_components.m21,
-        to_components.m22,
-        to_components.m23,
-        to_components.m24,
-        to_components.m31,
-        to_components.m32,
-        to_components.m33,
-        to_components.m34,
-        to_components.m41,
-        to_components.m42,
-        to_components.m43,
-        to_components.m44,
-    ];
-    let mut result = [0.0; 16];
-    for index in 0..16 {
-        result[index] = from_values[index] + (to_values[index] - from_values[index]) * amount;
-    }
-    CATransform3D {
-        m11: result[0],
-        m12: result[1],
-        m13: result[2],
-        m14: result[3],
-        m21: result[4],
-        m22: result[5],
-        m23: result[6],
-        m24: result[7],
-        m31: result[8],
-        m32: result[9],
-        m33: result[10],
-        m34: result[11],
-        m41: result[12],
-        m42: result[13],
-        m43: result[14],
-        m44: result[15],
-    }
+    super::ca_transform3d::interpolate(from, to, amount)
 }
 
 // CATransform3D is row-major with row-vector composition. Scale the basis

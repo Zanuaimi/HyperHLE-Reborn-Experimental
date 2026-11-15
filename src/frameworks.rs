@@ -90,6 +90,7 @@ pub struct State {
     avfoundation: avfoundation::State,
     core_animation: core_animation::State,
     core_foundation: core_foundation::State,
+    core_motion: core_motion::State,
     foundation: foundation::State,
     pub game_kit: game_kit::State,
     pub store_kit: store_kit::State,

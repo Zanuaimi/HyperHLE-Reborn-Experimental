@@ -473,9 +473,162 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CATransform3DGetAffineTransform(_)),
 ];
 
+/// Interpolate scale and translation independently from rotation. A component
+/// blend of rotation matrices shrinks geometry halfway through a turn.
+pub(super) fn interpolate(from: CATransform3D, to: CATransform3D, amount: f32) -> CATransform3D {
+    if amount <= 0.0 {
+        return from;
+    }
+    if amount >= 1.0 {
+        return to;
+    }
+    let a: Matrix<4> = from.into();
+    let b: Matrix<4> = to.into();
+    let other = *b.columns();
+    let mut result = *a.columns();
+    for (column, target) in result.iter_mut().zip(other) {
+        for (value, target) in column.iter_mut().zip(target) {
+            *value += (target - *value) * amount;
+        }
+    }
+    if let (Some((qa, sa)), Some((mut qb, sb))) = (rotation_and_scale(a), rotation_and_scale(b)) {
+        let mut dot: f32 = qa.iter().zip(qb).map(|(a, b)| a * b).sum();
+        if dot < 0.0 {
+            qb = qb.map(|x| -x);
+            dot = -dot;
+        }
+        let (wa, wb) = if dot > 0.9995 {
+            (1.0 - amount, amount)
+        } else {
+            let angle = dot.clamp(-1.0, 1.0).acos();
+            (
+                ((1.0 - amount) * angle).sin() / angle.sin(),
+                (amount * angle).sin() / angle.sin(),
+            )
+        };
+        let mut q = [0.0; 4];
+        for i in 0..4 {
+            q[i] = qa[i] * wa + qb[i] * wb;
+        }
+        let length = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let [x, y, z, w] = q.map(|v| v / length);
+        let rotation = [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y + w * z),
+                2.0 * (x * z - w * y),
+            ],
+            [
+                2.0 * (x * y - w * z),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z + w * x),
+            ],
+            [
+                2.0 * (x * z + w * y),
+                2.0 * (y * z - w * x),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+        ];
+        for col in 0..3 {
+            let scale = sa[col] + (sb[col] - sa[col]) * amount;
+            for row in 0..3 {
+                result[col][row] = rotation[col][row] * scale;
+            }
+        }
+    }
+    Matrix::from_columns(result).into()
+}
+
+fn rotation_and_scale(matrix: Matrix<4>) -> Option<([f32; 4], [f32; 3])> {
+    let mut r = [[0.0; 3]; 3];
+    let mut scale = [0.0; 3];
+    for col in 0..3 {
+        scale[col] = matrix.columns()[col][..3]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
+        // Singular transforms (e.g. a view starting at zero scale) cannot be
+        // decomposed. The component interpolation above handles those.
+        if !scale[col].is_finite() || scale[col] < 1e-6 {
+            return None;
+        }
+        let column = matrix.columns()[col];
+        for (value, source) in r[col].iter_mut().zip(column) {
+            *value = source / scale[col];
+        }
+    }
+    for a in 0..3 {
+        for b in a + 1..3 {
+            if r[a].iter().zip(r[b]).map(|(a, b)| a * b).sum::<f32>().abs() > 1e-4 {
+                return None;
+            }
+        }
+    }
+    let determinant = r[0][0] * (r[1][1] * r[2][2] - r[2][1] * r[1][2])
+        - r[1][0] * (r[0][1] * r[2][2] - r[2][1] * r[0][2])
+        + r[2][0] * (r[0][1] * r[1][2] - r[1][1] * r[0][2]);
+    if determinant < 0.0 {
+        scale[0] = -scale[0];
+        r[0] = r[0].map(|v| -v);
+    }
+    let mut q = [0.0; 4];
+    let trace = r[0][0] + r[1][1] + r[2][2];
+    if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        q = [
+            (r[1][2] - r[2][1]) / s,
+            (r[2][0] - r[0][2]) / s,
+            (r[0][1] - r[1][0]) / s,
+            s * 0.25,
+        ];
+    } else {
+        let i = if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
+            0
+        } else if r[1][1] > r[2][2] {
+            1
+        } else {
+            2
+        };
+        let j = (i + 1) % 3;
+        let k = (i + 2) % 3;
+        let s = (1.0 + r[i][i] - r[j][j] - r[k][k]).sqrt() * 2.0;
+        q[i] = s * 0.25;
+        q[j] = (r[j][i] + r[i][j]) / s;
+        q[k] = (r[k][i] + r[i][k]) / s;
+        q[3] = (r[j][k] - r[k][j]) / s;
+    }
+    Some((q, scale))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transform_interpolation_preserves_rotation_length() {
+        let to = CATransform3D::make_rotation(std::f32::consts::FRAC_PI_2, 0.0, 1.0, 0.0);
+        let mid: Matrix<4> = interpolate(CATransform3DIdentity, to, 0.5).into();
+        let p = mid.transform([1.0, 0.0, 0.0, 1.0]);
+        assert!((p[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!((p[2] + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!((p[0] * p[0] + p[2] * p[2] - 1.0).abs() < 1e-5);
+    }
+    
+    #[test]
+    fn transform_interpolation_handles_flat_scale_and_perspective() {
+        let mut from = CATransform3D::make_scale(0.01, 0.01, 0.0);
+        from.m34 = -0.001;
+        let mut to = CATransform3D::make_scale(1.0, 1.0, 0.0);
+        to.m34 = -0.001;
+        let mid = interpolate(from, to, 0.5);
+        let (x, y, z, p) = (mid.m11, mid.m22, mid.m33, mid.m34);
+        assert!((x - 0.505).abs() < 1e-6 && (y - 0.505).abs() < 1e-6);
+        assert_eq!(z, 0.0);
+        assert_eq!(p, -0.001);
+        assert!(interpolate(from, to, 0.0).equal_to(from));
+        assert!(interpolate(from, to, 1.0).equal_to(to));
+    }
 
     fn approx_eq(a: CATransform3D, b: CATransform3D, eps: f32) -> bool {
         let fields = [

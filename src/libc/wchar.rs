@@ -487,36 +487,100 @@ fn wcstombs(
     i
 }
 
-/// wcstol — wide string to long.
+/// The emulated C locale uses ASCII numeric syntax. Keeping one byte per
+/// wide character also makes an unconsumed delimiter map back to `wchar_t*`.
+fn wide_numeric_ascii(env: &Environment, s: ConstPtr<wchar_t>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let value = env.mem.read(s + offset);
+        if value == 0 || !(0..=0x7f).contains(&value) {
+            return bytes;
+        }
+        bytes.push(value as u8);
+        offset += 1;
+    }
+}
+
+/// Unlike Rust's whole-string `parse`, C conversions consume a numeric
+/// prefix and leave the next configuration field untouched. Darwin long is
+/// 32 bits even when the host's long is 64 bits.
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstol.3.html
+fn wide_integer_prefix(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    mut base: i32,
+    signed: bool,
+) -> u32 {
+    use super::errno::{set_errno, EINVAL, ERANGE};
+    if !endptr.is_null() {
+        env.mem.write(endptr, s.cast_mut());
+    }
+    if base != 0 && !(2..=36).contains(&base) {
+        set_errno(env, EINVAL);
+        return 0;
+    }
+    let bytes = wide_numeric_ascii(env, s);
+    let mut at = 0;
+    while bytes.get(at).is_some_and(|b| matches!(*b, 9..=13 | 32)) {
+        at += 1;
+    }
+    let negative = bytes.get(at) == Some(&b'-');
+    if matches!(bytes.get(at), Some(b'+' | b'-')) {
+        at += 1;
+    }
+    let digit = |byte: u8| (byte as char).to_digit(36);
+    if (base == 0 || base == 16)
+        && bytes.get(at) == Some(&b'0')
+        && matches!(bytes.get(at + 1), Some(b'x' | b'X'))
+        && bytes.get(at + 2).and_then(|b| digit(*b)).is_some_and(|d| d < 16)
+    {
+        base = 16;
+        at += 2;
+    } else if base == 0 {
+        base = if bytes.get(at) == Some(&b'0') { 8 } else { 10 };
+    }
+    let first_digit = at;
+    let limit = if signed {
+        if negative { 0x8000_0000 } else { 0x7fff_ffff }
+    } else {
+        u32::MAX
+    };
+    let mut magnitude = 0u32;
+    let mut overflow = false;
+    while let Some(value) = bytes.get(at).and_then(|b| digit(*b)) {
+        if value >= base as u32 {
+            break;
+        }
+        if magnitude > (limit - value) / base as u32 {
+            overflow = true;
+        } else if !overflow {
+            magnitude = magnitude * base as u32 + value;
+        }
+        at += 1;
+    }
+    if at == first_digit {
+        return 0;
+    }
+    if !endptr.is_null() {
+        env.mem.write(endptr, (s + at as GuestUSize).cast_mut());
+    }
+    if overflow {
+        set_errno(env, ERANGE);
+        return if signed && negative { 0x8000_0000 } else { limit };
+    }
+    if negative { magnitude.wrapping_neg() } else { magnitude }
+}
+
+/// wcstol — wide string to Darwin's 32-bit long.
 fn wcstol(
     env: &mut Environment,
     s: ConstPtr<wchar_t>,
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> i32 {
-    // Convert to a narrow string then parse.
-    let mut buf = String::new();
-    let mut i: GuestUSize = 0;
-    loop {
-        let wc = env.mem.read(s + i);
-        if wc == 0 || wc > 0x7F {
-            break;
-        }
-        buf.push(wc as u8 as char);
-        i += 1;
-    }
-    let buf = buf.trim();
-    let result = if base == 0 || base == 10 {
-        buf.parse::<i32>().unwrap_or(0)
-    } else if base == 16 {
-        i32::from_str_radix(buf.trim_start_matches("0x"), 16).unwrap_or(0)
-    } else {
-        i32::from_str_radix(buf, base as u32).unwrap_or(0)
-    };
-    if !endptr.is_null() {
-        env.mem.write(endptr, (s + i).cast_mut());
-    }
-    result
+    wide_integer_prefix(env, s, endptr, base, true) as i32
 }
 
 /// wcstoul — wide string to unsigned long.
@@ -526,30 +590,66 @@ fn wcstoul(
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> u32 {
-    wcstol(env, s, endptr, base) as u32
+    wide_integer_prefix(env, s, endptr, base, false)
+}
+
+/// Use the host C99 converter for decimal/hex floats, infinity and NaN, and
+/// translate its byte offset back into a guest wide-character offset.
+/// The guest only supports the C numeric locale (see clocale.rs).
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstod.3.html
+fn wide_float_prefix(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    single: bool,
+) -> f64 {
+    let bytes = wide_numeric_ascii(env, s);
+    let number = std::ffi::CString::new(bytes).unwrap();
+    let mut host_end = std::ptr::null_mut();
+    let value = unsafe {
+        if single {
+            libc::strtof(number.as_ptr(), &mut host_end) as f64
+        } else {
+            libc::strtod(number.as_ptr(), &mut host_end)
+        }
+    };
+    let consumed = unsafe { host_end.offset_from(number.as_ptr()) } as usize;
+    if !endptr.is_null() {
+        env.mem.write(endptr, (s + consumed as GuestUSize).cast_mut());
+    }
+    let token = std::str::from_utf8(&number.as_bytes()[..consumed])
+        .unwrap()
+        .trim_start()
+        .trim_start_matches(['+', '-'])
+        .to_ascii_lowercase();
+    // An explicit infinity/NaN isn't an overflow. For finite syntax, a
+    // nonzero significand rounded to zero is an underflow.
+    if consumed != 0 && !token.starts_with("inf") && !token.starts_with("nan") {
+        let hexadecimal = token.starts_with("0x");
+        let significand = token.split(if hexadecimal { 'p' } else { 'e' }).next().unwrap();
+        let nonzero = significand
+            .bytes()
+            .any(|b| matches!(b, b'1'..=b'9') || (hexadecimal && matches!(b, b'a'..=b'f')));
+        let min_normal = if single {
+            f32::MIN_POSITIVE as f64
+        } else {
+            f64::MIN_POSITIVE
+        };
+        if value.is_infinite() || (nonzero && value.abs() < min_normal) {
+            super::errno::set_errno(env, super::errno::ERANGE);
+        }
+    }
+    value
 }
 
 /// wcstod — wide string to double.
 fn wcstod(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
-    let mut buf = String::new();
-    let mut i: GuestUSize = 0;
-    loop {
-        let wc = env.mem.read(s + i);
-        if wc == 0 || wc > 0x7F {
-            break;
-        }
-        buf.push(wc as u8 as char);
-        i += 1;
-    }
-    if !endptr.is_null() {
-        env.mem.write(endptr, (s + i).cast_mut());
-    }
-    buf.trim().parse::<f64>().unwrap_or(0.0)
+    wide_float_prefix(env, s, endptr, false)
 }
 
 /// wcstof — wide string to float.
 fn wcstof(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f32 {
-    wcstod(env, s, endptr) as f32
+    wide_float_prefix(env, s, endptr, true) as f32
 }
 
 /// iswspace — test if wide char is whitespace.

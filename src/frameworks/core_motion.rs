@@ -24,13 +24,15 @@
 //! window's accelerometer reading) to provide real accelerometer data when
 //! available, and falls back to simulated gravity (0, 0, -1) otherwise.
 
-use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
-use crate::dyld::HostDylib;
+use crate::abi::{impl_GuestRet_for_large_struct, CallFromHost, GuestArg, GuestFunction};
+use crate::dyld::{HostDylib, HostFunction};
+use crate::mem::{guest_size_of, MutVoidPtr};
+use std::collections::HashSet;
 use crate::objc::{
-    autorelease, id, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 use crate::Environment;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const DYLIB: HostDylib = HostDylib {
     path: "/System/Library/Frameworks/CoreMotion.framework/CoreMotion",
@@ -39,6 +41,167 @@ pub const DYLIB: HostDylib = HostDylib {
     constant_exports: &[],
     function_exports: &[],
 };
+
+#[derive(Default)]
+pub struct State {
+    managers: HashSet<id>,
+    worker_running: bool,
+}
+struct MotionHandler {
+    queue: id,
+    block: id,
+    due: Instant,
+}
+#[derive(Default)]
+struct MotionSampleHandler {
+    block: id,
+    data: id,
+}
+impl HostObject for MotionSampleHandler {}
+
+fn stop_handler(env: &mut Environment, manager: id, sensor: usize) {
+    let handler = env
+        .objc
+        .borrow_mut::<CMMotionManagerHostObject>(manager)
+        .handlers[sensor]
+        .take();
+    if let Some(handler) = handler {
+        release(env, handler.queue);
+        crate::libc::blocks::_Block_release(env, handler.block.cast_void().cast_const());
+    }
+    if env
+        .objc
+        .borrow::<CMMotionManagerHostObject>(manager)
+        .handlers
+        .iter()
+        .all(Option::is_none)
+    {
+        env.framework_state.core_motion.managers.remove(&manager);
+    }
+}
+fn start_handler(env: &mut Environment, manager: id, sensor: usize, queue: id, block: id) {
+    assert!(
+        queue != nil && block != nil,
+        "Core Motion requires a queue and handler"
+    );
+    let block = crate::libc::blocks::_Block_copy(env, block.cast_void().cast_const())
+        .cast_mut()
+        .cast();
+    retain(env, queue);
+    stop_handler(env, manager, sensor);
+    env.objc
+        .borrow_mut::<CMMotionManagerHostObject>(manager)
+        .handlers[sensor] = Some(MotionHandler {
+        queue,
+        block,
+        due: Instant::now(),
+    });
+    env.framework_state.core_motion.managers.insert(manager);
+    if env.framework_state.core_motion.worker_running {
+        return;
+    }
+    env.framework_state.core_motion.worker_running = true;
+    let function: HostFunction = &(motion_worker as fn(&mut Environment, _) -> _);
+    let entry = env
+        .dyld
+        .create_guest_function(&mut env.mem, "__hyperhle_motion_worker", function);
+    use crate::libc::pthread::thread::{
+        pthread_attr_init, pthread_attr_setdetachstate, pthread_attr_t, pthread_create, pthread_t,
+        PTHREAD_CREATE_DETACHED,
+    };
+    let attr = env.mem.alloc(guest_size_of::<pthread_attr_t>()).cast();
+    pthread_attr_init(env, attr);
+    pthread_attr_setdetachstate(env, attr, PTHREAD_CREATE_DETACHED);
+    let thread = env.mem.alloc(guest_size_of::<pthread_t>()).cast();
+    assert_eq!(
+        pthread_create(env, thread, attr.cast_const(), entry, MutVoidPtr::null()),
+        0
+    );
+    env.mem.free(thread.cast());
+    env.mem.free(attr.cast());
+}
+
+/// Sample independently of application run loops. The supplied operation queue
+/// owns callback delivery; blocks and data must outlive the sampling call.
+/// https://developer.apple.com/documentation/coremotion/cmmotionmanager/startaccelerometerupdates(to:withhandler:)
+fn motion_worker(env: &mut Environment, _: MutVoidPtr) -> MutVoidPtr {
+    loop {
+        let managers: Vec<_> = env
+            .framework_state
+            .core_motion
+            .managers
+            .iter()
+            .copied()
+            .collect();
+        if managers.is_empty() {
+            env.framework_state.core_motion.worker_running = false;
+            return MutVoidPtr::null();
+        }
+        for manager in &managers {
+            retain(env, *manager);
+        }
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        for manager in managers {
+            for sensor in 0..3 {
+                let delivery = {
+                    let host = env.objc.borrow_mut::<CMMotionManagerHostObject>(manager);
+                    let interval = [
+                        host.accelerometer_update_interval,
+                        host.gyro_update_interval,
+                        host.device_motion_update_interval,
+                    ][sensor];
+                    host.handlers[sensor].as_mut().and_then(|handler| {
+                        let now = Instant::now();
+                        if now < handler.due {
+                            return None;
+                        }
+                        let interval = Duration::try_from_secs_f64(interval.max(0.01))
+                            .unwrap_or(Duration::from_millis(10));
+                        let next = handler.due.checked_add(interval).unwrap_or(now);
+                        handler.due = if next > now { next } else {
+                            now.checked_add(interval).unwrap_or(now + Duration::from_millis(10))
+                        };
+                        Some((handler.queue, handler.block))
+                    })
+                };
+                let Some((queue, block)) = delivery else {
+                    continue;
+                };
+                retain(env, queue);
+                let block = crate::libc::blocks::_Block_copy(env, block.cast_void().cast_const())
+                    .cast_mut()
+                    .cast();
+                let data: id = match sensor {
+                    0 => msg![env; manager accelerometerData],
+                    1 => msg![env; manager gyroData],
+                    _ => msg![env; manager deviceMotion],
+                };
+                retain(env, data);
+                let class = env
+                    .objc
+                    .get_known_class("_touchHLE_CMMotionSampleHandler", &mut env.mem);
+                let target = env.objc.alloc_object(
+                    class,
+                    Box::new(MotionSampleHandler { block, data }),
+                    &mut env.mem,
+                );
+                let selector = env
+                    .objc
+                    .lookup_selector("_touchHLE_deliverMotionSample")
+                    .unwrap();
+                let op: id = msg_class![env; NSInvocationOperation alloc];
+                let op: id = msg![env; op initWithTarget:target selector:selector object:nil];
+                () = msg![env; queue addOperation:op];
+                release(env, op);
+                release(env, target);
+                release(env, queue);
+            }
+            release(env, manager);
+        }
+        release(env, pool);
+        env.sleep(Duration::from_millis(5));
+    }
+}
 
 // =============================================================================
 // Host object types
@@ -123,6 +286,7 @@ struct CMMotionManagerHostObject {
     /// Complementary attitude filter state (quaternion, learned gyro bias,
     /// low-passed gravity input). `None` until the first device-motion read.
     attitude_state: Option<MotionFilter>,
+    handlers: [Option<MotionHandler>; 3],
 }
 impl HostObject for CMMotionManagerHostObject {}
 
@@ -642,6 +806,24 @@ const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
 
+@implementation _touchHLE_CMMotionSampleHandler: NSObject
+- (())_touchHLE_deliverMotionSample {
+    let host = env.objc.borrow::<MotionSampleHandler>(this);
+    let (block, data) = (host.block, host.data);
+    let address: u32 = env.mem.read(block.cast::<u32>() + 3u32);
+    let invoke = GuestFunction::from_addr_with_thumb_bit(address);
+    let _: () = invoke.call_from_host(env, (block, data, nil));
+}
+- (())dealloc {
+    let host = env.objc.borrow::<MotionSampleHandler>(this);
+    let (block, data) = (host.block, host.data);
+    crate::libc::blocks::_Block_release(env, block.cast_void().cast_const());
+    release(env, data);
+    env.objc.dealloc_object(this, &mut env.mem);
+}
+@end
+
+
 // =============================================================================
 // CMAccelerometerData
 // Per Apple: Encapsulates a single accelerometer sample.
@@ -900,8 +1082,14 @@ const CLASSES: ClassExports = objc_classes! {
         last_accel_timestamp: 0.0,
         start_time: Some(Instant::now()),
         attitude_state: None,
+        handlers: [None, None, None],
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+- (())dealloc {
+    for sensor in 0..3 { stop_handler(env, this, sensor); }
+    env.objc.dealloc_object(this, &mut env.mem);
 }
 
 // =========================================================================
@@ -974,14 +1162,17 @@ const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (())startAccelerometerUpdates {
+    stop_handler(env, this, 0);
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).accelerometer_active = true;
 }
 
 - (())stopAccelerometerUpdates {
+    stop_handler(env, this, 0);
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).accelerometer_active = false;
 }
 
 - (())startGyroUpdates {
+    stop_handler(env, this, 1);
     if env.window.as_ref().is_none_or(|w| !w.has_gyroscope()) {
         log!("No host gyroscope sensor; reporting a stationary device (zero rotation rate).");
     }
@@ -989,33 +1180,37 @@ const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())stopGyroUpdates {
+    stop_handler(env, this, 1);
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).gyro_active = false;
 }
 
 - (())startDeviceMotionUpdates {
+    stop_handler(env, this, 2);
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).device_motion_active = true;
 }
 
 - (())stopDeviceMotionUpdates {
+    stop_handler(env, this, 2);
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).device_motion_active = false;
 }
 
-// Push mode (handler-based) — we activate the sensor but do NOT call
-// handlers since that would require implementing NSOperationQueue dispatch.
-// Games that use pull-mode (polling accelerometerData) still work perfectly.
-- (())startAccelerometerUpdatesToQueue:(id)_queue withHandler:(id)_handler {
+// Push mode submits samples to the supplied operation queue.
+- (())startAccelerometerUpdatesToQueue:(id)queue withHandler:(id)handler {
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).accelerometer_active = true;
+    start_handler(env, this, 0, queue, handler);
 }
 
-- (())startGyroUpdatesToQueue:(id)_queue withHandler:(id)_handler {
+- (())startGyroUpdatesToQueue:(id)queue withHandler:(id)handler {
     if env.window.as_ref().is_none_or(|w| !w.has_gyroscope()) {
         log!("No host gyroscope sensor; reporting a stationary device (zero rotation rate).");
     }
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).gyro_active = true;
+    start_handler(env, this, 1, queue, handler);
 }
 
-- (())startDeviceMotionUpdatesToQueue:(id)_queue withHandler:(id)_handler {
+- (())startDeviceMotionUpdatesToQueue:(id)queue withHandler:(id)handler {
     env.objc.borrow_mut::<CMMotionManagerHostObject>(this).device_motion_active = true;
+    start_handler(env, this, 2, queue, handler);
 }
 
 // =========================================================================
