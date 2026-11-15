@@ -204,6 +204,9 @@ pub(super) struct GLShadowState {
     pub(super) vertex_array_state: VertexArrayState,
     /// Client array state of the other (software) vertex array objects.
     pub(super) software_vao_states: HashMap<GLuint, VertexArrayState>,
+    /// Error flags the emulator consumed from the driver while doing its own
+    /// validation, so `glGetError` can still report them to the guest.
+    pub(super) pending_guest_errors: std::collections::VecDeque<GLenum>,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
@@ -230,6 +233,7 @@ impl Default for GLShadowState {
             client_active_texture: 0,
             vertex_array_state: VertexArrayState::default(),
             software_vao_states: HashMap::new(),
+    pending_guest_errors: std::collections::VecDeque::new(),
         }
     }
 }

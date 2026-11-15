@@ -331,10 +331,36 @@ where
     res
 }
 
+/// Return error flags preserved by an internal validation query before asking
+/// the driver. OpenGL leaves error-return order implementation-dependent.
+unsafe fn guest_gl_error(gles: &mut dyn GLES, shadow: &mut GLShadowState) -> GLenum {
+    shadow
+        .pending_guest_errors
+        .pop_front()
+        .unwrap_or_else(|| gles.GetError())
+}
+
+unsafe fn preserve_driver_errors(gles: &mut dyn GLES, shadow: &mut GLShadowState) -> bool {
+    let mut any = false;
+    // GL has a finite set of error flags. Bound the loop for a broken driver
+    // that repeatedly reports an error without clearing it.
+    for _ in 0..16 {
+        let error = gles.GetError();
+        if error == gles11::NO_ERROR {
+            break;
+        }
+        any = true;
+        if !shadow.pending_guest_errors.contains(&error) {
+            shadow.pending_guest_errors.push_back(error);
+        }
+    }
+    any
+}
+
 fn glGetError(env: &mut Environment) -> GLenum {
     let ignore_gl_errors = env.options.ignore_gl_errors;
-    with_ctx_and_mem(env, |gles, _mem| {
-        let err = unsafe { gles.GetError() };
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| {
+        let err = unsafe { guest_gl_error(gles, shadow) };
         if err != 0 {
             if ignore_gl_errors {
                 return 0;
@@ -3264,29 +3290,39 @@ fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: 
         gles.TexParameterx(target, pname, param)
     })
 }
+/// Crop rectangles are texture-object state used by every DrawTex variant.
+/// Forward all four signed components, including negative sizes for flipping.
+/// https://registry.khronos.org/OpenGL/extensions/OES/OES_draw_texture.txt
+/// https://developer.apple.com/documentation/opengles/gl_oes_draw_texture
+enum TextureCropVector {
+    Integer(ConstPtr<GLint>),
+    Float(ConstPtr<GLfloat>),
+    Fixed(ConstPtr<GLfixed>),
+}
+
+unsafe fn dispatch_texture_crop_rect(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    target: GLenum,
+    vector: TextureCropVector,
+) {
+    match vector {
+        TextureCropVector::Integer(params) => {
+            gles.TexParameteriv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4))
+        }
+        TextureCropVector::Float(params) => {
+            gles.TexParameterfv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4))
+        }
+        TextureCropVector::Fixed(params) => {
+            gles.TexParameterxv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4))
+        }
+    }
+}
+
 fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLint>) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameteriv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameteriv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Integer(params));
         });
         return;
     }
@@ -3312,27 +3348,8 @@ fn glTexParameterfv(
     params: ConstPtr<GLfloat>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameterfv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameterfv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Float(params));
         });
         return;
     }
@@ -3358,27 +3375,8 @@ fn glTexParameterxv(
     params: ConstPtr<GLfixed>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameterxv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameterxv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Fixed(params));
         });
         return;
     }
@@ -6890,22 +6888,39 @@ fn glVertexAttrib4f(
         gles.VertexAttrib4f(index, x, y, z, w)
     });
 }
+/// Vector attribute setters consume every component from guest memory.
+/// https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glVertexAttrib.xml
+unsafe fn dispatch_vertex_attrib_fv(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    index: GLuint,
+    values: ConstPtr<GLfloat>,
+    components: usize,
+) {
+    let source = mem.ptr_at(values, components as GuestUSize);
+    let mut vector = [0.0f32; 4];
+    vector[..components].copy_from_slice(from_raw_parts(source, components));
+    match components {
+        2 => gles.VertexAttrib2fv(index, vector.as_ptr()),
+        3 => gles.VertexAttrib3fv(index, vector.as_ptr()),
+        4 => gles.VertexAttrib4fv(index, vector.as_ptr()),
+        _ => unreachable!(),
+    }
+}
+
 fn glVertexAttrib2fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib2fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 2);
     });
 }
 fn glVertexAttrib3fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib3fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 3);
     });
 }
 fn glVertexAttrib4fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib4fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 4);
     });
 }
 fn glUniform1i(env: &mut Environment, location: GLint, v0: GLint) {
@@ -7906,6 +7921,10 @@ fn glTexStorage2D(
 ) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
+        // Distinguish this allocation's errors from old sticky error flags
+        // without consuming either from the guest's point of view. A failed
+        // allocation must leave the previous format/dimension mirror intact.
+        preserve_driver_errors(gles, shadow);
         // Apps that moved to the ES 3.0 API (Gameloft games such as Asphalt 8
         // v1.2.0+) allocate their PVRTC texture atlases via immutable storage:
         // `glTexStorage2D` with a PVRTC internalformat, then per-level
@@ -7923,6 +7942,16 @@ fn glTexStorage2D(
         if crate::gles::util::pvrtc_format_properties(internalformat).is_some()
             && !gles.pvrtc_native()
         {
+        if width <= 0
+            || height <= 0
+            || !(width as u32).is_power_of_two()
+            || !(height as u32).is_power_of_two()
+        {
+            if !shadow.pending_guest_errors.contains(&gles11::INVALID_VALUE) {
+                shadow.pending_guest_errors.push_back(gles11::INVALID_VALUE);
+            }
+            return;
+        }
             if let Some(texture) = bound_texture {
                 for level in 0..levels.max(0) {
                     let level_width = (width >> level).max(1);
@@ -7942,6 +7971,9 @@ fn glTexStorage2D(
             return;
         }
         gles.TexStorage2D(target, levels, internalformat, width, height);
+        if preserve_driver_errors(gles, shadow) {
+            return;
+        }
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture(texture);
             crate::gles::perf_overlay::clear_gl_image_allocations(
@@ -10065,5 +10097,108 @@ mod performance_texture_size_tests {
         assert_eq!(texture_storage_volume_bytes(8, 4, 2, 0x8058), 256);
         assert_eq!(texture_storage_level_bytes(0, 8, 0x8058), 0);
         assert_eq!(texture_storage_level_bytes(16, 8, 0x83F1), 0);
+    }
+}
+#[cfg(test)]
+mod texture_crop_rect_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture {
+        calls: Vec<(GLenum, GLenum, Vec<f64>)>,
+        attribs: Vec<(GLuint, Vec<f32>)>,
+    }
+    impl GLES for Capture {
+        unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, values: *const GLint) {
+            self.calls.push((target, pname, from_raw_parts(values, 4).iter().map(|v| *v as f64).collect()));
+        }
+        unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, values: *const GLfloat) {
+            self.calls.push((target, pname, from_raw_parts(values, 4).iter().map(|v| *v as f64).collect()));
+        }
+        unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, values: *const GLfixed) {
+            self.calls.push((target, pname, from_raw_parts(values, 4).iter().map(|v| *v as f64).collect()));
+        }
+        unsafe fn VertexAttrib2fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.attribs.push((index, from_raw_parts(values, 2).to_vec()));
+        }
+        unsafe fn VertexAttrib3fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.attribs.push((index, from_raw_parts(values, 3).to_vec()));
+        }
+        unsafe fn VertexAttrib4fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.attribs.push((index, from_raw_parts(values, 4).to_vec()));
+        }
+    }
+    // A sprite atlas crop and a vertically flipped crop must both reach the
+    // host. No opt-in environment variable is required by OES_draw_texture.
+    #[test]
+    fn integer_and_fixed_crops_preserve_offsets_and_signed_dimensions() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLint>();
+        let mut driver = Capture::default();
+        for expected in [[17, 29, 128, 64], [0, 256, 256, -256]] {
+            for (i, value) in expected.iter().enumerate() {
+                mem.write(ptr + i as u32, *value);
+            }
+            unsafe {
+                dispatch_texture_crop_rect(
+                    &mut driver,
+                    &mem,
+                    gles11::TEXTURE_2D,
+                    TextureCropVector::Integer(ptr.cast_const()),
+                );
+                dispatch_texture_crop_rect(
+                    &mut driver,
+                    &mem,
+                    gles11::TEXTURE_2D,
+                    TextureCropVector::Fixed(ptr.cast_const()),
+                );
+            }
+            for call in &driver.calls[driver.calls.len() - 2..] {
+                assert_eq!(call.0, gles11::TEXTURE_2D);
+                assert_eq!(call.1, gles11::TEXTURE_CROP_RECT_OES);
+                assert_eq!(call.2, expected.map(|v| v as f64));
+            }
+        }
+        assert_eq!(driver.calls.len(), 4);
+    }
+    #[test]
+    fn float_crop_reaches_host_without_scalar_enum_conversion() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLfloat>();
+        let expected = [-12.5f32, 128.0, 64.0, -80.0];
+        for (i, value) in expected.iter().enumerate() {
+            mem.write(ptr + i as u32, *value);
+        }
+        let mut driver = Capture::default();
+        unsafe {
+            dispatch_texture_crop_rect(
+                &mut driver,
+                &mem,
+                gles11::TEXTURE_2D,
+                TextureCropVector::Float(ptr.cast_const()),
+            );
+        }
+        assert_eq!(driver.calls.len(), 1);
+        assert_eq!(driver.calls[0].2, expected.map(|v| v as f64));
+    }
+    // The driver reads as many floats as the entry point names, so a
+    // two-component call must not hand it a pointer to a single value.
+    #[test]
+    fn vertex_attrib_reads_every_named_component() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLfloat>();
+        let values = [1.5f32, -2.0, 3.25, 4.0];
+        for (i, value) in values.iter().enumerate() {
+            mem.write(ptr + i as u32, *value);
+        }
+        let mut driver = Capture::default();
+        unsafe {
+            dispatch_vertex_attrib_fv(&mut driver, &mem, 7, ptr.cast_const(), 2);
+            dispatch_vertex_attrib_fv(&mut driver, &mem, 7, ptr.cast_const(), 3);
+            dispatch_vertex_attrib_fv(&mut driver, &mem, 7, ptr.cast_const(), 4);
+        }
+        assert_eq!(driver.attribs.len(), 3);
+        assert_eq!(driver.attribs[0], (7, vec![1.5, -2.0]));
+        assert_eq!(driver.attribs[1], (7, vec![1.5, -2.0, 3.25]));
+        assert_eq!(driver.attribs[2], (7, vec![1.5, -2.0, 3.25, 4.0]));
     }
 }
